@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>jpllm/ — 日本語 4 モード論理ゲート LLM（X自動翻訳風・関西弁・津軽弁・会話）| griffith/</title>
+  <meta name="description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語 4 モード極小 LLM。">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="../fonts/martian-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Martian Mono';
+      font-style: normal;
+      font-display: swap;
+      font-weight: 100 800;
+      src: url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations'),
+           url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2');
+    }
+
+    :root {
+      color-scheme: light;
+      --paper: #f2f0e9;
+      --sheet: #faf9f3;
+      --ink: #141412;
+      --muted: #68665e;
+      --rule: #cfccc0;
+      --grid: #e3e0d6;
+      --tri: #e8e5db;
+      --accent: #ff4d00;
+      --accent-tint: #fff0e8;
+      --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --jp: 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--jp);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .app {
+      height: 100dvh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow: hidden;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--ink);
+      background: var(--paper);
+      min-height: 48px;
+    }
+    .identity { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+    .mark {
+      font-family: var(--mono);
+      font-weight: 800;
+      font-stretch: 75%;
+      font-size: clamp(20px, 2vw, 25px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      white-space: nowrap;
+    }
+    .mark .slash { color: var(--accent); }
+    .mark:hover { color: var(--accent); }
+    h1 { margin: 0; font-size: clamp(13px, 1.2vw, 15px); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tagline { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+
+    .bar__right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; min-width: 84px; }
+    .btn--go:hover:not(:disabled) { background: #e54400; border-color: #e54400; color: #fff; }
+
+    /* 中央 3 カラム（ページスクロールなし） */
+    .desk {
+      display: grid;
+      grid-template-columns: clamp(256px, 25vw, 308px) minmax(0, 1fr) clamp(236px, 21vw, 276px);
+      gap: 14px;
+      padding: 11px 16px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .block-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; color: var(--ink); white-space: nowrap; }
+    .kicker-mono { font-family: var(--mono), var(--jp); font-size: 10px; color: var(--muted); white-space: nowrap; }
+    .kicker-mono b { color: var(--accent); }
+
+    /* 左カラム：モード切替・モデル段・入力 */
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .lblock {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 6px;
+    }
+    .lblock:first-child { border-top: 0; padding-top: 0; }
+
+    .mode-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 4px;
+    }
+    .mode-btn {
+      padding: 7px 6px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      text-align: left;
+      display: grid;
+      gap: 1px;
+    }
+    .mode-btn strong { font-size: 11.5px; font-weight: 800; }
+    .mode-btn span { font-family: var(--mono), var(--jp); font-size: 9.5px; color: var(--muted); }
+    .mode-btn:hover { border-color: var(--ink); background: var(--tri); }
+    .mode-btn[aria-pressed="true"] {
+      background: var(--ink);
+      border-color: var(--ink);
+      color: var(--paper);
+    }
+    .mode-btn[aria-pressed="true"] span { color: #ff8e61; }
+
+    .rung-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .rung-btn {
+      padding: 6px 4px;
+      border-right: 1px solid var(--rule);
+      display: grid;
+      place-items: center;
+      gap: 1px;
+    }
+    .rung-btn:last-child { border-right: 0; }
+    .rung-btn strong { font-family: var(--mono); font-size: 11px; font-weight: 800; }
+    .rung-btn span { font-size: 9px; color: var(--muted); }
+    .rung-btn:hover { background: var(--tri); }
+    .rung-btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+    .rung-btn[aria-pressed="true"] span { color: var(--paper); opacity: 0.8; }
+    .rung-btn--mux[aria-pressed="true"] { background: var(--accent); color: #fff; }
+    .rung-btn--mux[aria-pressed="true"] span { color: #fff; opacity: 0.92; }
+
+    .jp-input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1.5px solid var(--ink);
+      background: var(--sheet);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip {
+      padding: 3px 7px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .chip:hover { border-color: var(--ink); color: var(--ink); background: var(--tri); }
+
+    .slider-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+    .slider-row input[type="range"] { accent-color: var(--accent); width: 100%; }
+    .slider-val { font-family: var(--mono); color: var(--ink); font-weight: 700; min-width: 30px; text-align: right; }
+
+    /* 中央ステージ：生成出力 + BPE トークン + Attention MUX マップ */
+    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 11px 15px 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--rule);
+      background-color: var(--sheet);
+      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
+      background-size: 20px 20px;
+      background-position: 9px 9px;
+    }
+    .stage::before, .stage::after {
+      content: '';
+      pointer-events: none;
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: solid var(--muted);
+      opacity: 0.45;
+    }
+    .stage::before { top: 8px; left: 8px; border-width: 1px 0 0 1px; }
+    .stage::after { right: 8px; bottom: 8px; border-width: 0 1px 1px 0; }
+
+    .stage-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .stage-title { font-size: 12.5px; font-weight: 800; display: flex; align-items: center; gap: 7px; }
+    .badge {
+      font-family: var(--mono);
+      font-size: 9.5px;
+      font-weight: 800;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: var(--tri);
+      color: var(--ink);
+    }
+    .badge--mux { background: var(--accent); color: #fff; }
+
+    .post-card {
+      padding: 10px 13px;
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      display: grid;
+      gap: 5px;
+    }
+    .post-src {
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .post-src .tag {
+      font-family: var(--mono), var(--jp);
+      font-weight: 800;
+      color: var(--accent);
+      margin-right: 5px;
+    }
+    .post-out {
+      font-size: clamp(14px, 1.45vw, 17px);
+      font-weight: 800;
+      line-height: 1.5;
+      color: var(--ink);
+      min-height: 2.3em;
+      word-break: break-word;
+    }
+    .caret {
+      display: inline-block;
+      width: 2px;
+      height: 1em;
+      background: var(--accent);
+      vertical-align: -2px;
+      margin-left: 2px;
+      animation: blink 0.8s steps(1) infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .bpe-strip {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      overflow: hidden;
+      flex-wrap: nowrap;
+      padding: 4px 7px;
+      background: var(--paper);
+      border: 1px solid var(--rule);
+      font-size: 10px;
+    }
+    .bpe-label { font-family: var(--mono); color: var(--muted); font-size: 9.5px; flex-shrink: 0; margin-right: 3px; }
+    .bpe-tok {
+      padding: 1px 5px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      border-radius: 3px;
+      white-space: nowrap;
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+    .bpe-tok--out { border-color: #f3b599; background: var(--accent-tint); }
+
+    .attn-wrap {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 4px;
+      min-height: 0;
+      min-width: 0;
+    }
+    .seg-mini { display: inline-flex; gap: 3px; }
+    .seg-mini button {
+      padding: 1px 6px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--paper);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .seg-mini button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+
+    #attn-svg { width: 100%; height: 100%; display: block; min-height: 0; }
+
+    .stage-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10.5px; color: var(--muted); }
+
+    /* 右カラム：Top-5 候補・計器・履歴 */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .rblock {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .rblock:first-child { border-top: 0; padding-top: 0; }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+    .stat-cell {
+      padding: 6px 8px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      display: grid;
+      gap: 1px;
+    }
+    .stat-cell span { font-size: 9.5px; color: var(--muted); }
+    .stat-cell strong { font-family: var(--mono); font-size: 13px; font-weight: 800; }
+    .stat-cell strong.accent { color: var(--accent); }
+
+    .top5 { display: grid; gap: 4px; }
+    .t5-row {
+      display: grid;
+      grid-template-columns: 54px minmax(0, 1fr) 36px;
+      align-items: center;
+      gap: 5px;
+      font-size: 10px;
+    }
+    .t5-tok {
+      font-family: var(--mono), var(--jp);
+      padding: 1px 4px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      text-align: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 10px;
+    }
+    .track { height: 6px; background: var(--tri); border-radius: 2px; overflow: hidden; }
+    .fill { height: 100%; background: var(--ink); }
+    .fill--acc { background: var(--accent); }
+    .t5-p { font-family: var(--mono); text-align: right; color: var(--muted); font-size: 9.5px; }
+
+    .hist-list { display: grid; gap: 4px; }
+    .hist-item {
+      padding: 5px 7px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      font-size: 10.5px;
+      text-align: left;
+      display: grid;
+      gap: 1px;
+      overflow: hidden;
+    }
+    .hist-item:hover { border-color: var(--ink); background: var(--tri); }
+    .hist-item .h-meta { font-family: var(--mono), var(--jp); font-size: 9px; color: var(--accent); }
+    .hist-item .h-txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
+
+    .action-tile {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--ink);
+      background: var(--sheet);
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .action-tile:hover { background: var(--ink); color: var(--paper); }
+
+    .foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 16px;
+      border-top: 1px solid var(--rule);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .foot-mono { font-family: var(--mono), var(--jp); font-size: 10.5px; white-space: nowrap; }
+    .foot a:hover { color: var(--accent); }
+
+    /* オーバーレイシート */
+    .sheet {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      background: rgba(20, 20, 18, 0.36);
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+    .sheet__body {
+      width: min(760px, 100%);
+      max-height: min(82dvh, 660px);
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      box-shadow: 0 20px 60px rgba(20, 20, 18, 0.24);
+    }
+    .sheet__head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 14px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .sheet__tabs { display: flex; gap: 4px; }
+    .sheet__tabs button {
+      padding: 5px 11px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+    .sheet__close { width: 30px; height: 30px; border-radius: 999px; font-size: 18px; }
+    .sheet__close:hover { background: var(--tri); }
+    .sheet__content { overflow: auto; padding: 14px 16px 18px; }
+
+    .cmp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .cmp-card { padding: 11px; border: 1px solid var(--rule); background: var(--sheet); display: grid; gap: 6px; }
+    .cmp-card--mux { border-color: var(--accent); background: var(--accent-tint); }
+    .cmp-head { display: flex; align-items: baseline; justify-content: space-between; }
+    .cmp-head strong { font-family: var(--mono); font-size: 12px; }
+    .cmp-out { font-size: 13.5px; font-weight: 700; line-height: 1.55; min-height: 64px; }
+    .cmp-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+    .about-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+    .about-list li { border-left: 2px solid var(--rule); padding-left: 12px; }
+    .about-list strong { display: block; font-size: 12.5px; margin-bottom: 3px; }
+    .about-list p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.65; }
+    .about-step { font-family: var(--mono); font-size: 10px; color: var(--accent); margin-right: 6px; }
+
+    @media (max-width: 1020px) {
+      .desk { grid-template-columns: clamp(232px, 31vw, 276px) minmax(0, 1fr); }
+      .right-col { display: none; }
+      .tagline { display: none; }
+    }
+    @media (max-width: 680px) {
+      .desk { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); padding: 8px 10px; gap: 8px; }
+      .lblock--hide-sm { display: none; }
+      .cmp-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="identity">
+        <a class="mark" href="../" title="griffith/ 一覧へ戻る">griffith<span class="slash">/</span>jpllm</a>
+        <h1>日本語 4 モード論理ゲート LLM</h1>
+        <span class="tagline">BPE · M4 Max Metal GPU 蒸留 · 0 ブロック乗算</span>
+      </div>
+      <div class="bar__right">
+        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">3 段同時比較</button>
+        <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
+        <button type="button" class="btn btn--go" id="btn-gen">生成</button>
+      </div>
+    </header>
+
+    <main class="desk">
+      <!-- 左：モード切替・モデル段・入力 -->
+      <section class="left-col" aria-label="入力とモデル設定">
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">スタイル / モード（1 モデル 4 役）</span>
+            <span class="kicker-mono" id="mode-tag">[X訳]</span>
+          </div>
+          <div class="mode-grid" id="mode-grid">
+            <button type="button" class="mode-btn" data-mode="[X訳]" aria-pressed="true">
+              <strong>X 自動翻訳風</strong><span>くそっ、俺は〜みたいなんだ</span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="[関西]" aria-pressed="false">
+              <strong>関西弁・エセ関西</strong><span>めっちゃ〜やん、知らんけど</span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="[津軽]" aria-pressed="false">
+              <strong>津軽弁</strong><span>わー、たんげ〜だびょん</span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="[会話]" aria-pressed="false">
+              <strong>会話モード</strong><span>X自動翻訳口調で返事</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">論理ゲート化レベル</span>
+            <span class="kicker-mono" id="load-stat">読込中…</span>
+          </div>
+          <div class="rung-row" id="rung-row">
+            <button type="button" class="rung-btn" data-rung="l0" aria-pressed="false">
+              <strong>L0</strong><span>実数 Teacher</span>
+            </button>
+            <button type="button" class="rung-btn" data-rung="l0b" aria-pressed="true">
+              <strong>L0b</strong><span>FFN 論理化</span>
+            </button>
+            <button type="button" class="rung-btn rung-btn--mux" data-rung="l3c" aria-pressed="false">
+              <strong>L3-C</strong><span>完全論理 · 乗算0</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">日本語を入力（Enter で即生成）</span>
+            <span class="kicker-mono" id="gen-speed">-</span>
+          </div>
+          <input class="jp-input" id="jp-in" type="text" value="今日めっちゃ眠い" placeholder="変換・会話したい日本語を入力…">
+          <div class="chips" id="preset-chips"></div>
+        </div>
+
+        <div class="lblock lblock--hide-sm">
+          <div class="slider-row">
+            <span>Temperature</span>
+            <input type="range" id="temp-range" min="15" max="100" value="55">
+            <span class="slider-val" id="temp-val">0.55</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 中央：ライブ出力カード + BPE トークン + Attention MUX マップ -->
+      <section class="stage-col" aria-label="生成結果と Attention MUX">
+        <div class="stage">
+          <div class="stage-head">
+            <span class="stage-title">
+              <span id="stage-model-name">L3-C 完全論理ゲート LLM（KL 蒸留）</span>
+              <span class="badge badge--mux" id="stage-badge">0 ブロック乗算 · 1-hot MUX</span>
+            </span>
+            <span class="kicker-mono" id="stage-meta">3層 · d=128 · BPE 768</span>
+          </div>
+
+          <div class="post-card">
+            <div class="post-src">
+              <div><span class="tag" id="out-tag">[X訳]</span><span id="out-src">今日めっちゃ眠い</span></div>
+              <span class="kicker-mono" id="out-status">待機中</span>
+            </div>
+            <div class="post-out" id="out-text">モデル読込中…</div>
+          </div>
+
+          <div class="bpe-strip" id="bpe-strip" aria-label="BPE トークン列">
+            <span class="bpe-label">BPE:</span>
+          </div>
+
+          <div class="attn-wrap">
+            <div class="block-head">
+              <span class="kicker" id="attn-caption">Causal Attention — L3-C ハードウェア MUX（各行 1 マスのみ点灯）</span>
+              <div style="display:flex;gap:8px;align-items:center">
+                <div class="seg-mini" id="layer-btns">
+                  <button type="button" data-l="0" aria-pressed="true">L0</button>
+                  <button type="button" data-l="1" aria-pressed="false">L1</button>
+                  <button type="button" data-l="2" aria-pressed="false">L2</button>
+                </div>
+                <div class="seg-mini" id="head-btns">
+                  <button type="button" data-h="0" aria-pressed="true">H0</button>
+                  <button type="button" data-h="1" aria-pressed="false">H1</button>
+                  <button type="button" data-h="2" aria-pressed="false">H2</button>
+                  <button type="button" data-h="3" aria-pressed="false">H3</button>
+                </div>
+              </div>
+            </div>
+            <svg id="attn-svg" viewBox="0 0 600 280" preserveAspectRatio="xMidYMid meet" role="img" aria-label="日本語 BPE Causal Attention マップ"></svg>
+          </div>
+
+          <div class="stage-foot">
+            <span id="attn-note">出力トークンが入力のどの日本語 BPE トークンを 1-hot MUX で参照したかを可視化</span>
+            <span class="kicker-mono" id="foot-muls">ブロック乗算: <b>0</b></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右：計器・Top-5 候補・履歴 -->
+      <aside class="right-col" aria-label="推論計器と候補確率">
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">モデル計器</span>
+            <span class="kicker-mono" id="m-size">- KB</span>
+          </div>
+          <div class="stat-grid">
+            <div class="stat-cell"><span>ブロック乗算/tok</span><strong class="accent" id="m-muls">0</strong></div>
+            <div class="stat-cell"><span>論理ゲート数</span><strong id="m-gates">-</strong></div>
+            <div class="stat-cell"><span>検証 PPL (hard)</span><strong id="m-ppl">-</strong></div>
+            <div class="stat-cell"><span>学習 Step</span><strong id="m-steps">-</strong></div>
+          </div>
+        </div>
+
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">次トークン Top-5 確率</span>
+            <span class="kicker-mono">BPE 768</span>
+          </div>
+          <div class="top5" id="top5-list"></div>
+        </div>
+
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">最近の生成</span>
+            <span class="kicker-mono">クリックで再利用</span>
+          </div>
+          <div class="hist-list" id="hist-list"></div>
+        </div>
+
+        <div class="rblock">
+          <button type="button" class="action-tile" id="open-cmp">L0 / L0b / L3-C を同時比較 <span>→</span></button>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
+      <span>Qwen3-4B (Apache 2.0) 蒸留データ → 純 Kizu BPE + M4 Max Metal GPU 学習 → L0→L3-C KL 蒸留 → 単体 WASM 推論</span>
+      <span class="foot-mono" id="foot-stat">kizu wasm32-browser</span>
+    </footer>
+
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="比較としくみ">
+        <div class="sheet__head">
+          <div class="sheet__tabs" role="tablist">
+            <button type="button" role="tab" data-tab="cmp" aria-selected="true">L0 / L0b / L3-C 並列比較</button>
+            <button type="button" role="tab" data-tab="about" aria-selected="false">この日本語論理ゲート LLM のしくみ</button>
+          </div>
+          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+        </div>
+        <div class="sheet__content">
+          <div id="tab-cmp">
+            <div class="block-head" style="margin-bottom:10px">
+              <span class="kicker-mono" id="cmp-prompt-label">同じ日本語入力・同じ乱数シードで 3 モデル同時生成</span>
+              <button type="button" class="btn btn--go" id="btn-run-cmp" style="min-height:28px;font-size:11px">同時生成</button>
+            </div>
+            <div class="cmp-grid">
+              <div class="cmp-card">
+                <div class="cmp-head"><strong>L0 (全実数)</strong><span class="kicker-mono" id="cmp-l0-meta">-</span></div>
+                <div class="cmp-out" id="cmp-l0-out">「同時生成」で比較</div>
+                <div class="cmp-meta" id="cmp-l0-stat">FP 行列積＋Softmax</div>
+              </div>
+              <div class="cmp-card">
+                <div class="cmp-head"><strong>L0b (FFN 論理化)</strong><span class="kicker-mono" id="cmp-l0b-meta">-</span></div>
+                <div class="cmp-out" id="cmp-l0b-out">「同時生成」で比較</div>
+                <div class="cmp-meta" id="cmp-l0b-stat">2,304 論理ゲート · KL 蒸留</div>
+              </div>
+              <div class="cmp-card cmp-card--mux">
+                <div class="cmp-head"><strong>L3-C (完全論理)</strong><span class="kicker-mono" id="cmp-l3-meta">-</span></div>
+                <div class="cmp-out" id="cmp-l3-out">「同時生成」で比較</div>
+                <div class="cmp-meta" id="cmp-l3-stat">3,456 論理ゲート · 乗算 0 · MUX</div>
+              </div>
+            </div>
+          </div>
+          <div id="tab-about" hidden>
+            <ul class="about-list">
+              <li>
+                <strong><span class="about-step">01</span>2 段階蒸留（オープンモデル → 実数 L0 → 乗算ゼロ L3-C）</strong>
+                <p>Apache 2.0 のオープンモデル（Qwen3-4B）から日本語 4 モード（<code>[X訳]</code>・<code>[関西]</code>・<code>[津軽]</code>・<code>[会話]</code>）の対話・変換データ約 1,700 件を生成し、純 Kizu のバイトレベル BPE（語彙 768・未知語ゼロ）で符号化。M4 Max Metal GPU 上で実数 Teacher <code>L0</code> を学習後、トークン単位の KL 蒸留で <code>L0b</code> / <code>L3-C</code> の論理ゲート回路へ知識を移しています。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">02</span>純 Kizu Metal GPU カーネルによる高速学習</strong>
+                <p><code>Linear</code>（前後伝播）と <code>WARP-LUT (N=2, 4)</code> の前後伝播（逆引き CSR で atomic ゼロ）を純 Kizu の <code>export "gpu" fn</code> から Metal シェーダへコンパイルし、Apple Silicon の統合メモリ上で学習しています。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">03</span>ブラウザ単体・軽量 `.glgpt` v2（約 0.5 MB）で乗算ゼロ生成</strong>
+                <p>離散化済みの論理ゲート真理値表と BPE マージ表、f16 埋め込みを 1 ファイルにまとめた <code>.glgpt</code> v2 をブラウザ WASM が直接実行。<code>L3-C</code> は Transformer ブロック内の浮動小数点乗算 0 回・Softmax 0 回（各ヘッド 1-hot ハードウェア MUX）でリアルタイムに日本語を紡ぎます。</p>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { instantiate } from "../dist/app.mjs";
+
+    const PRESETS_BY_MODE = {
+      "[X訳]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "そんな言葉使ってないよ", "雨降ってきて最悪", "バグが全然直らない"],
+      "[関西]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "仕事終わったから帰る", "猫が寝ててかわいい", "コードが一発で動いた", "コーヒー飲みたい"],
+      "[津軽]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "おはよう、今日も頑張ろう", "雨降ってきて最悪"],
+      "[会話]": ["おはよう", "疲れた", "あなたは誰？", "論理ゲートって何？", "腹減った", "すごいね"],
+    };
+
+    const RUNG_INFO = {
+      l0:  { name: "L0 全実数 Teacher（基準）", badge: "FP 行列積 · Softmax", mux: false },
+      l0b: { name: "L0b FFN 論理ゲート化（KL 蒸留）", badge: "FFN 乗算 0 · 2,304 LUT", mux: false },
+      l3c: { name: "L3-C 完全論理ゲート LLM（KL 蒸留）", badge: "0 ブロック乗算 · 1-hot MUX", mux: true },
+    };
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svgEl = (tag, attrs = {}, text = null) => {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+      if (text !== null) el.textContent = text;
+      return el;
+    };
+
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const slotBuffers = { 0: new Uint8Array(0), 1: new Uint8Array(0) };
+
+    let ex = null;
+    const handles = {};
+    const modelSizes = {};
+    let curMode = "[X訳]";
+    let curRung = "l0b";
+    let curLayer = 0;
+    let curHead = 0;
+    let lastPieceBytes = new Uint8Array(0);
+    let lastWindowTokens = [];
+    let promptTokCount = 0;
+    let generating = false;
+    let genTimer = 0;
+    let runSeed = 100;
+    const recentHist = [];
+    let sheetTab = "cmp";
+
+    function renderPresets() {
+      const box = document.getElementById("preset-chips");
+      box.innerHTML = "";
+      for (const txt of PRESETS_BY_MODE[curMode] || []) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "chip";
+        b.textContent = txt;
+        b.onclick = () => {
+          document.getElementById("jp-in").value = txt;
+          runGenerate();
+        };
+        box.appendChild(b);
+      }
+    }
+
+    async function ensureModel(rung) {
+      if (handles[rung]) return handles[rung];
+      document.getElementById("load-stat").textContent = `${rung.toUpperCase()} 読込中…`;
+      const resp = await fetch(`./models/${rung}.glgpt`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${rung}.glgpt`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      slotBuffers[0] = bytes;
+      const h = ex.ladder_load(bytes.byteLength) >>> 0;
+      if (!h) throw new Error(`ladder_load failed for ${rung}`);
+      handles[rung] = h;
+      modelSizes[rung] = bytes.byteLength;
+      document.getElementById("load-stat").textContent = `${rung.toUpperCase()} 準備完了`;
+      return h;
+    }
+
+    function updateModelStats(h, rung, seqLen) {
+      const info = RUNG_INFO[rung];
+      document.getElementById("stage-model-name").textContent = info.name;
+      const badge = document.getElementById("stage-badge");
+      badge.textContent = info.badge;
+      badge.classList.toggle("badge--mux", info.mux);
+
+      const muls = ex.ladder_block_muls(h, Math.max(1, seqLen));
+      const gates = ex.ladder_meta(h, 9);
+      const hppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
+      const steps = ex.ladder_meta(h, 8);
+      const kb = (modelSizes[rung] / 1024).toFixed(0);
+
+      document.getElementById("m-size").textContent = `${kb} KB`;
+      document.getElementById("m-muls").textContent = muls.toLocaleString();
+      document.getElementById("m-gates").textContent = gates.toLocaleString();
+      document.getElementById("m-ppl").textContent = hppl;
+      document.getElementById("m-steps").textContent = steps.toLocaleString();
+      document.getElementById("foot-muls").innerHTML = `ブロック乗算: <b>${muls.toLocaleString()}</b>`;
+      document.getElementById("attn-caption").textContent = info.mux
+        ? "Causal Attention — L3-C ハードウェア MUX（各行 1 マスのみ点灯）"
+        : `Causal Attention — ${rung.toUpperCase()} Softmax 確率分布`;
+    }
+
+    function fmtTokLabel(s) {
+      return s.replace(/\n/g, "↵").replace(/ /g, "␣");
+    }
+
+    function renderBpeStrip() {
+      const strip = document.getElementById("bpe-strip");
+      strip.innerHTML = `<span class="bpe-label">BPE (${lastWindowTokens.length}):</span>`;
+      const show = lastWindowTokens.slice(-24);
+      const offset = lastWindowTokens.length - show.length;
+      show.forEach((tok, idx) => {
+        const sp = document.createElement("span");
+        sp.className = "bpe-tok" + (offset + idx >= promptTokCount ? " bpe-tok--out" : "");
+        sp.textContent = fmtTokLabel(tok);
+        strip.appendChild(sp);
+      });
+    }
+
+    function renderTop5(h) {
+      const list = document.getElementById("top5-list");
+      list.innerHTML = "";
+      for (let r = 0; r < 5; r++) {
+        const pm = ex.ladder_top_bpe(h, r);
+        const pct = pm / 10;
+        const lbl = fmtTokLabel(decoder.decode(lastPieceBytes) || "?");
+        const row = document.createElement("div");
+        row.className = "t5-row";
+        row.innerHTML =
+          `<span class="t5-tok">${lbl.replace(/</g, "&lt;")}</span>` +
+          `<div class="track"><div class="fill ${r === 0 ? "fill--acc" : ""}" style="width:${Math.max(2, pct).toFixed(1)}%"></div></div>` +
+          `<span class="t5-p">${pct.toFixed(1)}%</span>`;
+        list.appendChild(row);
+      }
+    }
+
+    function renderAttention(h, rung) {
+      const svg = document.getElementById("attn-svg");
+      svg.innerHTML = "";
+      const n = lastWindowTokens.length;
+      if (n <= 0) return;
+
+      // Show last up to 22 tokens cleanly so labels remain legible
+      const maxShow = Math.min(n, 22);
+      const start = n - maxShow;
+      const W = 600, H = 280;
+      const left = 54, top = 28, right = 14, bot = 12;
+      const cell = Math.min((W - left - right) / maxShow, (H - top - bot) / maxShow);
+      const ox = left + Math.max(0, ((W - left - right) - cell * maxShow) * 0.5);
+      const oy = top;
+      const isMux = rung === "l3c";
+
+      for (let i = 0; i < maxShow; i++) {
+        const lbl = fmtTokLabel(lastWindowTokens[start + i]).slice(0, 4);
+        // Column header (Key)
+        svg.appendChild(svgEl("text", {
+          x: ox + (i + 0.5) * cell, y: oy - 6,
+          "text-anchor": "middle", "font-family": "var(--mono), var(--jp)",
+          "font-size": Math.min(9.5, Math.max(6.5, cell * 0.42)),
+          fill: start + i >= promptTokCount ? "#ff4d00" : "#68665e",
+        }, lbl));
+        // Row header (Query)
+        svg.appendChild(svgEl("text", {
+          x: ox - 5, y: oy + (i + 0.65) * cell,
+          "text-anchor": "end", "font-family": "var(--mono), var(--jp)",
+          "font-size": Math.min(9.5, Math.max(6.5, cell * 0.42)),
+          fill: start + i >= promptTokCount ? "#141412" : "#68665e",
+        }, lbl));
+
+        for (let j = 0; j < maxShow; j++) {
+          const qi = start + i, kj = start + j;
+          if (kj > qi) continue;
+          const w = ex.ladder_attn_milli(h, curLayer, curHead, qi, kj) / 1000;
+          let fill = "#f2f0e9";
+          if (isMux) {
+            fill = w > 0.5 ? "#ff4d00" : "#efede6";
+          } else {
+            const a = Math.min(1, Math.pow(w, 0.65));
+            const r = Math.round(242 + (255 - 242) * a);
+            const g = Math.round(240 + (77 - 240) * a);
+            const b = Math.round(233 + (0 - 233) * a);
+            fill = `rgb(${r},${g},${b})`;
+          }
+          svg.appendChild(svgEl("rect", {
+            x: ox + j * cell + 0.6,
+            y: oy + i * cell + 0.6,
+            width: Math.max(1, cell - 1.2),
+            height: Math.max(1, cell - 1.2),
+            rx: isMux ? 1.5 : 0.8,
+            fill,
+            stroke: (isMux && w > 0.5) ? "#141412" : "#e3e0d6",
+            "stroke-width": (isMux && w > 0.5) ? 0.8 : 0.4,
+          }));
+        }
+      }
+    }
+
+    function evalPromptBytes(h, bytesUint8) {
+      slotBuffers[1] = bytesUint8;
+      return ex.ladder_eval_bytes(h, bytesUint8.byteLength);
+    }
+
+    function decodeCleanUtf8(bytesArr) {
+      const s = decoder.decode(new Uint8Array(bytesArr)).split("\n")[0];
+      return s.replace(/\uFFFD/g, "");
+    }
+
+    function stopGen() {
+      generating = false;
+      if (genTimer) { clearTimeout(genTimer); genTimer = 0; }
+      document.getElementById("btn-gen").textContent = "生成";
+    }
+
+    function renderHistory() {
+      const box = document.getElementById("hist-list");
+      box.innerHTML = "";
+      for (const item of recentHist.slice(0, 4)) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "hist-item";
+        b.innerHTML = `<span class="h-meta">${item.mode} · ${item.rung.toUpperCase()}</span><span class="h-txt">${item.out.replace(/</g, "&lt;")}</span>`;
+        b.onclick = () => {
+          curMode = item.mode;
+          document.querySelectorAll("#mode-grid button").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === curMode)));
+          document.getElementById("mode-tag").textContent = curMode;
+          renderPresets();
+          document.getElementById("jp-in").value = item.src;
+          runGenerate();
+        };
+        box.appendChild(b);
+      }
+    }
+
+    async function runGenerate() {
+      if (!ex) return;
+      if (generating) { stopGen(); return; }
+
+      const h = await ensureModel(curRung);
+      const src = (document.getElementById("jp-in").value || "").trim() || "今日めっちゃ眠い";
+      const prefix = `${curMode} ${src}\n=> `;
+      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
+
+      document.getElementById("out-tag").textContent = curMode;
+      document.getElementById("out-src").textContent = src;
+      document.getElementById("out-status").textContent = "生成中…";
+      document.getElementById("out-text").innerHTML = `<span class="caret"></span>`;
+
+      generating = true;
+      document.getElementById("btn-gen").textContent = "停止";
+
+      // Accumulate raw UTF-8 bytes (never roundtrip partial multi-byte kanji through TextDecoder!)
+      const fullBytes = Array.from(encoder.encode(prefix));
+      const outBytes = [];
+      let steps = 0;
+      const maxToks = 44;
+      runSeed = (runSeed + 17) >>> 0;
+      let totalMs = 0;
+
+      const initLen = evalPromptBytes(h, new Uint8Array(fullBytes));
+      promptTokCount = initLen;
+      updateModelStats(h, curRung, initLen);
+      renderBpeStrip();
+      renderTop5(h);
+      renderAttention(h, curRung);
+
+      function stepOnce() {
+        if (!generating) return;
+        const t0 = performance.now();
+        const tid = ex.ladder_sample_bpe(h, tempMilli, steps === 0 ? runSeed : 0);
+        const piece = new Uint8Array(lastPieceBytes);
+        let hasNl = (tid === 10);
+        for (const b of piece) {
+          fullBytes.push(b);
+          outBytes.push(b);
+          if (b === 10) hasNl = true;
+        }
+        const seqLen = evalPromptBytes(h, new Uint8Array(fullBytes));
+        totalMs += (performance.now() - t0);
+        steps++;
+
+        const outStr = decodeCleanUtf8(outBytes);
+        const hitStop = hasNl || steps >= maxToks;
+        document.getElementById("out-text").innerHTML =
+          outStr.replace(/</g, "&lt;") + (hitStop ? "" : `<span class="caret"></span>`);
+        document.getElementById("gen-speed").textContent = `${((steps * 1000) / Math.max(totalMs, 0.1)).toFixed(0)} tok/s`;
+
+        updateModelStats(h, curRung, seqLen);
+        renderBpeStrip();
+        renderTop5(h);
+        renderAttention(h, curRung);
+
+        if (hitStop) {
+          stopGen();
+          document.getElementById("out-status").textContent = `${steps} tok · ${totalMs.toFixed(1)} ms`;
+          if (outStr.trim()) {
+            recentHist.unshift({ mode: curMode, rung: curRung, src, out: outStr.trim() });
+            renderHistory();
+          }
+          return;
+        }
+        genTimer = setTimeout(stepOnce, 18);
+      }
+      genTimer = setTimeout(stepOnce, 10);
+    }
+
+    async function runCompare() {
+      const src = (document.getElementById("jp-in").value || "").trim() || "今日めっちゃ眠い";
+      const prefix = `${curMode} ${src}\n=> `;
+      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
+      document.getElementById("cmp-prompt-label").textContent = `入力: ${curMode} ${src}`;
+      document.getElementById("cmp-l0-out").textContent = "L0 読込・生成中…";
+      document.getElementById("cmp-l0b-out").textContent = "L0b 読込・生成中…";
+      document.getElementById("cmp-l3-out").textContent = "L3-C 読込・生成中…";
+
+      const h0 = await ensureModel("l0");
+      const h0b = await ensureModel("l0b");
+      const h3 = await ensureModel("l3c");
+      const cmpSeed = (runSeed + 31) >>> 0;
+
+      const genOne = (h) => {
+        const fullBytes = Array.from(encoder.encode(prefix));
+        const outB = [];
+        const t0 = performance.now();
+        evalPromptBytes(h, new Uint8Array(fullBytes));
+        let n = 0;
+        for (let i = 0; i < 42; i++) {
+          const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? cmpSeed : 0);
+          let hasNl = (tid === 10);
+          for (const b of lastPieceBytes) {
+            fullBytes.push(b);
+            outB.push(b);
+            if (b === 10) hasNl = true;
+          }
+          n++;
+          if (hasNl) break;
+          evalPromptBytes(h, new Uint8Array(fullBytes));
+        }
+        const ms = performance.now() - t0;
+        return { text: decodeCleanUtf8(outB), ms, n, muls: ex.ladder_block_muls(h, 24) };
+      };
+
+      const r0 = genOne(h0);
+      const r0b = genOne(h0b);
+      const r3 = genOne(h3);
+      document.getElementById("cmp-l0-out").textContent = r0.text || "(空)";
+      document.getElementById("cmp-l0-meta").textContent = `${(modelSizes.l0 / 1024).toFixed(0)} KB · ${r0.ms.toFixed(1)} ms`;
+      document.getElementById("cmp-l0-stat").textContent = `ブロック乗算 ${r0.muls.toLocaleString()}/tok · ${r0.n} tok`;
+
+      document.getElementById("cmp-l0b-out").textContent = r0b.text || "(空)";
+      document.getElementById("cmp-l0b-meta").textContent = `${(modelSizes.l0b / 1024).toFixed(0)} KB · ${r0b.ms.toFixed(1)} ms`;
+      document.getElementById("cmp-l0b-stat").textContent = `ブロック乗算 ${r0b.muls.toLocaleString()}/tok · 2,304 ゲート`;
+
+      document.getElementById("cmp-l3-out").textContent = r3.text || "(空)";
+      document.getElementById("cmp-l3-meta").textContent = `${(modelSizes.l3c / 1024).toFixed(0)} KB · ${r3.ms.toFixed(1)} ms`;
+      document.getElementById("cmp-l3-stat").textContent = `ブロック乗算 0/tok · 3,456 ゲート · MUX`;
+    }
+
+    // UI イベント
+    document.querySelectorAll("#mode-grid button").forEach((b) => {
+      b.onclick = () => {
+        curMode = b.dataset.mode;
+        document.querySelectorAll("#mode-grid button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        document.getElementById("mode-tag").textContent = curMode;
+        renderPresets();
+        const defaults = PRESETS_BY_MODE[curMode];
+        if (curMode === "[会話]" && !defaults.includes(document.getElementById("jp-in").value)) {
+          document.getElementById("jp-in").value = defaults[0];
+        }
+        runGenerate();
+      };
+    });
+
+    document.querySelectorAll("#rung-row button").forEach((b) => {
+      b.onclick = () => {
+        curRung = b.dataset.rung;
+        document.querySelectorAll("#rung-row button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        runGenerate();
+      };
+    });
+
+    document.querySelectorAll("#layer-btns button").forEach((b) => {
+      b.onclick = () => {
+        curLayer = Number(b.dataset.l);
+        document.querySelectorAll("#layer-btns button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        if (handles[curRung]) renderAttention(handles[curRung], curRung);
+      };
+    });
+
+    document.querySelectorAll("#head-btns button").forEach((b) => {
+      b.onclick = () => {
+        curHead = Number(b.dataset.h);
+        document.querySelectorAll("#head-btns button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        if (handles[curRung]) renderAttention(handles[curRung], curRung);
+      };
+    });
+
+    document.getElementById("temp-range").oninput = (e) => {
+      document.getElementById("temp-val").textContent = (Number(e.target.value) / 100).toFixed(2);
+    };
+    document.getElementById("jp-in").addEventListener("keydown", (e) => { if (e.key === "Enter") runGenerate(); });
+    document.getElementById("btn-gen").onclick = runGenerate;
+
+    // シート
+    const sheet = document.getElementById("sheet"), btnCmp = document.getElementById("btn-cmp"), btnAbout = document.getElementById("btn-about");
+    function openSheet(tab) {
+      sheetTab = tab; sheet.hidden = false;
+      btnCmp.setAttribute("aria-expanded", String(tab === "cmp"));
+      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
+      document.querySelectorAll(".sheet__tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+      document.getElementById("tab-cmp").hidden = tab !== "cmp";
+      document.getElementById("tab-about").hidden = tab !== "about";
+      if (tab === "cmp" && ex) runCompare();
+    }
+    function closeSheet() { sheet.hidden = true; btnCmp.setAttribute("aria-expanded", "false"); btnAbout.setAttribute("aria-expanded", "false"); }
+    btnCmp.onclick = () => (!sheet.hidden && sheetTab === "cmp") ? closeSheet() : openSheet("cmp");
+    btnAbout.onclick = () => (!sheet.hidden && sheetTab === "about") ? closeSheet() : openSheet("about");
+    document.getElementById("open-cmp").onclick = () => openSheet("cmp");
+    document.getElementById("btn-run-cmp").onclick = runCompare;
+    document.getElementById("sheet-close").onclick = closeSheet;
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    document.querySelectorAll(".sheet__tabs button").forEach((b) => { b.onclick = () => openSheet(b.dataset.tab); });
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
+
+    async function boot() {
+      renderPresets();
+      const wasmResp = await fetch("../dist/app.wasm");
+      const kb = `${((await wasmResp.arrayBuffer()).byteLength / 1024).toFixed(0)} KB`;
+      const program = await instantiate({
+        write() { return true; },
+        host: {
+          read_input(host, slot, offset, ptr, cap) {
+            const src = slotBuffers[slot];
+            if (!src || offset >= src.byteLength) return 0;
+            const end = Math.min(src.byteLength, offset + (cap >>> 0));
+            return host.writeBytes(ptr, src.subarray(offset, end));
+          },
+          give_bytes(host, kind, ptr, len) {
+            const raw = new Uint8Array(host.readBytes(ptr, len));
+            if (kind === 2) {
+              lastPieceBytes = raw;
+            } else if (kind === 3) {
+              // NUL-separated UTF-8 BPE token strings
+              const toks = [];
+              let s = 0;
+              for (let i = 0; i <= raw.length; i++) {
+                if (i === raw.length || raw[i] === 0) {
+                  toks.push(decoder.decode(raw.subarray(s, i)));
+                  s = i + 1;
+                }
+              }
+              lastWindowTokens = toks;
+            }
+          },
+        },
+      });
+      program.start();
+      ex = program.exports;
+      document.getElementById("foot-stat").textContent = `${kb} .wasm · kizu wasm32-browser`;
+      try {
+        await ensureModel("l0b");
+        runGenerate();
+      } catch (err) {
+        document.getElementById("out-text").textContent = `モデル読込エラー: ${err.message}`;
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -n "${KIZU_SRC:-}" ]; then
+    KIZU_BIN="$KIZU_SRC/target/seed/stage1/bin/kizu"
+    if [ ! -x "$KIZU_BIN" ]; then
+        echo "error: Kizu compiler not found at $KIZU_BIN (check KIZU_SRC)" >&2
+        exit 1
+    fi
+    export KIZU_LIB_DIR="${KIZU_LIB_DIR:-$KIZU_SRC/lib/kizu}"
+    exec "$KIZU_BIN" "$@"
+fi
+
+if command -v kizu >/dev/null 2>&1; then
+    exec kizu "$@"
+fi
+
+# Fallback for sibling source checkout (e.g. ../../kizu-lang/kizu or ../kizu)
+for candidate in "$SCRIPT_DIR/../../../kizu-lang/kizu" "$SCRIPT_DIR/../../kizu"; do
+    if [ -x "$candidate/target/seed/stage1/bin/kizu" ]; then
+        export KIZU_LIB_DIR="${KIZU_LIB_DIR:-$candidate/lib/kizu}"
+        exec "$candidate/target/seed/stage1/bin/kizu" "$@"
+    fi
+done
+
+echo "error: Kizu compiler not found. Install 'kizu' on PATH or set KIZU_SRC=/path/to/kizu" >&2
+exit 1

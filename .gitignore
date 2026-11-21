@@ -1,0 +1,23 @@
+# Build outputs
+/target/
+*.o
+*.spv
+*.metal
+*.wasm
+
+# Keep prebuilt browser demo WASM bundle for out-of-the-box static hosting
+!/web/dist/
+!/web/dist/app.wasm
+!/web/dist/app.mjs
+
+# Training corpora, checkpoints, and private working notes (root-anchored so src/data/ is tracked!)
+/data/
+/checkpoints/
+/notes/
+
+# Local environment & OS / Python caches
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc

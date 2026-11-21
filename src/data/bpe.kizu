@@ -1,0 +1,458 @@
+import griffith::core;
+import std::array;
+import std::mem;
+import std::string;
+import std::testing;
+
+pub struct BpeVocab {
+    pub vocab_size: i64,
+    pub num_merges: i64,
+    pub merge_left: array::Array<i32>,
+    pub merge_right: array::Array<i32>,
+    pub tok_offsets: array::Array<i32>,
+    pub tok_bytes: string::String,
+    // Open-addressed O(1) hash table mapping (left << 16 | right) -> merge rank (0..num_merges-1)
+    pub ht_mask: i64,
+    pub ht_keys: array::Array<i32>,
+    pub ht_ranks: array::Array<i32>,
+}
+
+pub fn (self: BpeVocab) deinit(allocator: Allocator) -> void {
+    self.merge_left.deinit(allocator);
+    self.merge_right.deinit(allocator);
+    self.tok_offsets.deinit(allocator);
+    self.tok_bytes.deinit(allocator);
+    self.ht_keys.deinit(allocator);
+    self.ht_ranks.deinit(allocator);
+    return;
+}
+
+fn pair_key(a: i32, b: i32) -> i32 {
+    return (a << 16) | (b & 65535);
+}
+
+fn pair_hash(key: i32, mask: i64) -> i64 {
+    let x = cast<u32>(key) * cast<u32>(2654435761);
+    return cast<i64>(x ^ (x >> 16)) & mask;
+}
+
+fn arr_i32_get(a: &array::Array<i32>, idx: i64) -> i32 {
+    let s = a.as_slice();
+    return s[idx];
+}
+
+fn arr_i32_set(a: &var array::Array<i32>, idx: i64, val: i32) -> void {
+    let s = a.as_mut_slice();
+    s[idx] = val;
+    return;
+}
+
+fn str_byte_at(s: &string::String, idx: i64) -> u8 {
+    let bs = s.as_bytes();
+    return bs[idx];
+}
+
+/// Rebuilds tok_offsets, tok_bytes, and O(1) pair-rank lookup hash table from merge arrays.
+pub fn bpe_from_merges(
+    allocator: Allocator,
+    merge_left_in: []i32,
+    merge_right_in: []i32,
+    num_merges: i64
+) -> mem::Error!BpeVocab {
+    let vocab_size = 256 + num_merges;
+    var ml = try core::alloc_i32(allocator, if num_merges > 0 { num_merges } else { 1 });
+    errdefer ml.deinit(allocator);
+    var mr = try core::alloc_i32(allocator, if num_merges > 0 { num_merges } else { 1 });
+    errdefer mr.deinit(allocator);
+    for 0..num_merges |m| {
+        arr_i32_set(&var ml, m, merge_left_in[m]);
+        arr_i32_set(&var mr, m, merge_right_in[m]);
+    }
+
+    var tok_offsets = try core::alloc_i32(allocator, vocab_size + 1);
+    errdefer tok_offsets.deinit(allocator);
+    var tok_bytes = string::new(allocator);
+    errdefer tok_bytes.deinit(allocator);
+
+    for 0..256 |b| {
+        arr_i32_set(&var tok_offsets, b, cast<i32>(tok_bytes.len()));
+        try tok_bytes.append_byte(allocator, cast<u8>(b));
+    }
+    for 0..num_merges |m| {
+        let id = 256 + m;
+        arr_i32_set(&var tok_offsets, id, cast<i32>(tok_bytes.len()));
+        let l = cast<i64>(merge_left_in[m]);
+        let r = cast<i64>(merge_right_in[m]);
+        let ls = cast<i64>(arr_i32_get(&tok_offsets, l));
+        let le = cast<i64>(arr_i32_get(&tok_offsets, l + 1));
+        let rs = cast<i64>(arr_i32_get(&tok_offsets, r));
+        let re = cast<i64>(arr_i32_get(&tok_offsets, r + 1));
+        for ls..le |i| {
+            let bv = str_byte_at(&tok_bytes, i);
+            try tok_bytes.append_byte(allocator, bv);
+        }
+        for rs..re |i| {
+            let bv = str_byte_at(&tok_bytes, i);
+            try tok_bytes.append_byte(allocator, bv);
+        }
+    }
+    arr_i32_set(&var tok_offsets, vocab_size, cast<i32>(tok_bytes.len()));
+
+    // Build O(1) hash table (power-of-2 >= 4 * num_merges, min 256)
+    var cap: i64 = 256;
+    while cap < num_merges * 4 {
+        cap = cap * 2;
+    }
+    let mask = cap - 1;
+    var ht_keys = try core::alloc_i32(allocator, cap);
+    errdefer ht_keys.deinit(allocator);
+    var ht_ranks = try core::alloc_i32(allocator, cap);
+    errdefer ht_ranks.deinit(allocator);
+    let hk = ht_keys.as_mut_slice();
+    let hr = ht_ranks.as_mut_slice();
+    for 0..cap |i| {
+        hk[i] = -1;
+        hr[i] = -1;
+    }
+    for 0..num_merges |m| {
+        let key = pair_key(merge_left_in[m], merge_right_in[m]);
+        var slot = pair_hash(key, mask);
+        while hk[slot] != -1 and hk[slot] != key {
+            slot = (slot + 1) & mask;
+        }
+        if hk[slot] == -1 {
+            hk[slot] = key;
+            hr[slot] = cast<i32>(m);
+        }
+    }
+
+    return BpeVocab {
+        vocab_size: vocab_size,
+        num_merges: num_merges,
+        merge_left: move ml,
+        merge_right: move mr,
+        tok_offsets: move tok_offsets,
+        tok_bytes: move tok_bytes,
+        ht_mask: mask,
+        ht_keys: move ht_keys,
+        ht_ranks: move ht_ranks,
+    };
+}
+
+fn bpe_lookup_rank(bpe: &BpeVocab, a: i32, b: i32) -> i32 {
+    let key = pair_key(a, b);
+    let mask = bpe.ht_mask;
+    let hk = bpe.ht_keys.as_slice();
+    let hr = bpe.ht_ranks.as_slice();
+    var slot = pair_hash(key, mask);
+    while true {
+        let k = hk[slot];
+        if k == key { return hr[slot]; }
+        if k == -1 { return -1; }
+        slot = (slot + 1) & mask;
+    }
+    return -1;
+}
+
+/// Trains a byte-level BPE tokenizer (256 base bytes + up to target_vocab - 256 merges).
+/// Never merges across '\n' (byte 10) so line/prompt structure tags stay clean.
+pub fn bpe_train(allocator: Allocator, text: []u8, target_vocab: i64) -> mem::Error!BpeVocab {
+    let n = mem::len(text);
+    let max_merges = if target_vocab > 256 { target_vocab - 256 } else { 0 };
+
+    var ids = try core::alloc_i32(allocator, if n > 0 { n } else { 1 });
+    defer ids.deinit(allocator);
+    let ids_m = ids.as_mut_slice();
+    for 0..n |i| {
+        ids_m[i] = cast<i32>(text[i]);
+    }
+    var cur_len = n;
+
+    var ml = try core::alloc_i32(allocator, if max_merges > 0 { max_merges } else { 1 });
+    defer ml.deinit(allocator);
+    var mr = try core::alloc_i32(allocator, if max_merges > 0 { max_merges } else { 1 });
+    defer mr.deinit(allocator);
+    let ml_m = ml.as_mut_slice();
+    let mr_m = mr.as_mut_slice();
+
+    // Frequency hash table for pair counting (65536 slots, touched-list reset for speed)
+    let ht_cap: i64 = 65536;
+    let ht_mask: i64 = ht_cap - 1;
+    var f_keys = try core::alloc_i32(allocator, ht_cap);
+    defer f_keys.deinit(allocator);
+    var f_cnts = try core::alloc_i32(allocator, ht_cap);
+    defer f_cnts.deinit(allocator);
+    var touched = try core::alloc_i32(allocator, ht_cap);
+    defer touched.deinit(allocator);
+    let fk = f_keys.as_mut_slice();
+    let fc = f_cnts.as_mut_slice();
+    let tc = touched.as_mut_slice();
+    for 0..ht_cap |i| { fk[i] = -1; fc[i] = 0; }
+
+    var actual_merges: i64 = 0;
+    for 0..max_merges |m| {
+        if cur_len < 2 { break; }
+        var n_touched: i64 = 0;
+        var best_key: i32 = -1;
+        var best_cnt: i32 = 1;
+
+        for 0..(cur_len - 1) |i| {
+            let a = ids_m[i];
+            let b = ids_m[i + 1];
+            // Do not merge across newline so line/style boundaries remain exact
+            if a == 10 or b == 10 { continue; }
+            let key = pair_key(a, b);
+            var slot = pair_hash(key, ht_mask);
+            while fk[slot] != -1 and fk[slot] != key {
+                slot = (slot + 1) & ht_mask;
+            }
+            if fk[slot] == -1 {
+                fk[slot] = key;
+                fc[slot] = 1;
+                if n_touched < ht_cap {
+                    tc[n_touched] = cast<i32>(slot);
+                    n_touched = n_touched + 1;
+                }
+            } else {
+                let c = fc[slot] + 1;
+                fc[slot] = c;
+                if c > best_cnt {
+                    best_cnt = c;
+                    best_key = key;
+                }
+            }
+        }
+
+        // Reset touched slots cleanly
+        for 0..n_touched |t| {
+            let s = cast<i64>(tc[t]);
+            fk[s] = -1;
+            fc[s] = 0;
+        }
+
+        if best_key < 0 or best_cnt < 2 {
+            break;
+        }
+
+        let best_a = (best_key >> 16) & 65535;
+        let best_b = best_key & 65535;
+        let new_id = cast<i32>(256 + m);
+        ml_m[m] = best_a;
+        mr_m[m] = best_b;
+        actual_merges = m + 1;
+
+        // Apply merge in place
+        var w: i64 = 0;
+        var r: i64 = 0;
+        while r < cur_len {
+            if r + 1 < cur_len and ids_m[r] == best_a and ids_m[r + 1] == best_b {
+                ids_m[w] = new_id;
+                w = w + 1;
+                r = r + 2;
+            } else {
+                ids_m[w] = ids_m[r];
+                w = w + 1;
+                r = r + 1;
+            }
+        }
+        cur_len = w;
+    }
+
+    let ml_s = ml.as_slice();
+    let mr_s = mr.as_slice();
+    return try bpe_from_merges(allocator, ml_s, mr_s, actual_merges);
+}
+
+/// Encodes one UTF-8 chunk (no newlines or short prompt) with exact merge-rank priority.
+fn bpe_encode_segment(
+    allocator: Allocator,
+    bpe: &BpeVocab,
+    seg: []u8,
+    work: &var array::Array<i32>,
+    out: &var array::Array<i32>
+) -> mem::Error!void {
+    let n = mem::len(seg);
+    if n == 0 { return; }
+    work.clear(allocator);
+    for 0..n |i| {
+        try work.append(allocator, cast<i32>(seg[i]));
+    }
+    var cur = n;
+    while cur >= 2 {
+        let ws = work.as_slice();
+        var best_rank: i32 = 2147483647;
+        var best_a: i32 = -1;
+        var best_b: i32 = -1;
+        for 0..(cur - 1) |i| {
+            let r = bpe_lookup_rank(bpe, ws[i], ws[i + 1]);
+            if r >= 0 and r < best_rank {
+                best_rank = r;
+                best_a = ws[i];
+                best_b = ws[i + 1];
+            }
+        }
+        if best_rank == 2147483647 { break; }
+        let new_id = cast<i32>(256) + best_rank;
+        let wm = work.as_mut_slice();
+        var w: i64 = 0;
+        var idx: i64 = 0;
+        while idx < cur {
+            if idx + 1 < cur and wm[idx] == best_a and wm[idx + 1] == best_b {
+                wm[w] = new_id;
+                w = w + 1;
+                idx = idx + 2;
+            } else {
+                wm[w] = wm[idx];
+                w = w + 1;
+                idx = idx + 1;
+            }
+        }
+        cur = w;
+    }
+    for 0..cur |i| {
+        let v = arr_i32_get(work, i);
+        try out.append(allocator, v);
+    }
+    return;
+}
+
+/// Lossless byte-level BPE encoding over arbitrary UTF-8 text (splits on '\n' so encoding is O(line_len^2) and super fast).
+pub fn bpe_encode(
+    allocator: Allocator,
+    bpe: &BpeVocab,
+    text: []u8,
+    out: &var array::Array<i32>
+) -> mem::Error!void {
+    out.clear(allocator);
+    let n = mem::len(text);
+    var work = array::new<i32>(allocator);
+    defer work.deinit(allocator);
+    var start: i64 = 0;
+    for 0..n |i| {
+        if text[i] == 10 {
+            if i > start {
+                try bpe_encode_segment(allocator, bpe, text[start..i], &var work, out);
+            }
+            try out.append(allocator, 10);
+            start = i + 1;
+        }
+    }
+    if start < n {
+        try bpe_encode_segment(allocator, bpe, text[start..n], &var work, out);
+    }
+    return;
+}
+
+pub fn bpe_token_bytes(bpe: &BpeVocab, id: i32) -> []u8 {
+    let idx = cast<i64>(id);
+    if idx < 0 or idx >= bpe.vocab_size {
+        return "";
+    }
+    let offs = bpe.tok_offsets.as_slice();
+    let s = cast<i64>(offs[idx]);
+    let e = cast<i64>(offs[idx + 1]);
+    let bs = bpe.tok_bytes.as_bytes();
+    return bs[s..e];
+}
+
+pub fn bpe_decode(
+    allocator: Allocator,
+    bpe: &BpeVocab,
+    ids: []i32,
+    count: i64,
+    out: &var string::String
+) -> mem::Error!void {
+    for 0..count |i| {
+        let piece = bpe_token_bytes(bpe, ids[i]);
+        try out.append_bytes(allocator, piece);
+    }
+    return;
+}
+
+pub struct BpeCorpus {
+    pub vocab: BpeVocab,
+    pub tokens: array::Array<i32>,
+    pub train_len: i64,
+    pub val_start: i64,
+    pub val_len: i64,
+}
+
+pub fn (self: BpeCorpus) deinit(allocator: Allocator) -> void {
+    self.vocab.deinit(allocator);
+    self.tokens.deinit(allocator);
+    return;
+}
+
+pub fn build_bpe_corpus(allocator: Allocator, text: []u8, target_vocab: i64) -> mem::Error!BpeCorpus {
+    var vocab = try bpe_train(allocator, text, target_vocab);
+    errdefer vocab.deinit(allocator);
+    var tokens = array::new<i32>(allocator);
+    errdefer tokens.deinit(allocator);
+    try bpe_encode(allocator, &vocab, text, &var tokens);
+
+    let n = tokens.len();
+    let train_len = (n * 9) / 10;
+    let val_start = train_len;
+    let val_len = n - train_len;
+    return BpeCorpus {
+        vocab: move vocab,
+        tokens: move tokens,
+        train_len: train_len,
+        val_start: val_start,
+        val_len: val_len,
+    };
+}
+
+pub fn sample_bpe_batch(
+    corpus: &BpeCorpus,
+    batch: i64,
+    seq_len: i64,
+    is_val: bool,
+    rng: &var core::Rng,
+    x_out: &var []i32,
+    y_out: &var []i32
+) -> void {
+    let tok_s = corpus.tokens.as_slice();
+    let base = if is_val { corpus.val_start } else { 0 };
+    let span = (if is_val { corpus.val_len } else { corpus.train_len }) - seq_len - 1;
+    let safe_span = if span > 1 { span } else { 1 };
+    for 0..batch |b| {
+        let start = base + rng.next_range(safe_span);
+        let off = b * seq_len;
+        for 0..seq_len |t| {
+            x_out[off + t] = tok_s[start + t];
+            y_out[off + t] = tok_s[start + t + 1];
+        }
+    }
+    return;
+}
+
+test "byte-level BPE trains, compresses Japanese UTF-8, and roundtrips losslessly" {
+    let allocator = mem::page_allocator();
+    let sample = "[X訳] 今日めっちゃ眠い\n=> くそっ、俺は今日クソほど眠いみたいなんだよ。\n\n[関西] 今日めっちゃ眠い\n=> 今日ほんまめっちゃ眠いわ、もうあかんねん。\n\n[津軽] 今日めっちゃ眠い\n=> わー、今日たんげねぷてはんで、もうだめだびょん。\n\n";
+    var bpe = try bpe_train(allocator, sample, 300);
+    defer bpe.deinit(allocator);
+    testing::expect(bpe.vocab_size > 260);
+
+    var ids = array::new<i32>(allocator);
+    defer ids.deinit(allocator);
+    try bpe_encode(allocator, &bpe, sample, &var ids);
+    testing::expect(ids.len() < mem::len(sample));
+
+    var dec = string::new(allocator);
+    defer dec.deinit(allocator);
+    let id_s = ids.as_slice();
+    try bpe_decode(allocator, &bpe, id_s, ids.len(), &var dec);
+    let dec_b = dec.as_bytes();
+    testing::expect(mem::equal_bytes(dec_b, sample));
+
+    // Also test completely unseen UTF-8 text (lossless byte fallback!)
+    let unseen = "[X訳] 未知の漢字とEmoji🚀ABC!\n";
+    try bpe_encode(allocator, &bpe, unseen, &var ids);
+    var dec2 = string::new(allocator);
+    defer dec2.deinit(allocator);
+    let id_s2 = ids.as_slice();
+    try bpe_decode(allocator, &bpe, id_s2, ids.len(), &var dec2);
+    let dec2_b = dec2.as_bytes();
+    testing::expect(mem::equal_bytes(dec2_b, unseen));
+}

@@ -1,0 +1,6 @@
+[package]
+name = "griffith"
+version = "0.1.0"
+
+[modules]
+paths = ["src"]

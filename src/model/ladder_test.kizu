@@ -1,0 +1,225 @@
+import griffith::core;
+import griffith::lut;
+import std::math;
+import std::mem;
+import std::testing;
+
+fn combined_kd_objective(
+    s_logits: []f32,
+    t_logits: []f32,
+    targets: []i32,
+    batch: i64,
+    vocab: i64,
+    alpha: f32,
+    kd_temp: f32
+) -> f64 {
+    let a = cast<f64>(alpha);
+    let t = cast<f64>(kd_temp);
+    let inv_t = 1.0 / t;
+    var total: f64 = 0.0;
+    for 0..batch |b| {
+        let off = b * vocab;
+        // CE
+        var ms = cast<f64>(s_logits[off]);
+        for 1..vocab |c| {
+            let v = cast<f64>(s_logits[off + c]);
+            if v > ms { ms = v; }
+        }
+        var sum_s: f64 = 0.0;
+        for 0..vocab |c| { sum_s = sum_s + math::exp<f64>(cast<f64>(s_logits[off + c]) - ms); }
+        let ce = ms + math::log<f64>(sum_s) - cast<f64>(s_logits[off + cast<i64>(targets[b])]);
+
+        // KL(p_T || p_S) at temp T
+        var mst = cast<f64>(s_logits[off]) * inv_t;
+        var mtt = cast<f64>(t_logits[off]) * inv_t;
+        for 1..vocab |c| {
+            let vs = cast<f64>(s_logits[off + c]) * inv_t;
+            let vt = cast<f64>(t_logits[off + c]) * inv_t;
+            if vs > mst { mst = vs; }
+            if vt > mtt { mtt = vt; }
+        }
+        var sum_st: f64 = 0.0;
+        var sum_tt: f64 = 0.0;
+        for 0..vocab |c| {
+            sum_st = sum_st + math::exp<f64>(cast<f64>(s_logits[off + c]) * inv_t - mst);
+            sum_tt = sum_tt + math::exp<f64>(cast<f64>(t_logits[off + c]) * inv_t - mtt);
+        }
+        var kl: f64 = 0.0;
+        for 0..vocab |c| {
+            let pt = math::exp<f64>(cast<f64>(t_logits[off + c]) * inv_t - mtt) / sum_tt;
+            let ps = math::exp<f64>(cast<f64>(s_logits[off + c]) * inv_t - mst) / sum_st;
+            kl = kl + pt * (math::log<f64>(pt) - math::log<f64>(ps));
+        }
+        total = total + (1.0 - a) * ce + a * t * t * kl;
+    }
+    return total / cast<f64>(batch);
+}
+
+fn check_kl_distill_grad(allocator: Allocator, rng: &var core::Rng) -> mem::Error!void {
+    let h: f32 = 2e-3;
+    let kb: i64 = 2;
+    let kv: i64 = 5;
+    let alpha: f32 = 0.6;
+    let kd_t: f32 = 2.0;
+    var sl = try core::alloc_f32(allocator, kb * kv);
+    defer sl.deinit(allocator);
+    var tl = try core::alloc_f32(allocator, kb * kv);
+    defer tl.deinit(allocator);
+    var gl = try core::alloc_f32(allocator, kb * kv);
+    defer gl.deinit(allocator);
+    var targs_k = try core::alloc_i32(allocator, kb);
+    defer targs_k.deinit(allocator);
+
+    let sls = sl.as_mut_slice();
+    let tls = tl.as_mut_slice();
+    let gls = gl.as_mut_slice();
+    let tks = targs_k.as_mut_slice();
+    for 0..(kb * kv) |i| {
+        sls[i] = rng.next_normal_f32();
+        tls[i] = rng.next_normal_f32();
+    }
+    tks[0] = 1;
+    tks[1] = 3;
+    let _ = kl_distill_loss_grad(sls, tls, tks, kb, kv, alpha, kd_t, gls);
+
+    for 0..(kb * kv) |i| {
+        let orig = sls[i];
+        sls[i] = orig + h;
+        let lp = combined_kd_objective(sls, tls, tks, kb, kv, alpha, kd_t);
+        sls[i] = orig - h;
+        let lm = combined_kd_objective(sls, tls, tks, kb, kv, alpha, kd_t);
+        sls[i] = orig;
+        let num = (lp - lm) / (2.0 * cast<f64>(h));
+        testing::expect(math::abs<f64>(num - cast<f64>(gls[i])) < 5e-3);
+    }
+    return;
+}
+
+test "linear layernorm gelu and kl_distill finite-difference gradcheck" {
+    let allocator = mem::page_allocator();
+    var rng = core::rng_new(555);
+
+    // 1. LinearLayer + LayerNorm + GELU gradcheck
+    let batch: i64 = 2;
+    let dim: i64 = 6;
+    var ln = try layernorm_new(allocator, dim, batch);
+    defer ln.deinit(allocator);
+    var lin = try linear_new(allocator, dim, dim, batch, &var rng);
+    defer lin.deinit(allocator);
+
+    var x = try core::alloc_f32(allocator, batch * dim);
+    defer x.deinit(allocator);
+    var h1 = try core::alloc_f32(allocator, batch * dim);
+    defer h1.deinit(allocator);
+    var h2 = try core::alloc_f32(allocator, batch * dim);
+    defer h2.deinit(allocator);
+    var out = try core::alloc_f32(allocator, batch * dim);
+    defer out.deinit(allocator);
+    var coeffs = try core::alloc_f32(allocator, batch * dim);
+    defer coeffs.deinit(allocator);
+    var g1 = try core::alloc_f32(allocator, batch * dim);
+    defer g1.deinit(allocator);
+    var g2 = try core::alloc_f32(allocator, batch * dim);
+    defer g2.deinit(allocator);
+    var gx = try core::alloc_f32(allocator, batch * dim);
+    defer gx.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let cs = coeffs.as_mut_slice();
+    for 0..(batch * dim) |i| {
+        xs[i] = rng.next_normal_f32();
+        cs[i] = rng.next_normal_f32();
+    }
+    let h1s = h1.as_mut_slice();
+    let h2s = h2.as_mut_slice();
+    let os = out.as_mut_slice();
+    let g1s = g1.as_mut_slice();
+    let g2s = g2.as_mut_slice();
+    let gxs = gx.as_mut_slice();
+
+    layernorm_forward(&var ln, xs, batch, h1s);
+    linear_forward(&var lin, h1s, batch, h2s);
+    gelu_forward(h2s, os, batch * dim);
+    gelu_backward(h2s, cs, g2s, batch * dim);
+    linear_backward(&var lin, g2s, g1s, true);
+    layernorm_backward(&var ln, g1s, gxs);
+
+    let h: f32 = 2e-3;
+    for 0..(batch * dim) |i| {
+        let orig = xs[i];
+        xs[i] = orig + h;
+        layernorm_forward(&var ln, xs, batch, h1s);
+        linear_forward(&var lin, h1s, batch, h2s);
+        gelu_forward(h2s, os, batch * dim);
+        var lp: f64 = 0.0;
+        for 0..(batch * dim) |k| { lp = lp + cast<f64>(os[k] * cs[k]); }
+
+        xs[i] = orig - h;
+        layernorm_forward(&var ln, xs, batch, h1s);
+        linear_forward(&var lin, h1s, batch, h2s);
+        gelu_forward(h2s, os, batch * dim);
+        var lm: f64 = 0.0;
+        for 0..(batch * dim) |k| { lm = lm + cast<f64>(os[k] * cs[k]); }
+        xs[i] = orig;
+
+        let num = (lp - lm) / (2.0 * cast<f64>(h));
+        testing::expect(math::abs<f64>(num - cast<f64>(gxs[i])) < 1e-2);
+    }
+
+    try check_kl_distill_grad(allocator, &var rng);
+
+    // 2. Smoke overfit test across all 5 LogicLadderGPT rungs (L0..L3c)
+    let rungs = [5]LadderRung{ LadderRung::L0, LadderRung::L0b, LadderRung::L1, LadderRung::L2, LadderRung::L3c };
+    for 0..5 |ri| {
+        let cfg = LadderConfig {
+            vocab_size: 8,
+            seq_len: 8,
+            d_model: 16,
+            n_heads: 2,
+            n_layers: 1,
+            ffn_hidden: 32,
+            ffn_gates: 32,
+            ffn_group_factor: 2,
+            qkv_n_inputs: 2,
+            ffn_n_inputs: 2,
+            max_batch: 2,
+            rung: rungs[ri],
+            attn_tau: 1.0,
+            attn_gumbel_scale: 0.2,
+        };
+        var r2 = core::rng_new(900 + cast<u64>(ri));
+        var m = try ladder_gpt_new(allocator, cfg, &var r2);
+        defer m.deinit(allocator);
+
+        var toks = try core::alloc_i32(allocator, 16);
+        defer toks.deinit(allocator);
+        var targs = try core::alloc_i32(allocator, 16);
+        defer targs.deinit(allocator);
+        var logits = try core::alloc_f32(allocator, 16 * 8);
+        defer logits.deinit(allocator);
+        var g_logits = try core::alloc_f32(allocator, 16 * 8);
+        defer g_logits.deinit(allocator);
+
+        let ts = toks.as_mut_slice();
+        let ys = targs.as_mut_slice();
+        for 0..16 |i| {
+            ts[i] = cast<i32>(i % 8);
+            ys[i] = cast<i32>((i + 1) % 8);
+        }
+        let ls = logits.as_mut_slice();
+        let gls = g_logits.as_mut_slice();
+
+        var first_loss: f32 = 0.0;
+        var last_loss: f32 = 0.0;
+        for 1..41 |step| {
+            ladder_zero_grad(&var m);
+            ladder_forward(&var m, ts, 2, 8, ls, EvalMode::Train, &var r2);
+            let loss = lut::cross_entropy_loss_grad(ls, ys, 16, 8, gls);
+            if step == 1 { first_loss = loss; }
+            last_loss = loss;
+            ladder_backward(&var m, ts, 2, 8, gls);
+            ladder_adamw_step(&var m, 0.01, 0.05, 0.0, step);
+        }
+        testing::expect(last_loss < first_loss);
+    }
+}

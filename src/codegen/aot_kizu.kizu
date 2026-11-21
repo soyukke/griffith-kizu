@@ -1,0 +1,249 @@
+import griffith::lut;
+import griffith::synth;
+import std::fmt;
+import std::mem;
+import std::string;
+
+fn append_wire_expr(
+    allocator: Allocator,
+    out: &var string::String,
+    wire: i32,
+    input_width: i64
+) -> mem::Error!void {
+    if wire == synth::wire_const0() {
+        try out.append_bytes(allocator, "cast<u64>(0)");
+        return;
+    }
+    if wire == synth::wire_const1() {
+        try out.append_bytes(allocator, "all1");
+        return;
+    }
+    let wi = cast<i64>(wire);
+    if wi < input_width {
+        try out.append_bytes(allocator, "in_bits[");
+        try fmt::append_i64(allocator, out, wi);
+        try out.append_bytes(allocator, "]");
+        return;
+    }
+    try out.append_bytes(allocator, "w");
+    try fmt::append_i64(allocator, out, wi - input_width);
+    return;
+}
+
+fn append_gate2_expr(
+    allocator: Allocator,
+    out: &var string::String,
+    a: i32,
+    b: i32,
+    tt: u64,
+    input_width: i64
+) -> mem::Error!void {
+    let t = tt & cast<u64>(15);
+    if t == 0 {
+        try out.append_bytes(allocator, "cast<u64>(0)");
+    } else if t == 1 {
+        try out.append_bytes(allocator, "(~");
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, ") & (~");
+        try append_wire_expr(allocator, out, b, input_width);
+        try out.append_bytes(allocator, ")");
+    } else if t == 2 {
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " & (~");
+        try append_wire_expr(allocator, out, b, input_width);
+        try out.append_bytes(allocator, ")");
+    } else if t == 3 {
+        try out.append_bytes(allocator, "~");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 4 {
+        try out.append_bytes(allocator, "(~");
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, ") & ");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 5 {
+        try out.append_bytes(allocator, "~");
+        try append_wire_expr(allocator, out, a, input_width);
+    } else if t == 6 {
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " ^ ");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 7 {
+        try out.append_bytes(allocator, "~(");
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " & ");
+        try append_wire_expr(allocator, out, b, input_width);
+        try out.append_bytes(allocator, ")");
+    } else if t == 8 {
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " & ");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 9 {
+        try out.append_bytes(allocator, "~(");
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " ^ ");
+        try append_wire_expr(allocator, out, b, input_width);
+        try out.append_bytes(allocator, ")");
+    } else if t == 10 {
+        try append_wire_expr(allocator, out, a, input_width);
+    } else if t == 11 {
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " | (~");
+        try append_wire_expr(allocator, out, b, input_width);
+        try out.append_bytes(allocator, ")");
+    } else if t == 12 {
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 13 {
+        try out.append_bytes(allocator, "(~");
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, ") | ");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else if t == 14 {
+        try append_wire_expr(allocator, out, a, input_width);
+        try out.append_bytes(allocator, " | ");
+        try append_wire_expr(allocator, out, b, input_width);
+    } else {
+        try out.append_bytes(allocator, "all1");
+    }
+    return;
+}
+
+fn append_shannon_expr(
+    allocator: Allocator,
+    out: &var string::String,
+    pins: []i32,
+    pin_base: i64,
+    arity: i64,
+    tt: u64,
+    input_width: i64
+) -> mem::Error!void {
+    let mask = synth::tt_mask(arity);
+    let masked = tt & mask;
+    if masked == 0 {
+        try out.append_bytes(allocator, "cast<u64>(0)");
+        return;
+    }
+    if masked == mask {
+        try out.append_bytes(allocator, "all1");
+        return;
+    }
+    if arity == 1 {
+        if masked == 1 {
+            try out.append_bytes(allocator, "(~");
+            try append_wire_expr(allocator, out, pins[pin_base], input_width);
+            try out.append_bytes(allocator, ")");
+        } else {
+            try append_wire_expr(allocator, out, pins[pin_base], input_width);
+        }
+        return;
+    }
+    if arity == 2 {
+        try out.append_bytes(allocator, "(");
+        try append_gate2_expr(allocator, out, pins[pin_base], pins[pin_base + 1], masked, input_width);
+        try out.append_bytes(allocator, ")");
+        return;
+    }
+    let half_bits = lut::pow2(arity - 1);
+    let sub_mask = synth::tt_mask(arity - 1);
+    let lo_tt = masked & sub_mask;
+    let hi_tt = (masked >> cast<u64>(half_bits)) & sub_mask;
+    let top_pin = pins[pin_base + arity - 1];
+    if lo_tt == hi_tt {
+        try append_shannon_expr(allocator, out, pins, pin_base, arity - 1, lo_tt, input_width);
+        return;
+    }
+    if lo_tt == 0 {
+        try out.append_bytes(allocator, "(");
+        try append_wire_expr(allocator, out, top_pin, input_width);
+        try out.append_bytes(allocator, " & ");
+        try append_shannon_expr(allocator, out, pins, pin_base, arity - 1, hi_tt, input_width);
+        try out.append_bytes(allocator, ")");
+        return;
+    }
+    if hi_tt == 0 {
+        try out.append_bytes(allocator, "((~");
+        try append_wire_expr(allocator, out, top_pin, input_width);
+        try out.append_bytes(allocator, ") & ");
+        try append_shannon_expr(allocator, out, pins, pin_base, arity - 1, lo_tt, input_width);
+        try out.append_bytes(allocator, ")");
+        return;
+    }
+    try out.append_bytes(allocator, "(((~");
+    try append_wire_expr(allocator, out, top_pin, input_width);
+    try out.append_bytes(allocator, ") & ");
+    try append_shannon_expr(allocator, out, pins, pin_base, arity - 1, lo_tt, input_width);
+    try out.append_bytes(allocator, ") | (");
+    try append_wire_expr(allocator, out, top_pin, input_width);
+    try out.append_bytes(allocator, " & ");
+    try append_shannon_expr(allocator, out, pins, pin_base, arity - 1, hi_tt, input_width);
+    try out.append_bytes(allocator, "))");
+    return;
+}
+
+fn append_line_end(allocator: Allocator, out: &var string::String) -> mem::Error!void {
+    try out.append_byte(allocator, cast<u8>(10));
+    return;
+}
+
+/// Emits a zero-weight, pure-bitwise 64-way bit-sliced Kizu function for `c`.
+pub fn emit_aot_kizu_fn(
+    allocator: Allocator,
+    c: &synth::Circuit,
+    fn_name: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    let ga = c.gate_arity.as_slice();
+    let gp = c.gate_pins.as_slice();
+    let gt = c.gate_tt.as_slice();
+    let ow = c.out_wires.as_slice();
+    let out_count = c.out_wires.len();
+
+    try out.append_bytes(allocator, "pub fn ");
+    try out.append_bytes(allocator, fn_name);
+    try out.append_bytes(allocator, "(in_bits: []u64, out_bits: &var []u64) -> void {");
+    try append_line_end(allocator, out);
+    try out.append_bytes(allocator, "    let all1 = ~cast<u64>(0);");
+    try append_line_end(allocator, out);
+    try out.append_bytes(allocator, "    let _ = all1;");
+    try append_line_end(allocator, out);
+
+    for 0..c.gate_count |g| {
+        let arity = cast<i64>(ga[g]);
+        try out.append_bytes(allocator, "    let w");
+        try fmt::append_i64(allocator, out, g);
+        try out.append_bytes(allocator, ": u64 = ");
+        if arity == 0 {
+            if (gt[g] & cast<u64>(1)) != 0 {
+                try out.append_bytes(allocator, "all1");
+            } else {
+                try out.append_bytes(allocator, "cast<u64>(0)");
+            }
+        } else if arity == 1 {
+            if (gt[g] & cast<u64>(3)) == 1 {
+                try out.append_bytes(allocator, "~");
+                try append_wire_expr(allocator, out, gp[g * 6], c.input_width);
+            } else {
+                try append_wire_expr(allocator, out, gp[g * 6], c.input_width);
+            }
+        } else if arity == 2 {
+            try append_gate2_expr(allocator, out, gp[g * 6], gp[g * 6 + 1], gt[g], c.input_width);
+        } else {
+            try append_shannon_expr(allocator, out, gp, g * 6, arity, gt[g], c.input_width);
+        }
+        try out.append_bytes(allocator, ";");
+        try append_line_end(allocator, out);
+    }
+
+    for 0..out_count |i| {
+        try out.append_bytes(allocator, "    out_bits[");
+        try fmt::append_i64(allocator, out, i);
+        try out.append_bytes(allocator, "] = ");
+        try append_wire_expr(allocator, out, ow[i], c.input_width);
+        try out.append_bytes(allocator, ";");
+        try append_line_end(allocator, out);
+    }
+    try out.append_bytes(allocator, "    return;");
+    try append_line_end(allocator, out);
+    try out.append_bytes(allocator, "}");
+    try append_line_end(allocator, out);
+    return;
+}

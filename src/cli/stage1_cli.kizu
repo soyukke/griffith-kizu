@@ -1,0 +1,260 @@
+import griffith::browser;
+import griffith::codegen;
+import griffith::core;
+import griffith::synth;
+import griffith::tasks;
+import std::float;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::mem;
+import std::process;
+import std::string;
+
+fn print_task_summary(
+    allocator: Allocator,
+    name: []u8,
+    res: &tasks::Stage1TaskResult,
+    mismatches: i64
+) -> mem::Error!void {
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    try line.append_bytes(allocator, "[");
+    try line.append_bytes(allocator, name);
+    try line.append_bytes(allocator, "] steps=");
+    try fmt::append_i64(allocator, &var line, res.steps);
+    try line.append_bytes(allocator, " soft_acc=");
+    try float::append(allocator, &var line, res.soft_acc);
+    try line.append_bytes(allocator, " hard_acc=");
+    try float::append(allocator, &var line, res.hard_acc);
+    try line.append_bytes(allocator, " gates=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.raw_gates);
+    try line.append_bytes(allocator, "->");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.opt_gates);
+    try line.append_bytes(allocator, " depth=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.raw_depth);
+    try line.append_bytes(allocator, "->");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.opt_depth);
+    try line.append_bytes(allocator, " (const=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.const_folded);
+    try line.append_bytes(allocator, " pass=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.passthrough_removed);
+    try line.append_bytes(allocator, " inv=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.inverted_absorbed);
+    try line.append_bytes(allocator, " cse=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.cse_merged);
+    try line.append_bytes(allocator, " dce=");
+    try fmt::append_i64(allocator, &var line, res.opt_result.stats.dce_removed);
+    try line.append_bytes(allocator, ") opt_mm=");
+    try fmt::append_i64(allocator, &var line, mismatches);
+    let bytes = line.as_bytes();
+    print(bytes);
+    return;
+}
+
+fn write_text_file(path: []u8, text: &string::String) -> !void {
+    let bytes = text.as_bytes();
+    try fs::write_file(io::blocking(), &path, &bytes);
+    return;
+}
+
+pub fn run_stage1_pipeline() -> !void {
+    let allocator = mem::page_allocator();
+
+    var xor_res = try tasks::train_xor(allocator);
+    defer xor_res.deinit(allocator);
+    let xor_mm = try tasks::verify_raw_vs_opt_exhaustive(allocator, &xor_res.raw_circuit, &xor_res.opt_result.circuit);
+    try print_task_summary(allocator, "xor", &xor_res, xor_mm);
+
+    var par_res = try tasks::train_parity4(allocator);
+    defer par_res.deinit(allocator);
+    let par_mm = try tasks::verify_raw_vs_opt_exhaustive(allocator, &par_res.raw_circuit, &par_res.opt_result.circuit);
+    try print_task_summary(allocator, "parity4", &par_res, par_mm);
+
+    var add_res = try tasks::train_adder2(allocator);
+    defer add_res.deinit(allocator);
+    let add_mm = try tasks::verify_raw_vs_opt_exhaustive(allocator, &add_res.raw_circuit, &add_res.opt_result.circuit);
+    try print_task_summary(allocator, "adder2", &add_res, add_mm);
+
+    // Emit Griffith JSON IR files
+    var ir_xor = string::new(allocator);
+    defer ir_xor.deinit(allocator);
+    try codegen::emit_griffith_ir_json(allocator, &xor_res.opt_result.circuit, "xor", &var ir_xor);
+    try write_text_file("target/ir_xor.json", &ir_xor);
+
+    var ir_par = string::new(allocator);
+    defer ir_par.deinit(allocator);
+    try codegen::emit_griffith_ir_json(allocator, &par_res.opt_result.circuit, "parity4", &var ir_par);
+    try write_text_file("target/ir_parity4.json", &ir_par);
+
+    var ir_add = string::new(allocator);
+    defer ir_add.deinit(allocator);
+    try codegen::emit_griffith_ir_json(allocator, &add_res.opt_result.circuit, "adder2", &var ir_add);
+    try write_text_file("target/ir_adder2.json", &ir_add);
+
+    // Emit zero-weight AOT Kizu bundle for native bench + Lab 01 browser WASM
+    var bundle = string::new(allocator);
+    defer bundle.deinit(allocator);
+    try codegen::emit_browser_aot_bundle(allocator, &xor_res.opt_result, &par_res.opt_result, &add_res.opt_result, &var bundle);
+    try write_text_file("src/browser/aot_generated.kizu", &bundle);
+
+    // Emit standalone zero-weight native executable source
+    var standalone = string::new(allocator);
+    defer standalone.deinit(allocator);
+    try codegen::emit_standalone_aot_native(allocator, &xor_res.opt_result, &par_res.opt_result, &add_res.opt_result, &var standalone);
+    try write_text_file("target/aot_standalone.kizu", &standalone);
+
+    print("stage1-run: IR JSON and AOT Kizu files generated.");
+    return;
+}
+
+fn print_bench_row(
+    allocator: Allocator,
+    name: []u8,
+    vm_ms: i64,
+    aot_ms: i64,
+    total_inferences: i64,
+    mismatches: i64
+) -> mem::Error!void {
+    let vm_ns = cast<f64>(vm_ms) * 1000000.0 / cast<f64>(total_inferences);
+    let aot_ns = cast<f64>(aot_ms) * 1000000.0 / cast<f64>(total_inferences);
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    try line.append_bytes(allocator, "[bench ");
+    try line.append_bytes(allocator, name);
+    try line.append_bytes(allocator, "] vm_ms=");
+    try fmt::append_i64(allocator, &var line, vm_ms);
+    try line.append_bytes(allocator, " (");
+    try float::append(allocator, &var line, vm_ns);
+    try line.append_bytes(allocator, " ns/inf) aot_ms=");
+    try fmt::append_i64(allocator, &var line, aot_ms);
+    try line.append_bytes(allocator, " (");
+    try float::append(allocator, &var line, aot_ns);
+    try line.append_bytes(allocator, " ns/inf) mm=");
+    try fmt::append_i64(allocator, &var line, mismatches);
+    let bytes = line.as_bytes();
+    print(bytes);
+    return;
+}
+
+pub fn run_stage1_bench() -> !void {
+    let allocator = mem::page_allocator();
+    let iters: i64 = 2000000;
+    let total_inf = iters * 64;
+
+    // 1. XOR
+    var vm_xor = try browser::build_vm_xor(allocator);
+    defer vm_xor.deinit(allocator);
+    var x_scratch = try core::alloc_u64(allocator, 2 + vm_xor.gate_count + 1);
+    defer x_scratch.deinit(allocator);
+    var x_vm_out = try core::alloc_u64(allocator, vm_xor.out_wires.len());
+    defer x_vm_out.deinit(allocator);
+    var x_aot_out = try core::alloc_u64(allocator, vm_xor.out_wires.len());
+    defer x_aot_out.deinit(allocator);
+    var xin = [2]u64{ 0b1010, 0b1100 };
+    let xin_m = xin.as_mut_slice();
+    let xs_m = x_scratch.as_mut_slice();
+    let xv_m = x_vm_out.as_mut_slice();
+    let xa_m = x_aot_out.as_mut_slice();
+
+    synth::eval_circuit_vm_u64(&vm_xor, xin_m, xs_m, xv_m);
+    browser::aot_xor_64(xin_m, xa_m);
+    var xor_mm: i64 = 0;
+    for 0..vm_xor.out_wires.len() |i| {
+        if (xv_m[i] & 0xf) != (xa_m[i] & 0xf) {
+            xor_mm = xor_mm + 1;
+        }
+    }
+
+    var sink: u64 = 0;
+    let t0 = process::monotonic_millis();
+    for 0..iters |i| {
+        xin_m[0] = cast<u64>(i);
+        synth::eval_circuit_vm_u64(&vm_xor, xin_m, xs_m, xv_m);
+        sink = sink ^ xv_m[0];
+    }
+    let t1 = process::monotonic_millis();
+    for 0..iters |i| {
+        xin_m[0] = cast<u64>(i);
+        browser::aot_xor_64(xin_m, xa_m);
+        sink = sink ^ xa_m[0];
+    }
+    let t2 = process::monotonic_millis();
+    try print_bench_row(allocator, "xor", t1 - t0, t2 - t1, total_inf, xor_mm);
+
+    // 2. Parity4
+    var vm_par = try browser::build_vm_parity4(allocator);
+    defer vm_par.deinit(allocator);
+    var p_scratch = try core::alloc_u64(allocator, 4 + vm_par.gate_count + 1);
+    defer p_scratch.deinit(allocator);
+    var p_vm_out = [1]u64{};
+    var p_aot_out = [1]u64{};
+    var pin = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
+    let pin_m = pin.as_mut_slice();
+    let ps_m = p_scratch.as_mut_slice();
+    let pv_m = p_vm_out.as_mut_slice();
+    let pa_m = p_aot_out.as_mut_slice();
+
+    synth::eval_circuit_vm_u64(&vm_par, pin_m, ps_m, pv_m);
+    browser::aot_parity4_64(pin_m, pa_m);
+    var par_mm: i64 = 0;
+    if (pv_m[0] & 0xffff) != (pa_m[0] & 0xffff) {
+        par_mm = par_mm + 1;
+    }
+
+    let t3 = process::monotonic_millis();
+    for 0..iters |i| {
+        pin_m[0] = cast<u64>(i);
+        synth::eval_circuit_vm_u64(&vm_par, pin_m, ps_m, pv_m);
+        sink = sink ^ pv_m[0];
+    }
+    let t4 = process::monotonic_millis();
+    for 0..iters |i| {
+        pin_m[0] = cast<u64>(i);
+        browser::aot_parity4_64(pin_m, pa_m);
+        sink = sink ^ pa_m[0];
+    }
+    let t5 = process::monotonic_millis();
+    try print_bench_row(allocator, "parity4", t4 - t3, t5 - t4, total_inf, par_mm);
+
+    // 3. Adder2
+    var vm_add = try browser::build_vm_adder2(allocator);
+    defer vm_add.deinit(allocator);
+    var a_scratch = try core::alloc_u64(allocator, 4 + vm_add.gate_count + 1);
+    defer a_scratch.deinit(allocator);
+    var a_vm_out = [3]u64{};
+    var a_aot_out = [3]u64{};
+    let as_m = a_scratch.as_mut_slice();
+    let av_m = a_vm_out.as_mut_slice();
+    let aa_m = a_aot_out.as_mut_slice();
+    pin_m[0] = 0xaaaa;
+
+    synth::eval_circuit_vm_u64(&vm_add, pin_m, as_m, av_m);
+    browser::aot_adder2_64(pin_m, aa_m);
+    var add_mm: i64 = 0;
+    for 0..3 |b| {
+        if (av_m[b] & 0xffff) != (aa_m[b] & 0xffff) {
+            add_mm = add_mm + 1;
+        }
+    }
+
+    let t6 = process::monotonic_millis();
+    for 0..iters |i| {
+        pin_m[0] = cast<u64>(i);
+        synth::eval_circuit_vm_u64(&vm_add, pin_m, as_m, av_m);
+        sink = sink ^ av_m[0] ^ av_m[1] ^ av_m[2];
+    }
+    let t7 = process::monotonic_millis();
+    for 0..iters |i| {
+        pin_m[0] = cast<u64>(i);
+        browser::aot_adder2_64(pin_m, aa_m);
+        sink = sink ^ aa_m[0] ^ aa_m[1] ^ aa_m[2];
+    }
+    let t8 = process::monotonic_millis();
+    try print_bench_row(allocator, "adder2", t7 - t6, t8 - t7, total_inf, add_mm);
+
+    if sink == 987654321 {
+        print(sink);
+    }
+    return;
+}

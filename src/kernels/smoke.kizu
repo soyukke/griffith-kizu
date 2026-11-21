@@ -1,0 +1,14 @@
+import std::gpu;
+
+export "gpu" fn smoke_xor_bits(
+    left: []u32,
+    right: []u32,
+    out: &var []u32,
+    count: i64
+) -> void {
+    let idx = gpu::thread_index();
+    if idx < count {
+        out[idx] = left[idx] ^ right[idx];
+    }
+    return;
+}

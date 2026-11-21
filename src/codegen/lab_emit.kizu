@@ -1,0 +1,364 @@
+import griffith::synth;
+import std::fmt;
+import std::mem;
+import std::string;
+
+fn nl(allocator: Allocator, out: &var string::String) -> mem::Error!void {
+    try out.append_byte(allocator, cast<u8>(10));
+    return;
+}
+
+fn emit_const_i64(allocator: Allocator, out: &var string::String, name: []u8, val: i64) -> mem::Error!void {
+    try out.append_bytes(allocator, "pub fn ");
+    try out.append_bytes(allocator, name);
+    try out.append_bytes(allocator, "() -> i64 { return ");
+    try fmt::append_i64(allocator, out, val);
+    try out.append_bytes(allocator, "; }");
+    try nl(allocator, out);
+    return;
+}
+
+fn emit_vm_builder_fn(
+    allocator: Allocator,
+    out: &var string::String,
+    fn_name: []u8,
+    c: &synth::Circuit
+) -> mem::Error!void {
+    let ga = c.gate_arity.as_slice();
+    let gp = c.gate_pins.as_slice();
+    let gt = c.gate_tt.as_slice();
+    let ow = c.out_wires.as_slice();
+    let out_count = c.out_wires.len();
+
+    try out.append_bytes(allocator, "pub fn ");
+    try out.append_bytes(allocator, fn_name);
+    try out.append_bytes(allocator, "(allocator: Allocator) -> mem::Error!synth::Circuit {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let g_count: i64 = ");
+    try fmt::append_i64(allocator, out, c.gate_count);
+    try out.append_bytes(allocator, ";");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let out_count: i64 = ");
+    try fmt::append_i64(allocator, out, out_count);
+    try out.append_bytes(allocator, ";");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var ga = try core::alloc_i32(allocator, g_count);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    errdefer ga.deinit(allocator);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var gp = try core::alloc_i32(allocator, g_count * 6);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    errdefer gp.deinit(allocator);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var gt = try core::alloc_u64(allocator, g_count);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    errdefer gt.deinit(allocator);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var ow = try core::alloc_i32(allocator, out_count);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    errdefer ow.deinit(allocator);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let ga_s = ga.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let gp_s = gp.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let gt_s = gt.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let ow_s = ow.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let _ = ga_s;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let _ = gp_s;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let _ = gt_s;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let _ = ow_s;");
+    try nl(allocator, out);
+
+    for 0..c.gate_count |g| {
+        let arity = cast<i64>(ga[g]);
+        try out.append_bytes(allocator, "    ga_s[");
+        try fmt::append_i64(allocator, out, g);
+        try out.append_bytes(allocator, "] = ");
+        try fmt::append_i64(allocator, out, arity);
+        try out.append_bytes(allocator, ";");
+        try nl(allocator, out);
+
+        let tt_hi = gt[g] >> 32;
+        let tt_lo = gt[g] & cast<u64>(0xffffffff);
+        try out.append_bytes(allocator, "    gt_s[");
+        try fmt::append_i64(allocator, out, g);
+        try out.append_bytes(allocator, "] = (cast<u64>(");
+        try fmt::append_u64(allocator, out, tt_hi);
+        try out.append_bytes(allocator, ") << 32) | cast<u64>(");
+        try fmt::append_u64(allocator, out, tt_lo);
+        try out.append_bytes(allocator, ");");
+        try nl(allocator, out);
+
+        for 0..arity |p| {
+            try out.append_bytes(allocator, "    gp_s[");
+            try fmt::append_i64(allocator, out, g * 6 + p);
+            try out.append_bytes(allocator, "] = ");
+            try fmt::append_i64(allocator, out, cast<i64>(gp[g * 6 + p]));
+            try out.append_bytes(allocator, ";");
+            try nl(allocator, out);
+        }
+    }
+
+    for 0..out_count |i| {
+        try out.append_bytes(allocator, "    ow_s[");
+        try fmt::append_i64(allocator, out, i);
+        try out.append_bytes(allocator, "] = ");
+        try fmt::append_i64(allocator, out, cast<i64>(ow[i]));
+        try out.append_bytes(allocator, ";");
+        try nl(allocator, out);
+    }
+
+    try out.append_bytes(allocator, "    return synth::Circuit {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        input_width: ");
+    try fmt::append_i64(allocator, out, c.input_width);
+    try out.append_bytes(allocator, ",");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        gate_count: g_count,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        gate_arity: move ga,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        gate_pins: move gp,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        gate_tt: move gt,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        out_wires: move ow,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        group_sum_k: ");
+    try fmt::append_i64(allocator, out, c.group_sum_k);
+    try out.append_bytes(allocator, ",");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        group_sum_tau: 1.0,");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    };");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "}");
+    try nl(allocator, out);
+    return;
+}
+
+/// Emits `src/browser/aot_generated.kizu` containing both zero-weight AOT functions and VM circuits + stats.
+pub fn emit_browser_aot_bundle(
+    allocator: Allocator,
+    xor_opt: &synth::OptResult,
+    par_opt: &synth::OptResult,
+    add_opt: &synth::OptResult,
+    out: &var string::String
+) -> mem::Error!void {
+    try out.append_bytes(allocator, "// AUTO-GENERATED by griffith stage1-run. Zero-weight AOT circuits + Lab 01 stats.");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "import griffith::core;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "import griffith::synth;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "import std::mem;");
+    try nl(allocator, out);
+    try nl(allocator, out);
+
+    try emit_const_i64(allocator, out, "xor_raw_gates", xor_opt.stats.raw_gates);
+    try emit_const_i64(allocator, out, "xor_opt_gates", xor_opt.stats.opt_gates);
+    try emit_const_i64(allocator, out, "xor_raw_depth", xor_opt.stats.raw_depth);
+    try emit_const_i64(allocator, out, "xor_opt_depth", xor_opt.stats.opt_depth);
+    try emit_const_i64(allocator, out, "xor_out_count", xor_opt.circuit.out_wires.len());
+
+    try emit_const_i64(allocator, out, "parity4_raw_gates", par_opt.stats.raw_gates);
+    try emit_const_i64(allocator, out, "parity4_opt_gates", par_opt.stats.opt_gates);
+    try emit_const_i64(allocator, out, "parity4_raw_depth", par_opt.stats.raw_depth);
+    try emit_const_i64(allocator, out, "parity4_opt_depth", par_opt.stats.opt_depth);
+
+    try emit_const_i64(allocator, out, "adder2_raw_gates", add_opt.stats.raw_gates);
+    try emit_const_i64(allocator, out, "adder2_opt_gates", add_opt.stats.opt_gates);
+    try emit_const_i64(allocator, out, "adder2_raw_depth", add_opt.stats.raw_depth);
+    try emit_const_i64(allocator, out, "adder2_opt_depth", add_opt.stats.opt_depth);
+    try nl(allocator, out);
+
+    try emit_aot_kizu_fn(allocator, &xor_opt.circuit, "aot_xor_64", out);
+    try nl(allocator, out);
+    try emit_aot_kizu_fn(allocator, &par_opt.circuit, "aot_parity4_64", out);
+    try nl(allocator, out);
+    try emit_aot_kizu_fn(allocator, &add_opt.circuit, "aot_adder2_64", out);
+    try nl(allocator, out);
+
+    try emit_vm_builder_fn(allocator, out, "build_vm_xor", &xor_opt.circuit);
+    try nl(allocator, out);
+    try emit_vm_builder_fn(allocator, out, "build_vm_parity4", &par_opt.circuit);
+    try nl(allocator, out);
+    try emit_vm_builder_fn(allocator, out, "build_vm_adder2", &add_opt.circuit);
+    return;
+}
+
+/// Emits a completely standalone, dependency-free, zero-weight native Kizu benchmark & verifier.
+pub fn emit_standalone_aot_native(
+    allocator: Allocator,
+    xor_opt: &synth::OptResult,
+    par_opt: &synth::OptResult,
+    add_opt: &synth::OptResult,
+    out: &var string::String
+) -> mem::Error!void {
+    try out.append_bytes(allocator, "// AUTO-GENERATED standalone zero-weight AOT native binary (0 floats, 0 weights).");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "import std::process;");
+    try nl(allocator, out);
+    try nl(allocator, out);
+
+    try emit_aot_kizu_fn(allocator, &xor_opt.circuit, "aot_xor_64", out);
+    try nl(allocator, out);
+    try emit_aot_kizu_fn(allocator, &par_opt.circuit, "aot_parity4_64", out);
+    try nl(allocator, out);
+    try emit_aot_kizu_fn(allocator, &add_opt.circuit, "aot_adder2_64", out);
+    try nl(allocator, out);
+
+    try out.append_bytes(allocator, "fn groupsum_lane(out_bits: []u64, count: i64, lane: i64) -> i64 {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let half = count / 2;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var s0: i64 = 0;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var s1: i64 = 0;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let sh = cast<u64>(lane);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..half |i| { if ((out_bits[i] >> sh) & cast<u64>(1)) != 0 { s0 = s0 + 1; } }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..half |i| { if ((out_bits[half + i] >> sh) & cast<u64>(1)) != 0 { s1 = s1 + 1; } }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    return if s1 > s0 { 1 } else { 0 };");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "}");
+    try nl(allocator, out);
+    try nl(allocator, out);
+
+    try out.append_bytes(allocator, "pub fn main() -> !void {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var mm: i64 = 0;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var xin = [2]u64{ 0b1010, 0b1100 };");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var xout = [");
+    try fmt::append_i64(allocator, out, xor_opt.circuit.out_wires.len());
+    try out.append_bytes(allocator, "]u64{};");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let xin_s = xin.as_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let xout_m = xout.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    aot_xor_64(xin_s, xout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..4 |p| { if groupsum_lane(xout_m, ");
+    try fmt::append_i64(allocator, out, xor_opt.circuit.out_wires.len());
+    try out.append_bytes(allocator, ", p) != ((p & 1) ^ ((p >> 1) & 1)) { mm = mm + 1; } }");
+    try nl(allocator, out);
+
+    try out.append_bytes(allocator, "    var pin = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var pout = [1]u64{};");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let pin_s = pin.as_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let pout_m = pout.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    aot_parity4_64(pin_s, pout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..16 |p| {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let exp = (p & 1) ^ ((p >> 1) & 1) ^ ((p >> 2) & 1) ^ ((p >> 3) & 1);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let got = cast<i64>((pout_m[0] >> cast<u64>(p)) & cast<u64>(1));");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        if got != exp { mm = mm + 1; }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    }");
+    try nl(allocator, out);
+
+    try out.append_bytes(allocator, "    var aout = [3]u64{};");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let aout_m = aout.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    aot_adder2_64(pin_s, aout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..16 |p| {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let sum = (p & 3) + ((p >> 2) & 3);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let g0 = cast<i64>((aout_m[0] >> cast<u64>(p)) & cast<u64>(1));");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let g1 = cast<i64>((aout_m[1] >> cast<u64>(p)) & cast<u64>(1));");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let g2 = cast<i64>((aout_m[2] >> cast<u64>(p)) & cast<u64>(1));");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        if (g0 | (g1 << 1) | (g2 << 2)) != sum { mm = mm + 1; }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    print(mm);");
+    try nl(allocator, out);
+
+    // Benchmark 4,000,000 x 64-way = 256,000,000 inferences each
+    try out.append_bytes(allocator, "    let iters: i64 = 4000000;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    var sink: u64 = 0;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let t0 = process::monotonic_millis();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..iters |i| {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let mut_in = xin.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        mut_in[0] = cast<u64>(i);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        aot_xor_64(mut_in, xout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        sink = sink ^ xout_m[0];");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let t1 = process::monotonic_millis();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..iters |i| {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let mut_pin = pin.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        mut_pin[0] = cast<u64>(i);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        aot_parity4_64(mut_pin, pout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        sink = sink ^ pout_m[0];");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let t2 = process::monotonic_millis();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    for 0..iters |i| {");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        let mut_pin = pin.as_mut_slice();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        mut_pin[0] = cast<u64>(i);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        aot_adder2_64(mut_pin, aout_m);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "        sink = sink ^ aout_m[0] ^ aout_m[1] ^ aout_m[2];");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    let t3 = process::monotonic_millis();");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    print(t1 - t0);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    print(t2 - t1);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    print(t3 - t2);");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    if sink == 123456789 { print(sink); }");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "    return;");
+    try nl(allocator, out);
+    try out.append_bytes(allocator, "}");
+    try nl(allocator, out);
+    return;
+}

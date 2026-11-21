@@ -1,0 +1,181 @@
+import griffith::core;
+import std::array;
+import std::mem;
+import std::testing;
+
+pub struct Connections {
+    pub in_dim: i64,
+    pub out_dim: i64,
+    pub n_inputs: i64,
+    pub indices: array::Array<i32>,
+    pub rev_offsets: array::Array<i32>,
+    pub rev_gates: array::Array<i32>,
+    pub rev_pins: array::Array<i32>,
+}
+
+pub fn (self: Connections) deinit(allocator: Allocator) -> void {
+    self.indices.deinit(allocator);
+    self.rev_offsets.deinit(allocator);
+    self.rev_gates.deinit(allocator);
+    self.rev_pins.deinit(allocator);
+    return;
+}
+
+pub fn build_connections_from_indices(
+    allocator: Allocator,
+    in_dim: i64,
+    out_dim: i64,
+    n_inputs: i64,
+    indices: array::Array<i32>
+) -> mem::Error!Connections {
+    errdefer indices.deinit(allocator);
+    let total_edges = out_dim * n_inputs;
+    var counts = try core::alloc_i32(allocator, in_dim);
+    defer counts.deinit(allocator);
+    var rev_offsets = try core::alloc_i32(allocator, in_dim + 1);
+    errdefer rev_offsets.deinit(allocator);
+    var cursor = try core::alloc_i32(allocator, in_dim);
+    defer cursor.deinit(allocator);
+    var rev_gates = try core::alloc_i32(allocator, total_edges);
+    errdefer rev_gates.deinit(allocator);
+    var rev_pins = try core::alloc_i32(allocator, total_edges);
+    errdefer rev_pins.deinit(allocator);
+
+    let counts_s = counts.as_mut_slice();
+    let idx_s = indices.as_slice();
+    for 0..total_edges |e| {
+        let w = cast<i64>(idx_s[e]);
+        counts_s[w] = counts_s[w] + 1;
+    }
+
+    let off_s = rev_offsets.as_mut_slice();
+    var acc: i32 = 0;
+    for 0..in_dim |i| {
+        off_s[i] = acc;
+        acc = acc + counts_s[i];
+    }
+    off_s[in_dim] = acc;
+
+    let cur_s = cursor.as_mut_slice();
+    for 0..in_dim |i| {
+        cur_s[i] = off_s[i];
+    }
+
+    let rg_s = rev_gates.as_mut_slice();
+    let rp_s = rev_pins.as_mut_slice();
+
+    for 0..out_dim |o| {
+        for 0..n_inputs |p| {
+            let w = cast<i64>(idx_s[o * n_inputs + p]);
+            let pos = cast<i64>(cur_s[w]);
+            rg_s[pos] = cast<i32>(o);
+            rp_s[pos] = cast<i32>(p);
+            cur_s[w] = cur_s[w] + 1;
+        }
+    }
+
+    return Connections {
+        in_dim: in_dim,
+        out_dim: out_dim,
+        n_inputs: n_inputs,
+        indices: move indices,
+        rev_offsets: move rev_offsets,
+        rev_gates: move rev_gates,
+        rev_pins: move rev_pins,
+    };
+}
+
+pub fn build_unique_connections(
+    allocator: Allocator,
+    in_dim: i64,
+    out_dim: i64,
+    n_inputs: i64,
+    rng: &var core::Rng
+) -> mem::Error!Connections {
+    let total_edges = out_dim * n_inputs;
+    var pool = try core::alloc_i32(allocator, total_edges);
+    defer pool.deinit(allocator);
+    let pool_s = pool.as_mut_slice();
+
+    var filled: i64 = 0;
+    while filled < total_edges {
+        var perm = try core::alloc_i32(allocator, in_dim);
+        defer perm.deinit(allocator);
+        let ps = perm.as_mut_slice();
+        for 0..in_dim |i| {
+            ps[i] = cast<i32>(i);
+        }
+        var k = in_dim - 1;
+        while k > 0 {
+            let r = rng.next_range(k + 1);
+            let tmp = ps[k];
+            ps[k] = ps[r];
+            ps[r] = tmp;
+            k = k - 1;
+        }
+        for 0..in_dim |i| {
+            if filled < total_edges {
+                pool_s[filled] = ps[i];
+                filled = filled + 1;
+            }
+        }
+    }
+
+    var indices = try core::alloc_i32(allocator, total_edges);
+    errdefer indices.deinit(allocator);
+    let idx_s = indices.as_mut_slice();
+    for 0..total_edges |e| {
+        idx_s[e] = pool_s[e];
+    }
+
+    // Avoid duplicate input wires within the same gate when in_dim >= n_inputs.
+    if in_dim >= n_inputs {
+        for 0..out_dim |o| {
+            let base = o * n_inputs;
+            for 1..n_inputs |p| {
+                var dup = true;
+                var tries: i64 = 0;
+                while dup and tries < in_dim {
+                    dup = false;
+                    for 0..p |prev| {
+                        if idx_s[base + p] == idx_s[base + prev] {
+                            dup = true;
+                        }
+                    }
+                    if dup {
+                        idx_s[base + p] = cast<i32>((cast<i64>(idx_s[base + p]) + 1) % in_dim);
+                        tries = tries + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return build_connections_from_indices(allocator, in_dim, out_dim, n_inputs, move indices);
+}
+
+test "unique connections and reverse csr" {
+    let allocator = mem::page_allocator();
+    var rng = core::rng_new(123);
+    var conn = try build_unique_connections(allocator, 8, 16, 4, &var rng);
+    defer conn.deinit(allocator);
+    let idx_s = conn.indices.as_slice();
+    let off_s = conn.rev_offsets.as_slice();
+    let rg_s = conn.rev_gates.as_slice();
+    let rp_s = conn.rev_pins.as_slice();
+
+    testing::expect_equal<i32>(64, off_s[8]);
+    var total_found: i64 = 0;
+    for 0..8 |w| {
+        let start = cast<i64>(off_s[w]);
+        let end = cast<i64>(off_s[w + 1]);
+        testing::expect(end > start);
+        for start..end |pos| {
+            let g = cast<i64>(rg_s[pos]);
+            let p = cast<i64>(rp_s[pos]);
+            testing::expect_equal<i32>(cast<i32>(w), idx_s[g * 4 + p]);
+            total_found = total_found + 1;
+        }
+    }
+    testing::expect_equal<i64>(64, total_found);
+}

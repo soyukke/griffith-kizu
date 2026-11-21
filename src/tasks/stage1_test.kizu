@@ -1,0 +1,61 @@
+import griffith::codegen;
+import griffith::core;
+import griffith::synth;
+import std::mem;
+import std::string;
+import std::testing;
+
+fn check_xor_vm(allocator: Allocator, c: &synth::Circuit) -> mem::Error!void {
+    var in_bits = [2]u64{ 0b1010, 0b1100 };
+    var scratch = try core::alloc_u64(allocator, 2 + c.gate_count + 1);
+    defer scratch.deinit(allocator);
+    var out_bits = try core::alloc_u64(allocator, c.out_wires.len());
+    defer out_bits.deinit(allocator);
+    let ib = in_bits.as_slice();
+    let sc = scratch.as_mut_slice();
+    let ob = out_bits.as_mut_slice();
+    synth::eval_circuit_vm_u64(c, ib, sc, ob);
+    for 0..4 |p| {
+        let expected = (p & 1) ^ ((p >> 1) & 1);
+        let got = synth::groupsum_argmax_lane(ob, c.out_wires.len(), 2, p);
+        testing::expect_equal<i64>(expected, got);
+    }
+    return;
+}
+
+test "stage 1 xor parity4 adder2 train hard 1.00 and 0 mismatch after logic synthesis" {
+    let allocator = mem::page_allocator();
+
+    // 1. XOR (N=2 Softmax + GroupSum)
+    var xor_res = try train_xor(allocator);
+    defer xor_res.deinit(allocator);
+    testing::expect(xor_res.hard_acc >= 0.999);
+    let xor_mm = try verify_raw_vs_opt_exhaustive(allocator, &xor_res.raw_circuit, &xor_res.opt_result.circuit);
+    testing::expect_equal<i64>(0, xor_mm);
+    try check_xor_vm(allocator, &xor_res.opt_result.circuit);
+
+    // 2. 4-bit Parity (N=2 WARP + GumbelSt -> 1-bit circuit)
+    var par_res = try train_parity4(allocator);
+    defer par_res.deinit(allocator);
+    testing::expect(par_res.hard_acc >= 0.999);
+    let par_mm = try verify_raw_vs_opt_exhaustive(allocator, &par_res.raw_circuit, &par_res.opt_result.circuit);
+    testing::expect_equal<i64>(0, par_mm);
+
+    // 3. 2-bit Adder (N=4 WARP + GumbelSt -> 3-bit circuit)
+    var add_res = try train_adder2(allocator);
+    defer add_res.deinit(allocator);
+    testing::expect(add_res.hard_acc >= 0.999);
+    let add_mm = try verify_raw_vs_opt_exhaustive(allocator, &add_res.raw_circuit, &add_res.opt_result.circuit);
+    testing::expect_equal<i64>(0, add_mm);
+
+    // 4. Verify IR JSON and AOT Kizu codegen emit non-empty output
+    var ir = string::new(allocator);
+    defer ir.deinit(allocator);
+    try codegen::emit_griffith_ir_json(allocator, &add_res.opt_result.circuit, "adder2", &var ir);
+    testing::expect(ir.len() > 100);
+
+    var aot = string::new(allocator);
+    defer aot.deinit(allocator);
+    try codegen::emit_aot_kizu_fn(allocator, &add_res.opt_result.circuit, "aot_adder2", &var aot);
+    testing::expect(aot.len() > 80);
+}

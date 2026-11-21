@@ -1,0 +1,160 @@
+import std::math;
+import std::mem;
+
+pub struct GroupSum {
+    pub in_dim: i64,
+    pub k: i64,
+    pub tau: f32,
+}
+
+pub fn groupsum_new(in_dim: i64, k: i64, tau: f32) -> GroupSum {
+    return GroupSum { in_dim: in_dim, k: k, tau: tau };
+}
+
+pub fn groupsum_forward(
+    gs: &GroupSum,
+    x: []f32,
+    batch: i64,
+    logits_out: &var []f32
+) -> void {
+    let group_size = gs.in_dim / gs.k;
+    let inv_tau = 1.0 / gs.tau;
+    for 0..batch |b| {
+        let x_off = b * gs.in_dim;
+        let l_off = b * gs.k;
+        for 0..gs.k |c| {
+            var acc: f32 = 0.0;
+            let start = x_off + c * group_size;
+            for 0..group_size |j| {
+                acc = acc + x[start + j];
+            }
+            logits_out[l_off + c] = acc * inv_tau;
+        }
+    }
+    return;
+}
+
+pub fn groupsum_backward(
+    gs: &GroupSum,
+    grad_logits: []f32,
+    batch: i64,
+    grad_x_out: &var []f32
+) -> void {
+    let group_size = gs.in_dim / gs.k;
+    let inv_tau = 1.0 / gs.tau;
+    for 0..batch |b| {
+        let x_off = b * gs.in_dim;
+        let l_off = b * gs.k;
+        for 0..gs.k |c| {
+            let val = grad_logits[l_off + c] * inv_tau;
+            let start = x_off + c * group_size;
+            for 0..group_size |j| {
+                grad_x_out[start + j] = val;
+            }
+        }
+    }
+    return;
+}
+
+pub fn cross_entropy_loss_grad(
+    logits: []f32,
+    targets: []i32,
+    batch: i64,
+    num_classes: i64,
+    grad_logits: &var []f32
+) -> f32 {
+    var total_loss: f64 = 0.0;
+    let inv_batch = 1.0 / cast<f64>(batch);
+    for 0..batch |b| {
+        let off = b * num_classes;
+        var max_v = cast<f64>(logits[off]);
+        for 1..num_classes |c| {
+            let v = cast<f64>(logits[off + c]);
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        var sum_exp: f64 = 0.0;
+        for 0..num_classes |c| {
+            let e = math::exp<f64>(cast<f64>(logits[off + c]) - max_v);
+            grad_logits[off + c] = cast<f32>(e);
+            sum_exp = sum_exp + e;
+        }
+        let target = cast<i64>(targets[b]);
+        let log_sum_exp = max_v + math::log<f64>(sum_exp);
+        total_loss = total_loss + (log_sum_exp - cast<f64>(logits[off + target]));
+        let inv_sum = 1.0 / sum_exp;
+        for 0..num_classes |c| {
+            var p = cast<f64>(grad_logits[off + c]) * inv_sum;
+            if c == target {
+                p = p - 1.0;
+            }
+            grad_logits[off + c] = cast<f32>(p * inv_batch);
+        }
+    }
+    return cast<f32>(total_loss * inv_batch);
+}
+
+pub fn bce_loss_grad(
+    probs: []f32,
+    targets: []f32,
+    count: i64,
+    grad_probs: &var []f32
+) -> f32 {
+    let eps: f64 = 1e-6;
+    var total: f64 = 0.0;
+    let inv_n = 1.0 / cast<f64>(count);
+    for 0..count |i| {
+        var p = cast<f64>(probs[i]);
+        if p < eps {
+            p = eps;
+        }
+        if p > 1.0 - eps {
+            p = 1.0 - eps;
+        }
+        let y = cast<f64>(targets[i]);
+        total = total - (y * math::log<f64>(p) + (1.0 - y) * math::log<f64>(1.0 - p));
+        grad_probs[i] = cast<f32>(((p - y) / (p * (1.0 - p))) * inv_n);
+    }
+    return cast<f32>(total * inv_n);
+}
+
+pub fn adamw_update_slice(
+    params: &var []f32,
+    grads: []f32,
+    m: &var []f32,
+    v: &var []f32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step: i64
+) -> void {
+    let n = mem::count<f32>(params);
+    let b1 = cast<f64>(beta1);
+    let b2 = cast<f64>(beta2);
+    let step_f = cast<f64>(step);
+    let bc1 = 1.0 - math::pow<f64>(b1, step_f);
+    let bc2 = 1.0 - math::pow<f64>(b2, step_f);
+    let lr64 = cast<f64>(lr);
+    let wd64 = cast<f64>(weight_decay);
+    let eps64 = cast<f64>(eps);
+
+    for 0..n |i| {
+        let g = cast<f64>(grads[i]);
+        let mi = b1 * cast<f64>(m[i]) + (1.0 - b1) * g;
+        let vi = b2 * cast<f64>(v[i]) + (1.0 - b2) * g * g;
+        m[i] = cast<f32>(mi);
+        v[i] = cast<f32>(vi);
+        let m_hat = mi / bc1;
+        let v_hat = vi / bc2;
+        var p = cast<f64>(params[i]);
+        if wd64 > 0.0 {
+            p = p * (1.0 - lr64 * wd64);
+        }
+        p = p - lr64 * m_hat / (math::sqrt<f64>(v_hat) + eps64);
+        params[i] = cast<f32>(p);
+    }
+    return;
+}

@@ -1,0 +1,938 @@
+import griffith::core;
+import griffith::data;
+import griffith::gpu;
+import griffith::lut;
+import griffith::model;
+import std::array;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::process;
+import std::string;
+
+fn gpu_linear_fwd_layer(
+    ctx: &gpu::MetalTrainCtx,
+    layer: &var model::LinearLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32
+) -> gpu::MetalError!void {
+    let sx = layer.saved_x.as_mut_slice();
+    let n = batch * layer.in_dim;
+    for 0..n |i| { sx[i] = x[i]; }
+    layer.saved_batch = batch;
+    let w = layer.w.as_slice();
+    let b = layer.b.as_slice();
+    try gpu::metal_linear_fwd(ctx, x, w, b, out, batch, layer.in_dim, layer.out_dim);
+    return;
+}
+
+fn gpu_linear_bwd_layer(
+    ctx: &gpu::MetalTrainCtx,
+    layer: &var model::LinearLayer,
+    dy: []f32,
+    dx: &var []f32,
+    need_dx: bool
+) -> gpu::MetalError!void {
+    let sx = layer.saved_x.as_slice();
+    let w = layer.w.as_slice();
+    let gw = layer.gw.as_mut_slice();
+    let gb = layer.gb.as_mut_slice();
+    try gpu::metal_linear_bwd(ctx, sx, w, dy, dx, gw, gb, layer.saved_batch, layer.in_dim, layer.out_dim, need_dx);
+    return;
+}
+
+fn gpu_lut_fwd_mode(
+    ctx: &gpu::MetalTrainCtx,
+    layer: &var lut::LutLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32,
+    mode: model::EvalMode,
+    rng: &var core::Rng
+) -> gpu::MetalError!void {
+    match mode {
+        Train => {
+            try gpu::metal_lut_warp_fwd(ctx, layer, x, batch, out, true, rng);
+        },
+        EvalSoft => {
+            let saved_sel = layer.select_mode;
+            layer.select_mode = lut::SelectMode::Soft;
+            try gpu::metal_lut_warp_fwd(ctx, layer, x, batch, out, true, rng);
+            layer.select_mode = saved_sel;
+        },
+        EvalHard => {
+            try gpu::metal_lut_warp_fwd(ctx, layer, x, batch, out, false, rng);
+        },
+    }
+    return;
+}
+
+fn gpu_block_forward(
+    ctx: &gpu::MetalTrainCtx,
+    blk: &var model::LadderBlock,
+    x_in: []f32,
+    batch: i64,
+    seq_len: i64,
+    x_out: &var []f32,
+    tmp_proj: &var []f32,
+    mode: model::EvalMode,
+    rng: &var core::Rng
+) -> gpu::MetalError!void {
+    let bt = batch * seq_len;
+    let d = blk.d_model;
+    let n_heads = blk.n_heads;
+    let dk = d / n_heads;
+    let inv_sqrt_dk = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(dk)));
+    let use_lqkv = model::rung_uses_logic_qkv(blk.rung);
+    let use_xnor = model::rung_uses_xnor(blk.rung);
+    let use_mux_rung = model::rung_uses_mux(blk.rung);
+    let use_lffn = model::rung_uses_logic_ffn(blk.rung);
+
+    var is_train = false;
+    var is_eval_soft = false;
+    match mode {
+        Train => { is_train = true; },
+        EvalSoft => { is_eval_soft = true; },
+        EvalHard => {},
+    }
+    let use_mux = use_mux_rung and !is_eval_soft;
+
+    let sc = blk.scalars.as_slice();
+    let score_scale = sc[0];
+    let attn_out_scale = sc[1];
+    let ffn_out_scale = sc[2];
+
+    let ln1_s = blk.buf_ln1.as_mut_slice();
+    let bin1_s = blk.buf_bin1.as_mut_slice();
+    let q_s = blk.buf_q.as_mut_slice();
+    let k_s = blk.buf_k.as_mut_slice();
+    let v_s = blk.buf_v.as_mut_slice();
+    let a_soft = blk.buf_attn_soft.as_mut_slice();
+    let a_hard = blk.buf_attn_hard.as_mut_slice();
+    let ctx_s = blk.buf_ctx.as_mut_slice();
+
+    model::layernorm_forward(&var blk.ln1, x_in, bt, ln1_s);
+    if use_lqkv {
+        model::binarize_forward_ste(ln1_s, bin1_s, bt * d);
+        try gpu_lut_fwd_mode(ctx, &var blk.lq, bin1_s, bt, q_s, mode, rng);
+        try gpu_lut_fwd_mode(ctx, &var blk.lk, bin1_s, bt, k_s, mode, rng);
+        try gpu_lut_fwd_mode(ctx, &var blk.lv, bin1_s, bt, v_s, mode, rng);
+    } else {
+        try gpu_linear_fwd_layer(ctx, &var blk.wq, ln1_s, bt, q_s);
+        try gpu_linear_fwd_layer(ctx, &var blk.wk, ln1_s, bt, k_s);
+        try gpu_linear_fwd_layer(ctx, &var blk.wv, ln1_s, bt, v_s);
+    }
+
+    var scores = [128]f32{};
+    let sc_buf = scores.as_mut_slice();
+    let half_dk = cast<f32>(dk) * 0.5;
+    let inv_tau = 1.0 / blk.attn_tau;
+
+    for 0..batch |b| {
+        for 0..n_heads |h| {
+            let h_off = h * dk;
+            for 0..seq_len |t| {
+                let qt_off = (b * seq_len + t) * d + h_off;
+                let row_off = ((b * n_heads + h) * seq_len + t) * seq_len;
+
+                for 0..(t + 1) |s| {
+                    let ks_off = (b * seq_len + s) * d + h_off;
+                    var dot: f32 = 0.0;
+                    if !use_lqkv {
+                        for 0..dk |j| { dot = dot + q_s[qt_off + j] * k_s[ks_off + j]; }
+                        sc_buf[s] = dot * inv_sqrt_dk;
+                    } else if !use_xnor {
+                        for 0..dk |j| {
+                            dot = dot + (2.0 * q_s[qt_off + j] - 1.0) * (2.0 * k_s[ks_off + j] - 1.0);
+                        }
+                        sc_buf[s] = score_scale * dot * inv_sqrt_dk;
+                    } else {
+                        for 0..dk |j| {
+                            let qv = q_s[qt_off + j];
+                            let kv = k_s[ks_off + j];
+                            dot = dot + (1.0 - qv - kv + 2.0 * qv * kv);
+                        }
+                        sc_buf[s] = score_scale * (dot - half_dk) * inv_sqrt_dk;
+                    }
+                }
+
+                if use_mux {
+                    var best_s: i64 = 0;
+                    var best_v: f32 = -1e30;
+                    for 0..(t + 1) |s| {
+                        var noisy = sc_buf[s];
+                        if is_train {
+                            noisy = noisy + blk.attn_gumbel_scale * rng.next_gumbel_f32();
+                        } else {
+                            noisy = noisy + 1e-4 * cast<f32>(s) / cast<f32>(seq_len);
+                        }
+                        sc_buf[s] = noisy;
+                        if noisy > best_v { best_v = noisy; best_s = s; }
+                    }
+                    for 0..seq_len |s| {
+                        a_hard[row_off + s] = if s == best_s { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                    }
+                    if is_train {
+                        var max_s = sc_buf[0] * inv_tau;
+                        for 1..(t + 1) |s| {
+                            let v = sc_buf[s] * inv_tau;
+                            if v > max_s { max_s = v; }
+                        }
+                        var sum_e: f64 = 0.0;
+                        for 0..(t + 1) |s| {
+                            let e = math::exp<f64>(cast<f64>(sc_buf[s] * inv_tau - max_s));
+                            a_soft[row_off + s] = cast<f32>(e);
+                            sum_e = sum_e + e;
+                        }
+                        let inv_sum = cast<f32>(1.0 / sum_e);
+                        for 0..(t + 1) |s| { a_soft[row_off + s] = a_soft[row_off + s] * inv_sum; }
+                        for (t + 1)..seq_len |s| { a_soft[row_off + s] = 0.0; }
+                    }
+                    let vw_off = (b * seq_len + best_s) * d + h_off;
+                    for 0..dk |j| { ctx_s[qt_off + j] = 2.0 * v_s[vw_off + j] - 1.0; }
+                } else {
+                    var max_s = sc_buf[0];
+                    for 1..(t + 1) |s| { if sc_buf[s] > max_s { max_s = sc_buf[s]; } }
+                    var sum_e: f64 = 0.0;
+                    for 0..(t + 1) |s| {
+                        let e = math::exp<f64>(cast<f64>(sc_buf[s] - max_s));
+                        a_soft[row_off + s] = cast<f32>(e);
+                        sum_e = sum_e + e;
+                    }
+                    let inv_sum = cast<f32>(1.0 / sum_e);
+                    for 0..(t + 1) |s| {
+                        let w = a_soft[row_off + s] * inv_sum;
+                        a_soft[row_off + s] = w;
+                        a_hard[row_off + s] = w;
+                    }
+                    for (t + 1)..seq_len |s| { a_soft[row_off + s] = 0.0; a_hard[row_off + s] = 0.0; }
+                    for 0..dk |j| {
+                        var acc: f32 = 0.0;
+                        if use_lqkv {
+                            for 0..(t + 1) |s| {
+                                let vs_off = (b * seq_len + s) * d + h_off;
+                                acc = acc + a_soft[row_off + s] * (2.0 * v_s[vs_off + j] - 1.0);
+                            }
+                        } else {
+                            for 0..(t + 1) |s| {
+                                let vs_off = (b * seq_len + s) * d + h_off;
+                                acc = acc + a_soft[row_off + s] * v_s[vs_off + j];
+                            }
+                        }
+                        ctx_s[qt_off + j] = acc;
+                    }
+                }
+            }
+        }
+    }
+
+    if use_lqkv {
+        for 0..(bt * d) |i| { x_out[i] = x_in[i] + attn_out_scale * ctx_s[i]; }
+    } else {
+        try gpu_linear_fwd_layer(ctx, &var blk.wo, ctx_s, bt, tmp_proj);
+        for 0..(bt * d) |i| { x_out[i] = x_in[i] + tmp_proj[i]; }
+    }
+
+    let ln2_s = blk.buf_ln2.as_mut_slice();
+    let bin2_s = blk.buf_bin2.as_mut_slice();
+    let h1_s = blk.buf_ffn_h1.as_mut_slice();
+    let h2_s = blk.buf_ffn_h2.as_mut_slice();
+    let fgs_s = blk.buf_ffn_gs.as_mut_slice();
+
+    model::layernorm_forward(&var blk.ln2, x_out, bt, ln2_s);
+    if use_lffn {
+        model::binarize_forward_ste(ln2_s, bin2_s, bt * d);
+        try gpu_lut_fwd_mode(ctx, &var blk.ffn_lut1, bin2_s, bt, h1_s, mode, rng);
+        try gpu_lut_fwd_mode(ctx, &var blk.ffn_lut2, h1_s, bt, h2_s, mode, rng);
+        lut::groupsum_forward(&blk.ffn_gs, h2_s, bt, fgs_s);
+        for 0..(bt * d) |i| { x_out[i] = x_out[i] + ffn_out_scale * (fgs_s[i] - 0.5); }
+    } else {
+        try gpu_linear_fwd_layer(ctx, &var blk.fc1, ln2_s, bt, h1_s);
+        model::gelu_forward(h1_s, h2_s, bt * blk.ffn_hidden);
+        try gpu_linear_fwd_layer(ctx, &var blk.fc2, h2_s, bt, tmp_proj);
+        for 0..(bt * d) |i| { x_out[i] = x_out[i] + tmp_proj[i]; }
+    }
+    return;
+}
+
+fn gpu_block_backward(
+    ctx: &gpu::MetalTrainCtx,
+    blk: &var model::LadderBlock,
+    grad_out: []f32,
+    batch: i64,
+    seq_len: i64,
+    grad_in: &var []f32,
+    g_tmp1: &var []f32,
+    g_tmp2: &var []f32,
+    g_tmp3: &var []f32,
+    g_q: &var []f32,
+    g_k: &var []f32,
+    g_v: &var []f32
+) -> gpu::MetalError!void {
+    let bt = batch * seq_len;
+    let d = blk.d_model;
+    let n_heads = blk.n_heads;
+    let dk = d / n_heads;
+    let inv_sqrt_dk = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(dk)));
+    let use_lqkv = model::rung_uses_logic_qkv(blk.rung);
+    let use_xnor = model::rung_uses_xnor(blk.rung);
+    let use_mux = model::rung_uses_mux(blk.rung);
+    let use_lffn = model::rung_uses_logic_ffn(blk.rung);
+
+    let sc = blk.scalars.as_slice();
+    let score_scale = sc[0];
+    let attn_out_scale = sc[1];
+    let ffn_out_scale = sc[2];
+    let gsc = blk.g_scalars.as_mut_slice();
+
+    let ln2_s = blk.buf_ln2.as_slice();
+    let h1_s = blk.buf_ffn_h1.as_slice();
+    let fgs_s = blk.buf_ffn_gs.as_slice();
+
+    if use_lffn {
+        var g_scale2: f64 = 0.0;
+        for 0..(bt * d) |i| {
+            g_scale2 = g_scale2 + cast<f64>(grad_out[i] * (fgs_s[i] - 0.5));
+            g_tmp1[i] = grad_out[i] * ffn_out_scale;
+        }
+        gsc[2] = gsc[2] + cast<f32>(g_scale2);
+        lut::groupsum_backward(&blk.ffn_gs, g_tmp1, bt, g_tmp2);
+        try gpu::metal_lut_warp_bwd(ctx, &var blk.ffn_lut2, g_tmp2, g_tmp1, true);
+        try gpu::metal_lut_warp_bwd(ctx, &var blk.ffn_lut1, g_tmp1, g_tmp2, true);
+        model::binarize_backward_ste(ln2_s, g_tmp2, g_tmp1, bt * d);
+        model::layernorm_backward(&var blk.ln2, g_tmp1, g_tmp3);
+    } else {
+        try gpu_linear_bwd_layer(ctx, &var blk.fc2, grad_out, g_tmp2, true);
+        model::gelu_backward(h1_s, g_tmp2, g_tmp1, bt * blk.ffn_hidden);
+        try gpu_linear_bwd_layer(ctx, &var blk.fc1, g_tmp1, g_tmp2, true);
+        model::layernorm_backward(&var blk.ln2, g_tmp2, g_tmp3);
+    }
+
+    for 0..(bt * d) |i| { g_tmp3[i] = grad_out[i] + g_tmp3[i]; }
+
+    let ctx_s = blk.buf_ctx.as_slice();
+    if use_lqkv {
+        var g_scale1: f64 = 0.0;
+        for 0..(bt * d) |i| {
+            g_scale1 = g_scale1 + cast<f64>(g_tmp3[i] * ctx_s[i]);
+            g_tmp1[i] = g_tmp3[i] * attn_out_scale;
+        }
+        gsc[1] = gsc[1] + cast<f32>(g_scale1);
+    } else {
+        try gpu_linear_bwd_layer(ctx, &var blk.wo, g_tmp3, g_tmp1, true);
+    }
+
+    for 0..(bt * d) |i| { g_q[i] = 0.0; g_k[i] = 0.0; g_v[i] = 0.0; }
+
+    let q_s = blk.buf_q.as_slice();
+    let k_s = blk.buf_k.as_slice();
+    let v_s = blk.buf_v.as_slice();
+    let a_soft = blk.buf_attn_soft.as_slice();
+    let a_hard = blk.buf_attn_hard.as_slice();
+
+    var grad_w = [128]f32{};
+    let gw_buf = grad_w.as_mut_slice();
+    let half_dk = cast<f32>(dk) * 0.5;
+    let inv_tau: f32 = if use_mux { cast<f32>(1.0) / blk.attn_tau } else { cast<f32>(1.0) };
+    var g_score_scale: f64 = 0.0;
+
+    for 0..batch |b| {
+        for 0..n_heads |h| {
+            let h_off = h * dk;
+            for 0..seq_len |t| {
+                let qt_off = (b * seq_len + t) * d + h_off;
+                let row_off = ((b * n_heads + h) * seq_len + t) * seq_len;
+
+                var dot_gw_w: f32 = 0.0;
+                for 0..(t + 1) |s| {
+                    let vs_off = (b * seq_len + s) * d + h_off;
+                    let w_fwd = a_hard[row_off + s];
+                    let w_sft = a_soft[row_off + s];
+                    var dw: f32 = 0.0;
+                    if use_lqkv {
+                        for 0..dk |j| {
+                            let gc = g_tmp1[qt_off + j];
+                            dw = dw + gc * (2.0 * v_s[vs_off + j] - 1.0);
+                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc * 2.0;
+                        }
+                    } else {
+                        for 0..dk |j| {
+                            let gc = g_tmp1[qt_off + j];
+                            dw = dw + gc * v_s[vs_off + j];
+                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc;
+                        }
+                    }
+                    gw_buf[s] = dw;
+                    dot_gw_w = dot_gw_w + dw * w_sft;
+                }
+
+                for 0..(t + 1) |s| {
+                    let w_sft = a_soft[row_off + s];
+                    let ds = w_sft * (gw_buf[s] - dot_gw_w) * inv_tau;
+                    let ks_off = (b * seq_len + s) * d + h_off;
+                    if !use_lqkv {
+                        let ds_scaled = ds * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * k_s[ks_off + j];
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * q_s[qt_off + j];
+                        }
+                    } else if !use_xnor {
+                        var raw_dot: f32 = 0.0;
+                        let ds_scaled = ds * score_scale * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            let qc = 2.0 * q_s[qt_off + j] - 1.0;
+                            let kc = 2.0 * k_s[ks_off + j] - 1.0;
+                            raw_dot = raw_dot + qc * kc;
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * kc * 2.0;
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * qc * 2.0;
+                        }
+                        g_score_scale = g_score_scale + cast<f64>(ds * raw_dot * inv_sqrt_dk);
+                    } else {
+                        var xnor_sum: f32 = 0.0;
+                        let ds_scaled = ds * score_scale * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            let qv = q_s[qt_off + j];
+                            let kv = k_s[ks_off + j];
+                            xnor_sum = xnor_sum + (1.0 - qv - kv + 2.0 * qv * kv);
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * (2.0 * kv - 1.0);
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * (2.0 * qv - 1.0);
+                        }
+                        g_score_scale = g_score_scale + cast<f64>(ds * (xnor_sum - half_dk) * inv_sqrt_dk);
+                    }
+                }
+            }
+        }
+    }
+    if use_lqkv { gsc[0] = gsc[0] + cast<f32>(g_score_scale); }
+
+    let ln1_s = blk.buf_ln1.as_slice();
+    if use_lqkv {
+        try gpu::metal_lut_warp_bwd(ctx, &var blk.lq, g_q, g_tmp1, true);
+        try gpu::metal_lut_warp_bwd(ctx, &var blk.lk, g_k, g_tmp2, true);
+        for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
+        try gpu::metal_lut_warp_bwd(ctx, &var blk.lv, g_v, g_tmp2, true);
+        for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
+        model::binarize_backward_ste(ln1_s, g_tmp1, g_tmp2, bt * d);
+        model::layernorm_backward(&var blk.ln1, g_tmp2, g_tmp1);
+    } else {
+        try gpu_linear_bwd_layer(ctx, &var blk.wq, g_q, g_tmp1, true);
+        try gpu_linear_bwd_layer(ctx, &var blk.wk, g_k, g_tmp2, true);
+        for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
+        try gpu_linear_bwd_layer(ctx, &var blk.wv, g_v, g_tmp2, true);
+        for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
+        model::layernorm_backward(&var blk.ln1, g_tmp1, g_tmp2);
+        for 0..(bt * d) |i| { g_tmp1[i] = g_tmp2[i]; }
+    }
+
+    for 0..(bt * d) |i| { grad_in[i] = g_tmp3[i] + g_tmp1[i]; }
+    return;
+}
+
+fn gpu_ladder_forward(
+    ctx: &gpu::MetalTrainCtx,
+    m: &var model::LogicLadderGPT,
+    tokens: []i32,
+    batch: i64,
+    seq_len: i64,
+    logits_out: &var []f32,
+    mode: model::EvalMode,
+    rng: &var core::Rng
+) -> gpu::MetalError!void {
+    let d = m.cfg.d_model;
+    let bt = batch * seq_len;
+    let stride = m.cfg.max_batch * m.cfg.seq_len * d;
+
+    let tok_w = m.tok_emb.w.as_slice();
+    let pos_w = m.pos_emb.w.as_slice();
+    let xs = m.layer_xs.as_mut_slice();
+    let tmp_p = m.buf_tmp_proj.as_mut_slice();
+
+    for 0..batch |b| {
+        for 0..seq_len |t| {
+            let tok = cast<i64>(tokens[b * seq_len + t]);
+            let dst = (b * seq_len + t) * d;
+            let t_off = tok * d;
+            let p_off = t * d;
+            for 0..d |i| { xs[dst + i] = tok_w[t_off + i] + pos_w[p_off + i]; }
+        }
+    }
+
+    let x_in_buf = m.grad_cur.as_mut_slice();
+    let x_out_buf = m.grad_prev.as_mut_slice();
+    for 0..m.cfg.n_layers |l| {
+        let in_off = l * stride;
+        let out_off = (l + 1) * stride;
+        for 0..(bt * d) |i| { x_in_buf[i] = xs[in_off + i]; }
+        if m.blocks.at_mut(l) |blk| {
+            try gpu_block_forward(ctx, blk, x_in_buf, batch, seq_len, x_out_buf, tmp_p, mode, rng);
+        }
+        for 0..(bt * d) |i| { xs[out_off + i] = x_out_buf[i]; }
+    }
+
+    let last_off = m.cfg.n_layers * stride;
+    for 0..(bt * d) |i| { x_in_buf[i] = xs[last_off + i]; }
+    let lnf = m.buf_ln_final.as_mut_slice();
+    model::layernorm_forward(&var m.final_ln, x_in_buf, bt, lnf);
+    try gpu_linear_fwd_layer(ctx, &var m.lm_head, lnf, bt, logits_out);
+    return;
+}
+
+fn gpu_ladder_backward(
+    ctx: &gpu::MetalTrainCtx,
+    m: &var model::LogicLadderGPT,
+    tokens: []i32,
+    batch: i64,
+    seq_len: i64,
+    grad_logits: []f32
+) -> gpu::MetalError!void {
+    let d = m.cfg.d_model;
+    let bt = batch * seq_len;
+
+    let gc = m.grad_cur.as_mut_slice();
+    let gp = m.grad_prev.as_mut_slice();
+    let gt1 = m.g_tmp1.as_mut_slice();
+    let gt2 = m.g_tmp2.as_mut_slice();
+    let gt3 = m.g_tmp3.as_mut_slice();
+    let gq = m.g_q.as_mut_slice();
+    let gk = m.g_k.as_mut_slice();
+    let gv = m.g_v.as_mut_slice();
+
+    try gpu_linear_bwd_layer(ctx, &var m.lm_head, grad_logits, gp, true);
+    model::layernorm_backward(&var m.final_ln, gp, gc);
+
+    var l = m.cfg.n_layers - 1;
+    while l >= 0 {
+        if m.blocks.at_mut(l) |blk| {
+            try gpu_block_backward(ctx, blk, gc, batch, seq_len, gp, gt1, gt2, gt3, gq, gk, gv);
+        }
+        for 0..(bt * d) |i| { gc[i] = gp[i]; }
+        l = l - 1;
+    }
+
+    let g_tok = m.tok_emb.gw.as_mut_slice();
+    let g_pos = m.pos_emb.gw.as_mut_slice();
+    for 0..batch |b| {
+        for 0..seq_len |t| {
+            let tok = cast<i64>(tokens[b * seq_len + t]);
+            let src = (b * seq_len + t) * d;
+            let t_off = tok * d;
+            let p_off = t * d;
+            for 0..d |i| {
+                let g = gc[src + i];
+                g_tok[t_off + i] = g_tok[t_off + i] + g;
+                g_pos[p_off + i] = g_pos[p_off + i] + g;
+            }
+        }
+    }
+    return;
+}
+
+/// Collects token indices where each example begins (after "\n\n", or index 0).
+fn collect_example_starts(
+    allocator: Allocator,
+    tokens: []i32,
+    start_bound: i64,
+    end_bound: i64,
+    seq_len: i64
+) -> mem::Error!array::Array<i64> {
+    var starts = array::new<i64>(allocator);
+    errdefer starts.deinit(allocator);
+    let max_pos = end_bound - seq_len - 1;
+    if start_bound <= max_pos {
+        try starts.append(allocator, start_bound);
+    }
+    var i = start_bound + 2;
+    while i <= max_pos {
+        // "\n\n" followed by '[' (byte 91, or a BPE token starting after two '\n' tokens)
+        if tokens[i - 1] == 10 and tokens[i - 2] == 10 {
+            try starts.append(allocator, i);
+        }
+        i = i + 1;
+    }
+    return move starts;
+}
+
+fn sample_aligned_batch(
+    tokens: []i32,
+    starts: []i64,
+    n_starts: i64,
+    base: i64,
+    span_len: i64,
+    batch: i64,
+    seq_len: i64,
+    rng: &var core::Rng,
+    x_out: &var []i32,
+    y_out: &var []i32
+) -> void {
+    let safe_span = if span_len - seq_len - 1 > 1 { span_len - seq_len - 1 } else { 1 };
+    for 0..batch |b| {
+        var pos = base;
+        // 80% aligned to example start ([X訳]/[関西]/[津軽]/[会話] at t=0!), 20% sliding stream
+        if n_starts > 0 and rng.next_range(10) < 8 {
+            pos = starts[rng.next_range(n_starts)];
+        } else {
+            pos = base + rng.next_range(safe_span);
+        }
+        let off = b * seq_len;
+        for 0..seq_len |t| {
+            x_out[off + t] = tokens[pos + t];
+            y_out[off + t] = tokens[pos + t + 1];
+        }
+    }
+    return;
+}
+
+fn eval_jpllm_ppl(
+    ctx: &gpu::MetalTrainCtx,
+    m: &var model::LogicLadderGPT,
+    tokens: []i32,
+    val_starts: []i64,
+    n_val_starts: i64,
+    val_base: i64,
+    val_len: i64,
+    batch: i64,
+    seq_len: i64,
+    eval_batches: i64,
+    mode: model::EvalMode,
+    x_buf: &var array::Array<i32>,
+    y_buf: &var array::Array<i32>,
+    logits: &var array::Array<f32>,
+    g_logits: &var array::Array<f32>
+) -> gpu::MetalError!f64 {
+    var rng = core::rng_new(9999);
+    let bt = batch * seq_len;
+    let vocab = m.cfg.vocab_size;
+    var total_loss: f64 = 0.0;
+    for 0..eval_batches |_| {
+        let xm = x_buf.as_mut_slice();
+        let ym = y_buf.as_mut_slice();
+        sample_aligned_batch(tokens, val_starts, n_val_starts, val_base, val_len, batch, seq_len, &var rng, xm, ym);
+        let xs = x_buf.as_slice();
+        let ys = y_buf.as_slice();
+        let lm = logits.as_mut_slice();
+        try gpu_ladder_forward(ctx, m, xs, batch, seq_len, lm, mode, &var rng);
+        let ls = logits.as_slice();
+        let gl = g_logits.as_mut_slice();
+        total_loss = total_loss + cast<f64>(lut::cross_entropy_loss_grad(ls, ys, bt, vocab, gl));
+    }
+    return math::exp<f64>(total_loss / cast<f64>(eval_batches));
+}
+
+fn jpllm_print_sample(
+    allocator: Allocator,
+    rt: &var model::LadderRuntime,
+    prompt: []u8,
+    max_new: i64,
+    temp: f32
+) -> mem::Error!void {
+    var ids = array::new<i32>(allocator);
+    defer ids.deinit(allocator);
+    try data::bpe_encode(allocator, &rt.bpe, prompt, &var ids);
+
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    try out.append_bytes(allocator, prompt);
+
+    rt.rng = core::rng_new(42);
+    var prev_nl = false;
+    for 0..max_new |_| {
+        let cur_n = ids.len();
+        let win = if cur_n > rt.seq_len { rt.seq_len } else { cur_n };
+        let start = cur_n - win;
+        let id_s = ids.as_slice();
+        model::ladder_runtime_forward(rt, id_s[start..cur_n], win);
+        let nxt = model::ladder_runtime_sample_next(rt, temp);
+        try ids.append(allocator, nxt);
+        let piece = data::bpe_token_bytes(&rt.bpe, nxt);
+        try out.append_bytes(allocator, piece);
+        if nxt == 10 {
+            if prev_nl { break; }
+            prev_nl = true;
+        } else {
+            prev_nl = false;
+        }
+    }
+    let out_b = out.as_bytes();
+    print(out_b);
+    return;
+}
+
+fn parse_i64_default(raw: []u8, fallback: i64) -> i64 {
+    let n = mem::len(raw);
+    if n <= 0 { return fallback; }
+    var v: i64 = 0;
+    for 0..n |i| {
+        let b = raw[i];
+        if b < 48 or b > 57 { return fallback; }
+        v = v * 10 + cast<i64>(b - 48);
+    }
+    return if v > 0 { v } else { fallback };
+}
+
+/// CLI: griffith jpllm-train-one <l0|l0b|l3c> <steps> <out.glgpt> [teacher.glgpt] [corpus.txt]
+pub fn run_jpllm_train_one() -> !void {
+    let allocator = mem::page_allocator();
+    if process::arg_count() < 4 {
+        print("usage: griffith jpllm-train-one <l0|l0b|l3c> <steps> <out.glgpt> [teacher.glgpt] [corpus.txt]");
+        return;
+    }
+    let rung_arg = try process::arg(1);
+    let steps_arg = try process::arg(2);
+    let out_arg = try process::arg(3);
+
+    var rung = model::LadderRung::L0;
+    if mem::equal_bytes(rung_arg, "l0b") { rung = model::LadderRung::L0b; }
+    else if mem::equal_bytes(rung_arg, "l1") { rung = model::LadderRung::L1; }
+    else if mem::equal_bytes(rung_arg, "l2") { rung = model::LadderRung::L2; }
+    else if mem::equal_bytes(rung_arg, "l3c") { rung = model::LadderRung::L3c; }
+
+    let steps = parse_i64_default(steps_arg, 2500);
+    var has_teacher = false;
+    var teacher_path = string::new(allocator);
+    defer teacher_path.deinit(allocator);
+    if process::arg_count() >= 5 {
+        let tp = try process::arg(4);
+        if mem::len(tp) > 0 and !mem::equal_bytes(tp, "-") {
+            try teacher_path.append_bytes(allocator, tp);
+            has_teacher = true;
+        }
+    }
+
+    var corpus_path = string::new(allocator);
+    defer corpus_path.deinit(allocator);
+    if process::arg_count() >= 6 {
+        try corpus_path.append_bytes(allocator, try process::arg(5));
+    } else {
+        try corpus_path.append_bytes(allocator, "data/jpllm_corpus.txt");
+    }
+
+    let cp_b = corpus_path.as_bytes();
+    let raw = try fs::read_file(io::blocking(), allocator, &cp_b, mem::Limit::Unlimited);
+    defer raw.deinit(allocator);
+    let raw_bytes = raw.as_bytes();
+
+    // Load Teacher if given (and reuse its exact BPE vocab for lossless KL distillation!)
+    var teacher_loaded = false;
+    var teacher_rt_opt = array::new<model::LadderRuntime>(allocator);
+    defer teacher_rt_opt.deinit(allocator);
+
+    var bpe_opt = array::new<data::BpeVocab>(allocator);
+    defer bpe_opt.deinit(allocator);
+    var tokens = array::new<i32>(allocator);
+    defer tokens.deinit(allocator);
+
+    if has_teacher {
+        let tp_b = teacher_path.as_bytes();
+        let tb = try fs::read_file(io::blocking(), allocator, &tp_b, mem::Limit::Unlimited);
+        defer tb.deinit(allocator);
+        let tb_bytes = tb.as_bytes();
+        var trt = try model::ladder_runtime_from_bytes(allocator, tb_bytes);
+        try teacher_rt_opt.append(allocator, move trt);
+        if teacher_rt_opt.at(0) |tr| {
+            let ml_s = tr.bpe.merge_left.as_slice();
+            let mr_s = tr.bpe.merge_right.as_slice();
+            var bpe_copy = try data::bpe_from_merges(allocator, ml_s, mr_s, tr.bpe.num_merges);
+            errdefer bpe_copy.deinit(allocator);
+            try data::bpe_encode(allocator, &bpe_copy, raw_bytes, &var tokens);
+            try bpe_opt.append(allocator, move bpe_copy);
+        }
+        teacher_loaded = true;
+    } else {
+        let t_bpe0 = process::monotonic_millis();
+        var bpe = try data::bpe_train(allocator, raw_bytes, 768);
+        errdefer bpe.deinit(allocator);
+        try data::bpe_encode(allocator, &bpe, raw_bytes, &var tokens);
+        let t_bpe1 = process::monotonic_millis();
+        var ln = string::new(allocator);
+        defer ln.deinit(allocator);
+        try ln.append_bytes(allocator, "BPE trained: vocab=");
+        try fmt::append_i64(allocator, &var ln, bpe.vocab_size);
+        try ln.append_bytes(allocator, " raw_bytes=");
+        try fmt::append_i64(allocator, &var ln, mem::len(raw_bytes));
+        try ln.append_bytes(allocator, " tokens=");
+        try fmt::append_i64(allocator, &var ln, tokens.len());
+        try ln.append_bytes(allocator, " ms=");
+        try fmt::append_i64(allocator, &var ln, t_bpe1 - t_bpe0);
+        let lnb = ln.as_bytes();
+        print(lnb);
+        try bpe_opt.append(allocator, move bpe);
+    }
+
+    var vocab_size: i64 = 768;
+    if bpe_opt.at(0) |br| { vocab_size = br.vocab_size; }
+    let n_toks = tokens.len();
+    let train_len = (n_toks * 9) / 10;
+    let val_start = train_len;
+    let val_len = n_toks - train_len;
+
+    let seq_len: i64 = 64;
+    let batch: i64 = 16;
+    let bt = batch * seq_len;
+
+    let tok_s = tokens.as_slice();
+    var train_starts = try collect_example_starts(allocator, tok_s, 0, train_len, seq_len);
+    defer train_starts.deinit(allocator);
+    var val_starts = try collect_example_starts(allocator, tok_s, val_start, n_toks, seq_len);
+    defer val_starts.deinit(allocator);
+    var dln = string::new(allocator);
+    defer dln.deinit(allocator);
+    try dln.append_bytes(allocator, "Dataset: train_toks=");
+    try fmt::append_i64(allocator, &var dln, train_len);
+    try dln.append_bytes(allocator, " val_toks=");
+    try fmt::append_i64(allocator, &var dln, val_len);
+    try dln.append_bytes(allocator, " train_ex=");
+    try fmt::append_i64(allocator, &var dln, train_starts.len());
+    try dln.append_bytes(allocator, " val_ex=");
+    try fmt::append_i64(allocator, &var dln, val_starts.len());
+    let dlnb = dln.as_bytes();
+    print(dlnb);
+
+    let cfg = model::LadderConfig {
+        vocab_size: vocab_size,
+        seq_len: seq_len,
+        d_model: 128,
+        n_heads: 4,
+        n_layers: 3,
+        ffn_hidden: 256,
+        ffn_gates: 256,
+        ffn_group_factor: 4,
+        qkv_n_inputs: 4,
+        ffn_n_inputs: 2,
+        max_batch: batch,
+        rung: rung,
+        attn_tau: 1.0,
+        attn_gumbel_scale: 0.25,
+    };
+
+    // Init Metal GPU training context (max_f32 = 2M floats = 8 MB per shared buffer -> plenty for BT*V=786K & d*4*BT)
+    let gpu_ctx = try gpu::metal_train_init(allocator, 2097152, 65536);
+    defer gpu_ctx.release();
+
+    var rng = core::rng_new(42);
+    var m = try model::ladder_gpt_new(allocator, cfg, &var rng);
+    defer m.deinit(allocator);
+
+    var x_buf = try core::alloc_i32(allocator, bt);
+    defer x_buf.deinit(allocator);
+    var y_buf = try core::alloc_i32(allocator, bt);
+    defer y_buf.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, bt * vocab_size);
+    defer logits.deinit(allocator);
+    var t_logits = try core::alloc_f32(allocator, bt * vocab_size);
+    defer t_logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, bt * vocab_size);
+    defer g_logits.deinit(allocator);
+
+    let ts_s = train_starts.as_slice();
+    let vs_s = val_starts.as_slice();
+    let t0 = process::monotonic_millis();
+    var last_loss: f32 = 0.0;
+
+    for 0..steps |step_idx| {
+        let step = step_idx + 1;
+        let prog = cast<f64>(step_idx) / cast<f64>(steps);
+        let lr_mult = 0.15 + 0.85 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * prog));
+        let lr_fp = cast<f32>(0.003 * lr_mult);
+        let lr_lut = cast<f32>(0.035 * lr_mult);
+
+        let xm = x_buf.as_mut_slice();
+        let ym = y_buf.as_mut_slice();
+        sample_aligned_batch(tok_s, ts_s, train_starts.len(), 0, train_len, batch, seq_len, &var rng, xm, ym);
+        let xs = x_buf.as_slice();
+        let ys = y_buf.as_slice();
+
+        model::ladder_zero_grad(&var m);
+        let lm = logits.as_mut_slice();
+        try gpu_ladder_forward(&gpu_ctx, &var m, xs, batch, seq_len, lm, model::EvalMode::Train, &var rng);
+        let ls = logits.as_slice();
+        let gl = g_logits.as_mut_slice();
+
+        if teacher_loaded {
+            let tlm = t_logits.as_mut_slice();
+            if teacher_rt_opt.at_mut(0) |trt| {
+                model::ladder_runtime_forward_batch(trt, xs, batch, seq_len, tlm);
+            }
+            let tls = t_logits.as_slice();
+            last_loss = model::kl_distill_loss_grad(ls, tls, ys, bt, vocab_size, 0.55, 2.0, gl);
+        } else {
+            last_loss = lut::cross_entropy_loss_grad(ls, ys, bt, vocab_size, gl);
+        }
+
+        let gls = g_logits.as_slice();
+        try gpu_ladder_backward(&gpu_ctx, &var m, xs, batch, seq_len, gls);
+        model::ladder_adamw_step(&var m, lr_fp, lr_lut, 0.01, step);
+
+        if step == 1 or step % 400 == 0 or step == steps {
+            let dt_ms = process::monotonic_millis() - t0;
+            let safe_ms = if dt_ms > 0 { dt_ms } else { 1 };
+            let tps = (step * bt * 1000) / safe_ms;
+            var slog = string::new(allocator);
+            defer slog.deinit(allocator);
+            try slog.append_bytes(allocator, "step=");
+            try fmt::append_i64(allocator, &var slog, step);
+            try slog.append_bytes(allocator, "/");
+            try fmt::append_i64(allocator, &var slog, steps);
+            try slog.append_bytes(allocator, " loss_x1000=");
+            try fmt::append_i64(allocator, &var slog, cast<i64>(cast<f64>(last_loss) * 1000.0 + 0.5));
+            try slog.append_bytes(allocator, " tok/s=");
+            try fmt::append_i64(allocator, &var slog, tps);
+            try slog.append_bytes(allocator, " ms=");
+            try fmt::append_i64(allocator, &var slog, dt_ms);
+            let slb = slog.as_bytes();
+            print(slb);
+        }
+    }
+
+    let soft_ppl = try eval_jpllm_ppl(
+        &gpu_ctx, &var m, tok_s, vs_s, val_starts.len(), val_start, val_len,
+        batch, seq_len, 16, model::EvalMode::EvalSoft, &var x_buf, &var y_buf, &var logits, &var g_logits
+    );
+    let hard_ppl = try eval_jpllm_ppl(
+        &gpu_ctx, &var m, tok_s, vs_s, val_starts.len(), val_start, val_len,
+        batch, seq_len, 16, model::EvalMode::EvalHard, &var x_buf, &var y_buf, &var logits, &var g_logits
+    );
+
+    let soft_x100 = cast<i32>(soft_ppl * 100.0 + 0.5);
+    let hard_x100 = cast<i32>(hard_ppl * 100.0 + 0.5);
+
+    var blob = string::new(allocator);
+    defer blob.deinit(allocator);
+    if bpe_opt.at(0) |br| {
+        try model::ladder_serialize_glgpt_bpe(allocator, &m, br, soft_x100, hard_x100, cast<i32>(steps), &var blob);
+    }
+
+    var out_path = string::new(allocator);
+    defer out_path.deinit(allocator);
+    try out_path.append_bytes(allocator, out_arg);
+    let op_b = out_path.as_bytes();
+    let blob_b = blob.as_bytes();
+    try fs::write_file(io::blocking(), &op_b, blob_b);
+
+    var rlog = string::new(allocator);
+    defer rlog.deinit(allocator);
+    try rlog.append_bytes(allocator, "EXPORTED JPLLM v2: rung=");
+    try rlog.append_bytes(allocator, rung_arg);
+    try rlog.append_bytes(allocator, " bytes=");
+    try fmt::append_i64(allocator, &var rlog, blob.len());
+    try rlog.append_bytes(allocator, " soft_ppl_x100=");
+    try fmt::append_i64(allocator, &var rlog, cast<i64>(soft_x100));
+    try rlog.append_bytes(allocator, " hard_ppl_x100=");
+    try fmt::append_i64(allocator, &var rlog, cast<i64>(hard_x100));
+    try rlog.append_bytes(allocator, " path=");
+    try rlog.append_bytes(allocator, out_arg);
+    let rlb = rlog.as_bytes();
+    print(rlb);
+
+    // Quick qualitative check right from serialized runtime!
+    var rt = try model::ladder_runtime_from_bytes(allocator, blob_b);
+    defer rt.deinit(allocator);
+    print("--- SAMPLES (EvalHard, temp=0.6) ---");
+    try jpllm_print_sample(allocator, &var rt, "[X訳] 今日めっちゃ眠い\n=> ", 42, 0.6);
+    try jpllm_print_sample(allocator, &var rt, "[関西] 今日めっちゃ眠い\n=> ", 42, 0.6);
+    try jpllm_print_sample(allocator, &var rt, "[津軽] 今日めっちゃ眠い\n=> ", 42, 0.6);
+    try jpllm_print_sample(allocator, &var rt, "[会話] おはよう\n=> ", 42, 0.6);
+    return;
+}

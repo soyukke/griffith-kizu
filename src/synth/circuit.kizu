@@ -1,0 +1,869 @@
+import griffith::core;
+import griffith::lut;
+import std::array;
+import std::mem;
+import std::testing;
+
+pub fn wire_const0() -> i32 {
+    return -1;
+}
+
+pub fn wire_const1() -> i32 {
+    return -2;
+}
+
+pub struct Circuit {
+    pub input_width: i64,
+    pub gate_count: i64,
+    pub gate_arity: array::Array<i32>,
+    pub gate_pins: array::Array<i32>,
+    pub gate_tt: array::Array<u64>,
+    pub out_wires: array::Array<i32>,
+    pub group_sum_k: i64,
+    pub group_sum_tau: f32,
+}
+
+pub fn (self: Circuit) deinit(allocator: Allocator) -> void {
+    self.gate_arity.deinit(allocator);
+    self.gate_pins.deinit(allocator);
+    self.gate_tt.deinit(allocator);
+    self.out_wires.deinit(allocator);
+    return;
+}
+
+pub struct OptStats {
+    pub raw_gates: i64,
+    pub opt_gates: i64,
+    pub const_folded: i64,
+    pub passthrough_removed: i64,
+    pub inverted_absorbed: i64,
+    pub cse_merged: i64,
+    pub dce_removed: i64,
+    pub raw_depth: i64,
+    pub opt_depth: i64,
+}
+
+pub struct OptResult {
+    pub circuit: Circuit,
+    pub stats: OptStats,
+}
+
+pub fn (self: OptResult) deinit(allocator: Allocator) -> void {
+    self.circuit.deinit(allocator);
+    return;
+}
+
+pub fn tt_mask(arity: i64) -> u64 {
+    if arity >= 6 {
+        return ~cast<u64>(0);
+    }
+    let bits = lut::pow2(arity);
+    return (cast<u64>(1) << cast<u64>(bits)) - cast<u64>(1);
+}
+
+pub fn tt_flip_pin(tt: u64, arity: i64, pin: i64) -> u64 {
+    let entries = lut::pow2(arity);
+    let bit_mask = cast<i64>(cast<u64>(1) << cast<u64>(pin));
+    var out: u64 = 0;
+    for 0..entries |k| {
+        let src = k ^ bit_mask;
+        if ((tt >> cast<u64>(src)) & cast<u64>(1)) != 0 {
+            out = out | (cast<u64>(1) << cast<u64>(k));
+        }
+    }
+    return out;
+}
+
+pub fn tt_swap_pins(tt: u64, arity: i64, p1: i64, p2: i64) -> u64 {
+    if p1 == p2 {
+        return tt;
+    }
+    let entries = lut::pow2(arity);
+    var out: u64 = 0;
+    for 0..entries |k| {
+        let b1 = (cast<u64>(k) >> cast<u64>(p1)) & cast<u64>(1);
+        let b2 = (cast<u64>(k) >> cast<u64>(p2)) & cast<u64>(1);
+        var src = cast<u64>(k);
+        if b1 != b2 {
+            src = src ^ (cast<u64>(1) << cast<u64>(p1));
+            src = src ^ (cast<u64>(1) << cast<u64>(p2));
+        }
+        if ((tt >> src) & cast<u64>(1)) != 0 {
+            out = out | (cast<u64>(1) << cast<u64>(k));
+        }
+    }
+    return out;
+}
+
+pub fn tt_cofactor(tt: u64, arity: i64, pin: i64, val: i64) -> u64 {
+    let new_arity = arity - 1;
+    let new_entries = lut::pow2(new_arity);
+    let low_mask = (cast<u64>(1) << cast<u64>(pin)) - cast<u64>(1);
+    var out: u64 = 0;
+    for 0..new_entries |k| {
+        let ku = cast<u64>(k);
+        let low = ku & low_mask;
+        let high = (ku >> cast<u64>(pin)) << cast<u64>(pin + 1);
+        let src = low | high | (cast<u64>(val) << cast<u64>(pin));
+        if ((tt >> src) & cast<u64>(1)) != 0 {
+            out = out | (cast<u64>(1) << ku);
+        }
+    }
+    return out;
+}
+
+pub fn tt_merge_dup_pins(tt: u64, arity: i64, p_keep: i64, p_drop: i64) -> u64 {
+    let new_arity = arity - 1;
+    let new_entries = lut::pow2(new_arity);
+    let low_mask = (cast<u64>(1) << cast<u64>(p_drop)) - cast<u64>(1);
+    var out: u64 = 0;
+    for 0..new_entries |k| {
+        let ku = cast<u64>(k);
+        let low = ku & low_mask;
+        let high = (ku >> cast<u64>(p_drop)) << cast<u64>(p_drop + 1);
+        var orig_keep = p_keep;
+        if p_keep > p_drop {
+            orig_keep = p_keep;
+        }
+        let shifted_keep = if p_keep < p_drop { p_keep } else { p_keep - 1 };
+        let keep_bit = (ku >> cast<u64>(shifted_keep)) & cast<u64>(1);
+        let src = low | high | (keep_bit << cast<u64>(p_drop));
+        let _ = orig_keep;
+        if ((tt >> src) & cast<u64>(1)) != 0 {
+            out = out | (cast<u64>(1) << ku);
+        }
+    }
+    return out;
+}
+
+pub fn tt_depends_on(tt: u64, arity: i64, pin: i64) -> bool {
+    let entries = lut::pow2(arity);
+    let bit_mask = cast<i64>(cast<u64>(1) << cast<u64>(pin));
+    for 0..entries |k| {
+        if (k & bit_mask) == 0 {
+            let b0 = (tt >> cast<u64>(k)) & cast<u64>(1);
+            let b1 = (tt >> cast<u64>(k | bit_mask)) & cast<u64>(1);
+            if b0 != b1 {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn circuit_from_discrete_pair(
+    allocator: Allocator,
+    layer1: &lut::DiscreteLutLayer,
+    layer2: &lut::DiscreteLutLayer,
+    group_sum_k: i64,
+    group_sum_tau: f32
+) -> mem::Error!Circuit {
+    let in_w = layer1.in_dim;
+    let g1 = layer1.out_dim;
+    let g2 = layer2.out_dim;
+    let total_g = g1 + g2;
+
+    var gate_arity = try core::alloc_i32(allocator, total_g);
+    errdefer gate_arity.deinit(allocator);
+    var gate_pins = try core::alloc_i32(allocator, total_g * 6);
+    errdefer gate_pins.deinit(allocator);
+    var gate_tt = try core::alloc_u64(allocator, total_g);
+    errdefer gate_tt.deinit(allocator);
+    var out_wires = try core::alloc_i32(allocator, g2);
+    errdefer out_wires.deinit(allocator);
+
+    let ga = gate_arity.as_mut_slice();
+    let gp = gate_pins.as_mut_slice();
+    let gt = gate_tt.as_mut_slice();
+    let ow = out_wires.as_mut_slice();
+
+    let l1_idx = layer1.indices.as_slice();
+    let l1_tt = layer1.truth_tables.as_slice();
+    for 0..g1 |o| {
+        ga[o] = cast<i32>(layer1.n_inputs);
+        gt[o] = l1_tt[o];
+        for 0..layer1.n_inputs |p| {
+            gp[o * 6 + p] = l1_idx[o * layer1.n_inputs + p];
+        }
+    }
+
+    let l2_idx = layer2.indices.as_slice();
+    let l2_tt = layer2.truth_tables.as_slice();
+    for 0..g2 |o| {
+        let gid = g1 + o;
+        ga[gid] = cast<i32>(layer2.n_inputs);
+        gt[gid] = l2_tt[o];
+        for 0..layer2.n_inputs |p| {
+            gp[gid * 6 + p] = cast<i32>(in_w) + l2_idx[o * layer2.n_inputs + p];
+        }
+        ow[o] = cast<i32>(in_w + gid);
+    }
+
+    return Circuit {
+        input_width: in_w,
+        gate_count: total_g,
+        gate_arity: move gate_arity,
+        gate_pins: move gate_pins,
+        gate_tt: move gate_tt,
+        out_wires: move out_wires,
+        group_sum_k: group_sum_k,
+        group_sum_tau: group_sum_tau,
+    };
+}
+
+pub fn circuit_from_discrete_triple(
+    allocator: Allocator,
+    layer1: &lut::DiscreteLutLayer,
+    layer2: &lut::DiscreteLutLayer,
+    layer3: &lut::DiscreteLutLayer,
+    group_sum_k: i64,
+    group_sum_tau: f32
+) -> mem::Error!Circuit {
+    let in_w = layer1.in_dim;
+    let g1 = layer1.out_dim;
+    let g2 = layer2.out_dim;
+    let g3 = layer3.out_dim;
+    let total_g = g1 + g2 + g3;
+
+    var gate_arity = try core::alloc_i32(allocator, total_g);
+    errdefer gate_arity.deinit(allocator);
+    var gate_pins = try core::alloc_i32(allocator, total_g * 6);
+    errdefer gate_pins.deinit(allocator);
+    var gate_tt = try core::alloc_u64(allocator, total_g);
+    errdefer gate_tt.deinit(allocator);
+    var out_wires = try core::alloc_i32(allocator, g3);
+    errdefer out_wires.deinit(allocator);
+
+    let ga = gate_arity.as_mut_slice();
+    let gp = gate_pins.as_mut_slice();
+    let gt = gate_tt.as_mut_slice();
+    let ow = out_wires.as_mut_slice();
+
+    let l1_idx = layer1.indices.as_slice();
+    let l1_tt = layer1.truth_tables.as_slice();
+    for 0..g1 |o| {
+        ga[o] = cast<i32>(layer1.n_inputs);
+        gt[o] = l1_tt[o];
+        for 0..layer1.n_inputs |p| {
+            gp[o * 6 + p] = l1_idx[o * layer1.n_inputs + p];
+        }
+    }
+
+    let l2_idx = layer2.indices.as_slice();
+    let l2_tt = layer2.truth_tables.as_slice();
+    for 0..g2 |o| {
+        let gid = g1 + o;
+        ga[gid] = cast<i32>(layer2.n_inputs);
+        gt[gid] = l2_tt[o];
+        for 0..layer2.n_inputs |p| {
+            gp[gid * 6 + p] = cast<i32>(in_w) + l2_idx[o * layer2.n_inputs + p];
+        }
+    }
+
+    let l3_idx = layer3.indices.as_slice();
+    let l3_tt = layer3.truth_tables.as_slice();
+    for 0..g3 |o| {
+        let gid = g1 + g2 + o;
+        ga[gid] = cast<i32>(layer3.n_inputs);
+        gt[gid] = l3_tt[o];
+        for 0..layer3.n_inputs |p| {
+            gp[gid * 6 + p] = cast<i32>(in_w + g1) + l3_idx[o * layer3.n_inputs + p];
+        }
+        ow[o] = cast<i32>(in_w + gid);
+    }
+
+    return Circuit {
+        input_width: in_w,
+        gate_count: total_g,
+        gate_arity: move gate_arity,
+        gate_pins: move gate_pins,
+        gate_tt: move gate_tt,
+        out_wires: move out_wires,
+        group_sum_k: group_sum_k,
+        group_sum_tau: group_sum_tau,
+    };
+}
+
+pub fn circuit_compute_depth(allocator: Allocator, c: &Circuit) -> mem::Error!i64 {
+    let total_wires = c.input_width + c.gate_count;
+    var depth = try core::alloc_i32(allocator, total_wires);
+    defer depth.deinit(allocator);
+    let ds = depth.as_mut_slice();
+    let ga = c.gate_arity.as_slice();
+    let gp = c.gate_pins.as_slice();
+    let ow = c.out_wires.as_slice();
+
+    for 0..c.gate_count |g| {
+        let arity = cast<i64>(ga[g]);
+        var max_d: i32 = 0;
+        for 0..arity |p| {
+            let w = gp[g * 6 + p];
+            if w >= 0 {
+                let d = ds[cast<i64>(w)];
+                if d > max_d {
+                    max_d = d;
+                }
+            }
+        }
+        ds[c.input_width + g] = max_d + 1;
+    }
+
+    var out_max: i64 = 0;
+    for 0..c.out_wires.len() |i| {
+        let w = ow[i];
+        if w >= 0 {
+            let d = cast<i64>(ds[cast<i64>(w)]);
+            if d > out_max {
+                out_max = d;
+            }
+        }
+    }
+    return out_max;
+}
+
+pub fn circuit_optimize(allocator: Allocator, src: &Circuit) -> mem::Error!OptResult {
+    let in_w = src.input_width;
+    let g_count = src.gate_count;
+    let out_count = src.out_wires.len();
+    let total_wires = in_w + g_count;
+    let raw_depth = try circuit_compute_depth(allocator, src);
+
+    // Working arrays for canonicalization + CSE (allocated up front).
+    var remap_wire = try core::alloc_i32(allocator, total_wires);
+    defer remap_wire.deinit(allocator);
+    var remap_inv = try core::alloc_i32(allocator, total_wires);
+    defer remap_inv.deinit(allocator);
+
+    // Surviving unique canonical gates before DCE (at most g_count + out_count for output inverters).
+    let cap_g = g_count + out_count + 1;
+    var tmp_arity = try core::alloc_i32(allocator, cap_g);
+    defer tmp_arity.deinit(allocator);
+    var tmp_pins = try core::alloc_i32(allocator, cap_g * 6);
+    defer tmp_pins.deinit(allocator);
+    var tmp_tt = try core::alloc_u64(allocator, cap_g);
+    defer tmp_tt.deinit(allocator);
+    var tmp_out_wires = try core::alloc_i32(allocator, out_count);
+    defer tmp_out_wires.deinit(allocator);
+    var live = try core::alloc_i32(allocator, cap_g);
+    defer live.deinit(allocator);
+    var compact_id = try core::alloc_i32(allocator, cap_g);
+    defer compact_id.deinit(allocator);
+
+    let rw = remap_wire.as_mut_slice();
+    let ri = remap_inv.as_mut_slice();
+    let ta = tmp_arity.as_mut_slice();
+    let tp = tmp_pins.as_mut_slice();
+    let tt_arr = tmp_tt.as_mut_slice();
+    let tow = tmp_out_wires.as_mut_slice();
+    let live_s = live.as_mut_slice();
+    let cid = compact_id.as_mut_slice();
+
+    for 0..in_w |i| {
+        rw[i] = cast<i32>(i);
+        ri[i] = 0;
+    }
+
+    let src_arity = src.gate_arity.as_slice();
+    let src_pins = src.gate_pins.as_slice();
+    let src_tt = src.gate_tt.as_slice();
+    let src_ow = src.out_wires.as_slice();
+
+    var const_folded: i64 = 0;
+    var passthrough_removed: i64 = 0;
+    var inverted_absorbed: i64 = 0;
+    var cse_merged: i64 = 0;
+    var kept_g: i64 = 0;
+
+    var cur_pins = [6]i32{};
+    let cp = cur_pins.as_mut_slice();
+
+    for 0..g_count |g| {
+        var arity = cast<i64>(src_arity[g]);
+        var tt = src_tt[g] & tt_mask(arity);
+        for 0..arity |p| {
+            let old_w = src_pins[g * 6 + p];
+            if old_w >= 0 {
+                let mapped = rw[cast<i64>(old_w)];
+                let inv = ri[cast<i64>(old_w)];
+                cp[p] = mapped;
+                if inv != 0 {
+                    tt = tt_flip_pin(tt, arity, p);
+                }
+            } else {
+                cp[p] = old_w;
+            }
+        }
+
+        // 1. Constant pin folding
+        var p: i64 = 0;
+        while p < arity {
+            if cp[p] == wire_const0() or cp[p] == wire_const1() {
+                let cval: i64 = if cp[p] == wire_const1() { 1 } else { 0 };
+                tt = tt_cofactor(tt, arity, p, cval);
+                var q = p;
+                while q + 1 < arity {
+                    cp[q] = cp[q + 1];
+                    q = q + 1;
+                }
+                arity = arity - 1;
+            } else {
+                p = p + 1;
+            }
+        }
+
+        // 2. Duplicate pin merging
+        var a: i64 = 0;
+        while a < arity {
+            var b = a + 1;
+            while b < arity {
+                if cp[a] == cp[b] {
+                    tt = tt_merge_dup_pins(tt, arity, a, b);
+                    var q = b;
+                    while q + 1 < arity {
+                        cp[q] = cp[q + 1];
+                        q = q + 1;
+                    }
+                    arity = arity - 1;
+                } else {
+                    b = b + 1;
+                }
+            }
+            a = a + 1;
+        }
+
+        // 3. Vacuous variable elimination (support minimization)
+        p = 0;
+        while p < arity {
+            if !tt_depends_on(tt, arity, p) {
+                tt = tt_cofactor(tt, arity, p, 0);
+                var q = p;
+                while q + 1 < arity {
+                    cp[q] = cp[q + 1];
+                    q = q + 1;
+                }
+                arity = arity - 1;
+            } else {
+                p = p + 1;
+            }
+        }
+
+        // 4. Canonical pin sorting (ascending wire ID)
+        for 1..arity |i| {
+            var j = i;
+            while j > 0 and cp[j - 1] > cp[j] {
+                let tmp_w = cp[j - 1];
+                cp[j - 1] = cp[j];
+                cp[j] = tmp_w;
+                tt = tt_swap_pins(tt, arity, j - 1, j);
+                j = j - 1;
+            }
+        }
+
+        let mask = tt_mask(arity);
+        tt = tt & mask;
+        let wire_idx = in_w + g;
+
+        if tt == 0 {
+            rw[wire_idx] = wire_const0();
+            ri[wire_idx] = 0;
+            const_folded = const_folded + 1;
+        } else if tt == mask {
+            rw[wire_idx] = wire_const1();
+            ri[wire_idx] = 0;
+            const_folded = const_folded + 1;
+        } else if arity == 1 and tt == cast<u64>(2) {
+            rw[wire_idx] = cp[0];
+            ri[wire_idx] = 0;
+            passthrough_removed = passthrough_removed + 1;
+        } else if arity == 1 and tt == cast<u64>(1) {
+            rw[wire_idx] = cp[0];
+            ri[wire_idx] = 1;
+            inverted_absorbed = inverted_absorbed + 1;
+        } else {
+            // 5. Canonical CSE (both positive and complemented structural match)
+            let neg_tt = (~tt) & mask;
+            var found: i64 = -1;
+            var found_inv: i32 = 0;
+            for 0..kept_g |prev| {
+                if cast<i64>(ta[prev]) == arity {
+                    let prev_tt = tt_arr[prev];
+                    if prev_tt == tt or prev_tt == neg_tt {
+                        var same = true;
+                        for 0..arity |k| {
+                            if tp[prev * 6 + k] != cp[k] {
+                                same = false;
+                            }
+                        }
+                        if same {
+                            found = prev;
+                            if prev_tt == neg_tt {
+                                found_inv = 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if found >= 0 {
+                rw[wire_idx] = cast<i32>(in_w + found);
+                ri[wire_idx] = found_inv;
+                cse_merged = cse_merged + 1;
+            } else {
+                ta[kept_g] = cast<i32>(arity);
+                tt_arr[kept_g] = tt;
+                for 0..arity |k| {
+                    tp[kept_g * 6 + k] = cp[k];
+                }
+                rw[wire_idx] = cast<i32>(in_w + kept_g);
+                ri[wire_idx] = 0;
+                kept_g = kept_g + 1;
+            }
+        }
+    }
+
+    // Resolve primary outputs (materialize 1-input NOT gate only if an output wire is inverted).
+    for 0..out_count |i| {
+        let old_w = src_ow[i];
+        if old_w < 0 {
+            tow[i] = old_w;
+        } else {
+            let mapped = rw[cast<i64>(old_w)];
+            let inv = ri[cast<i64>(old_w)];
+            if inv == 0 {
+                tow[i] = mapped;
+            } else if mapped == wire_const0() {
+                tow[i] = wire_const1();
+            } else if mapped == wire_const1() {
+                tow[i] = wire_const0();
+            } else {
+                // Reuse existing 1-input inverter for mapped if present.
+                var inv_gate: i64 = -1;
+                for 0..kept_g |prev| {
+                    if ta[prev] == 1 and tt_arr[prev] == cast<u64>(1) and tp[prev * 6] == mapped {
+                        inv_gate = prev;
+                        break;
+                    }
+                }
+                if inv_gate < 0 {
+                    inv_gate = kept_g;
+                    ta[kept_g] = 1;
+                    tp[kept_g * 6] = mapped;
+                    tt_arr[kept_g] = cast<u64>(1);
+                    kept_g = kept_g + 1;
+                }
+                tow[i] = cast<i32>(in_w + inv_gate);
+            }
+        }
+    }
+
+    // 6. DCE (Dead Code Elimination) backwards from outputs
+    for 0..out_count |i| {
+        let w = tow[i];
+        if w >= cast<i32>(in_w) {
+            live_s[cast<i64>(w) - in_w] = 1;
+        }
+    }
+    var g_back = kept_g - 1;
+    while g_back >= 0 {
+        if live_s[g_back] != 0 {
+            let arity = cast<i64>(ta[g_back]);
+            for 0..arity |k| {
+                let w = tp[g_back * 6 + k];
+                if w >= cast<i32>(in_w) {
+                    live_s[cast<i64>(w) - in_w] = 1;
+                }
+            }
+        }
+        g_back = g_back - 1;
+    }
+
+    var new_g: i64 = 0;
+    for 0..kept_g |g| {
+        if live_s[g] != 0 {
+            cid[g] = cast<i32>(new_g);
+            new_g = new_g + 1;
+        } else {
+            cid[g] = -1;
+        }
+    }
+    let dce_removed = kept_g - new_g;
+
+    var out_arity = try core::alloc_i32(allocator, new_g);
+    errdefer out_arity.deinit(allocator);
+    var out_pins = try core::alloc_i32(allocator, new_g * 6);
+    errdefer out_pins.deinit(allocator);
+    var out_tt = try core::alloc_u64(allocator, new_g);
+    errdefer out_tt.deinit(allocator);
+    var final_ow = try core::alloc_i32(allocator, out_count);
+    errdefer final_ow.deinit(allocator);
+
+    let oa = out_arity.as_mut_slice();
+    let op = out_pins.as_mut_slice();
+    let ot = out_tt.as_mut_slice();
+    let fow = final_ow.as_mut_slice();
+
+    for 0..kept_g |g| {
+        if live_s[g] != 0 {
+            let ng = cast<i64>(cid[g]);
+            let arity = cast<i64>(ta[g]);
+            oa[ng] = cast<i32>(arity);
+            ot[ng] = tt_arr[g];
+            for 0..arity |k| {
+                let w = tp[g * 6 + k];
+                if w >= cast<i32>(in_w) {
+                    op[ng * 6 + k] = cast<i32>(in_w) + cid[cast<i64>(w) - in_w];
+                } else {
+                    op[ng * 6 + k] = w;
+                }
+            }
+        }
+    }
+
+    for 0..out_count |i| {
+        let w = tow[i];
+        if w >= cast<i32>(in_w) {
+            fow[i] = cast<i32>(in_w) + cid[cast<i64>(w) - in_w];
+        } else {
+            fow[i] = w;
+        }
+    }
+
+    var opt_circuit = Circuit {
+        input_width: in_w,
+        gate_count: new_g,
+        gate_arity: move out_arity,
+        gate_pins: move out_pins,
+        gate_tt: move out_tt,
+        out_wires: move final_ow,
+        group_sum_k: src.group_sum_k,
+        group_sum_tau: src.group_sum_tau,
+    };
+    errdefer opt_circuit.deinit(allocator);
+    let opt_depth = try circuit_compute_depth(allocator, &opt_circuit);
+
+    let stats = OptStats {
+        raw_gates: g_count,
+        opt_gates: new_g,
+        const_folded: const_folded,
+        passthrough_removed: passthrough_removed,
+        inverted_absorbed: inverted_absorbed,
+        cse_merged: cse_merged,
+        dce_removed: dce_removed,
+        raw_depth: raw_depth,
+        opt_depth: opt_depth,
+    };
+    return OptResult { circuit: move opt_circuit, stats: stats };
+}
+
+pub fn eval_lut_u64(pins: []u64, arity: i64, tt: u64) -> u64 {
+    let all1 = ~cast<u64>(0);
+    if arity == 0 {
+        if (tt & cast<u64>(1)) != 0 {
+            return all1;
+        }
+        return 0;
+    }
+    if arity == 1 {
+        let t = tt & cast<u64>(3);
+        if t == 0 { return 0; }
+        if t == 1 { return ~pins[0]; }
+        if t == 2 { return pins[0]; }
+        return all1;
+    }
+    if arity == 2 {
+        let a = pins[0];
+        let b = pins[1];
+        let t = tt & cast<u64>(15);
+        if t == 0 { return 0; }
+        if t == 1 { return (~a) & (~b); }
+        if t == 2 { return a & (~b); }
+        if t == 3 { return ~b; }
+        if t == 4 { return (~a) & b; }
+        if t == 5 { return ~a; }
+        if t == 6 { return a ^ b; }
+        if t == 7 { return ~(a & b); }
+        if t == 8 { return a & b; }
+        if t == 9 { return ~(a ^ b); }
+        if t == 10 { return a; }
+        if t == 11 { return a | (~b); }
+        if t == 12 { return b; }
+        if t == 13 { return (~a) | b; }
+        if t == 14 { return a | b; }
+        return all1;
+    }
+    // General arity 3..6: 64-way bit-sliced Shannon mux tree
+    var cur = [32]u64{};
+    let cs = cur.as_mut_slice();
+    let a0 = pins[0];
+    let na0 = ~a0;
+    let half0 = lut::pow2(arity - 1);
+    for 0..half0 |m| {
+        let b0 = (tt >> cast<u64>(m * 2)) & cast<u64>(1);
+        let b1 = (tt >> cast<u64>(m * 2 + 1)) & cast<u64>(1);
+        let code = b0 | (b1 << 1);
+        if code == 0 {
+            cs[m] = 0;
+        } else if code == 1 {
+            cs[m] = na0;
+        } else if code == 2 {
+            cs[m] = a0;
+        } else {
+            cs[m] = all1;
+        }
+    }
+    var cur_len = half0;
+    for 1..arity |p| {
+        let ap = pins[p];
+        let nap = ~ap;
+        let next_len = cur_len / 2;
+        for 0..next_len |m| {
+            cs[m] = (cs[m * 2] & nap) | (cs[m * 2 + 1] & ap);
+        }
+        cur_len = next_len;
+    }
+    return cs[0];
+}
+
+pub fn eval_circuit_vm_u64(
+    c: &Circuit,
+    in_bits: []u64,
+    wire_scratch: &var []u64,
+    out_bits: &var []u64
+) -> void {
+    let in_w = c.input_width;
+    let ga = c.gate_arity.as_slice();
+    let gp = c.gate_pins.as_slice();
+    let gt = c.gate_tt.as_slice();
+    let ow = c.out_wires.as_slice();
+
+    for 0..in_w |i| {
+        wire_scratch[i] = in_bits[i];
+    }
+
+    var pin_vals = [6]u64{};
+    let pv = pin_vals.as_mut_slice();
+    let all1 = ~cast<u64>(0);
+
+    for 0..c.gate_count |g| {
+        let arity = cast<i64>(ga[g]);
+        for 0..arity |p| {
+            let w = gp[g * 6 + p];
+            if w == wire_const0() {
+                pv[p] = 0;
+            } else if w == wire_const1() {
+                pv[p] = all1;
+            } else {
+                pv[p] = wire_scratch[cast<i64>(w)];
+            }
+        }
+        wire_scratch[in_w + g] = eval_lut_u64(pv, arity, gt[g]);
+    }
+
+    for 0..c.out_wires.len() |i| {
+        let w = ow[i];
+        if w == wire_const0() {
+            out_bits[i] = 0;
+        } else if w == wire_const1() {
+            out_bits[i] = all1;
+        } else {
+            out_bits[i] = wire_scratch[cast<i64>(w)];
+        }
+    }
+    return;
+}
+
+pub fn groupsum_argmax_lane(out_bits: []u64, out_count: i64, k: i64, lane: i64) -> i64 {
+    let group_size = out_count / k;
+    var best_c: i64 = 0;
+    var best_sum: i64 = -1;
+    let shift = cast<u64>(lane);
+    for 0..k |c| {
+        var sum: i64 = 0;
+        let start = c * group_size;
+        for 0..group_size |j| {
+            if ((out_bits[start + j] >> shift) & cast<u64>(1)) != 0 {
+                sum = sum + 1;
+            }
+        }
+        if sum > best_sum {
+            best_sum = sum;
+            best_c = c;
+        }
+    }
+    return best_c;
+}
+
+fn fill_redundant_xor_test(
+    ga: &var array::Array<i32>,
+    gp: &var array::Array<i32>,
+    gt: &var array::Array<u64>,
+    ow: &var array::Array<i32>
+) -> void {
+    let a = ga.as_mut_slice();
+    let p = gp.as_mut_slice();
+    let t = gt.as_mut_slice();
+    let o = ow.as_mut_slice();
+    // g0 (wire 2): const 0
+    a[0] = 2; p[0] = 0; p[1] = 1; t[0] = 0;
+    // g1 (wire 3): passthrough in0 (tt=0b1010 = 10)
+    a[1] = 2; p[6] = 0; p[7] = 1; t[1] = 10;
+    // g2 (wire 4): ~in1 (tt=0b0011 = 3)
+    a[2] = 2; p[12] = 0; p[13] = 1; t[2] = 3;
+    // g3 (wire 5): XNOR(g1, g2) = in0 ^ in1 (tt=0b1001 = 9)
+    a[3] = 2; p[18] = 3; p[19] = 4; t[3] = 9;
+    // g4 (wire 6): XOR(in0, in1) (tt=0b0110 = 6) -> CSE merges with g3!
+    a[4] = 2; p[24] = 1; p[25] = 0; t[4] = 6;
+    // g5 (wire 7): dead AND(in0, in1)
+    a[5] = 2; p[30] = 0; p[31] = 1; t[5] = 8;
+    o[0] = 5;
+    o[1] = 6;
+    return;
+}
+
+test "circuit optimizer preserves truth table and shrinks redundant gates" {
+    let allocator = mem::page_allocator();
+    var ga = try core::alloc_i32(allocator, 6);
+    errdefer ga.deinit(allocator);
+    var gp = try core::alloc_i32(allocator, 36);
+    errdefer gp.deinit(allocator);
+    var gt = try core::alloc_u64(allocator, 6);
+    errdefer gt.deinit(allocator);
+    var ow = try core::alloc_i32(allocator, 2);
+    errdefer ow.deinit(allocator);
+
+    fill_redundant_xor_test(&var ga, &var gp, &var gt, &var ow);
+
+    var raw = Circuit {
+        input_width: 2,
+        gate_count: 6,
+        gate_arity: move ga,
+        gate_pins: move gp,
+        gate_tt: move gt,
+        out_wires: move ow,
+        group_sum_k: 0,
+        group_sum_tau: 1.0,
+    };
+    defer raw.deinit(allocator);
+
+    var opt = try circuit_optimize(allocator, &raw);
+    defer opt.deinit(allocator);
+
+    testing::expect_equal<i64>(6, opt.stats.raw_gates);
+    testing::expect_equal<i64>(1, opt.stats.opt_gates);
+
+    var in_bits = [2]u64{ 0b1010, 0b1100 };
+    var raw_scratch = [16]u64{};
+    var opt_scratch = [16]u64{};
+    var raw_out = [2]u64{};
+    var opt_out = [2]u64{};
+    let ib = in_bits.as_slice();
+    let rs = raw_scratch.as_mut_slice();
+    let os = opt_scratch.as_mut_slice();
+    let ro = raw_out.as_mut_slice();
+    let oo = opt_out.as_mut_slice();
+    eval_circuit_vm_u64(&raw, ib, rs, ro);
+    eval_circuit_vm_u64(&opt.circuit, ib, os, oo);
+    testing::expect_equal<u64>(ro[0] & 0xf, oo[0] & 0xf);
+    testing::expect_equal<u64>(ro[1] & 0xf, oo[1] & 0xf);
+    testing::expect_equal<u64>(0b0110, oo[0] & 0xf);
+}

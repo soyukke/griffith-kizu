@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p target web/dist
+scripts/kizu build --target native --opt -o target/griffith .
+scripts/kizu build --target metal --opt -o target/kernels.metal .
+scripts/kizu build --target spirv --opt -o target/kernels.spv .
+scripts/kizu build --target wasm32-browser --opt --emit esm -o web/dist .

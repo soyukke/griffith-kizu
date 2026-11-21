@@ -1,0 +1,466 @@
+import std::gpu;
+
+/// GPU Linear Forward: Y[m, o] = sum_k X[m, k] * W[o, k] + b[o]
+/// Dispatched with total threads = m * out_d
+export "gpu" fn gpu_linear_fwd(
+    x: []f32,
+    w: []f32,
+    b: []f32,
+    y: &var []f32,
+    m: i64,
+    in_d: i64,
+    out_d: i64
+) -> void {
+    let tid = gpu::thread_index();
+    let total = m * out_d;
+    if tid >= total { return; }
+    let row = tid / out_d;
+    let o = tid - row * out_d;
+    let x_off = row * in_d;
+    let w_off = o * in_d;
+    var acc = b[o];
+    for 0..in_d |k| {
+        acc = acc + x[x_off + k] * w[w_off + k];
+    }
+    y[tid] = acc;
+    return;
+}
+
+/// GPU Linear Backward w.r.t. X: dX[m, k] = sum_o dY[m, o] * W[o, k]
+/// Dispatched with total threads = m * in_d
+export "gpu" fn gpu_linear_bwd_x(
+    dy: []f32,
+    w: []f32,
+    dx: &var []f32,
+    m: i64,
+    in_d: i64,
+    out_d: i64
+) -> void {
+    let tid = gpu::thread_index();
+    let total = m * in_d;
+    if tid >= total { return; }
+    let row = tid / in_d;
+    let k = tid - row * in_d;
+    let dy_off = row * out_d;
+    var acc: f32 = 0.0;
+    for 0..out_d |o| {
+        acc = acc + dy[dy_off + o] * w[o * in_d + k];
+    }
+    dx[tid] = acc;
+    return;
+}
+
+/// GPU Linear Backward w.r.t. W: dW[o, k] += sum_m dY[m, o] * X[m, k]
+/// Zero-atomic: 1 thread per (o, k), dispatched with total threads = out_d * in_d
+export "gpu" fn gpu_linear_bwd_w(
+    x: []f32,
+    dy: []f32,
+    dw: &var []f32,
+    m: i64,
+    in_d: i64,
+    out_d: i64
+) -> void {
+    let tid = gpu::thread_index();
+    let total = out_d * in_d;
+    if tid >= total { return; }
+    let o = tid / in_d;
+    let k = tid - o * in_d;
+    var acc: f32 = 0.0;
+    for 0..m |row| {
+        acc = acc + dy[row * out_d + o] * x[row * in_d + k];
+    }
+    dw[tid] = dw[tid] + acc;
+    return;
+}
+
+/// GPU Linear Backward w.r.t. bias: db[o] += sum_m dY[m, o]
+/// Dispatched with total threads = out_d
+export "gpu" fn gpu_linear_bwd_b(
+    dy: []f32,
+    db: &var []f32,
+    m: i64,
+    out_d: i64
+) -> void {
+    let o = gpu::thread_index();
+    if o >= out_d { return; }
+    var acc: f32 = 0.0;
+    for 0..m |row| {
+        acc = acc + dy[row * out_d + o];
+    }
+    db[o] = db[o] + acc;
+    return;
+}
+
+fn gpu_sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        let e = gpu::exp(-x);
+        return cast<f32>(1.0) / (cast<f32>(1.0) + e);
+    }
+    let e = gpu::exp(x);
+    return e / (cast<f32>(1.0) + e);
+}
+
+/// GPU WARP LUT Forward for N=2 (4 coeffs) and N=4 (16 coeffs).
+/// mode: 0 = Soft, 1 = HardSt, 2 = GumbelSt, 3 = EvalHard
+/// Dispatched with total threads = batch * out_d
+export "gpu" fn gpu_lut_warp_fwd(
+    x: []f32,
+    w: []f32,
+    indices: []i32,
+    noise: []f32,
+    out: &var []f32,
+    z_out: &var []f32,
+    batch: i64,
+    in_d: i64,
+    out_d: i64,
+    n_in: i64,
+    mode: i64,
+    tau: f32,
+    gumbel_scale: f32
+) -> void {
+    let tid = gpu::thread_index();
+    let total = batch * out_d;
+    if tid >= total { return; }
+    let b = tid / out_d;
+    let o = tid - b * out_d;
+    let x_off = b * in_d;
+    let idx_off = o * n_in;
+
+    if n_in == 2 {
+        let w_off = o * 4;
+        var a0 = w[w_off + 0];
+        var a1 = w[w_off + 1];
+        var a2 = w[w_off + 2];
+        var a3 = w[w_off + 3];
+        // Fast Walsh-Hadamard transform (size 4)
+        let u0 = a0 + a1; let u1 = a0 - a1;
+        let u2 = a2 + a3; let u3 = a2 - a3;
+        var z0 = u0 + u2;
+        var z1 = u1 + u3;
+        var z2 = u0 - u2;
+        var z3 = u1 - u3;
+        if mode == 2 {
+            z0 = z0 + gumbel_scale * noise[w_off + 0];
+            z1 = z1 + gumbel_scale * noise[w_off + 1];
+            z2 = z2 + gumbel_scale * noise[w_off + 2];
+            z3 = z3 + gumbel_scale * noise[w_off + 3];
+        }
+        let x0 = x[x_off + cast<i64>(indices[idx_off + 0])];
+        let x1 = x[x_off + cast<i64>(indices[idx_off + 1])];
+        if mode == 3 {
+            let b0 = if x0 >= 0.5 { 1 } else { 0 };
+            let b1 = if x1 >= 0.5 { 1 } else { 0 };
+            let c = b0 + b1 * 2;
+            var zv = z0;
+            if c == 1 { zv = z1; }
+            else if c == 2 { zv = z2; }
+            else if c == 3 { zv = z3; }
+            z_out[tid] = zv;
+            out[tid] = if zv >= 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+            return;
+        }
+        let q0 = cast<f32>(1.0) - x0;
+        let q1 = cast<f32>(1.0) - x1;
+        let z = (q0 * q1) * z0 + (x0 * q1) * z1 + (q0 * x1) * z2 + (x0 * x1) * z3;
+        z_out[tid] = z;
+        if mode == 0 {
+            out[tid] = gpu_sigmoid(z / tau);
+        } else {
+            out[tid] = if z >= 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        }
+        return;
+    }
+
+    // N = 4 (16 entries)
+    let w_off = o * 16;
+    var t = [16]f32{};
+    for 0..16 |k| { t[k] = w[w_off + k]; }
+    // FWHT size 16 (4 stages, scale = 1/sqrt(16) = 0.25)
+    var step: i64 = 1;
+    while step < 16 {
+        var i: i64 = 0;
+        while i < 16 {
+            for 0..step |j| {
+                let u = t[i + j];
+                let v = t[i + j + step];
+                t[i + j] = u + v;
+                t[i + j + step] = u - v;
+            }
+            i = i + step * 2;
+        }
+        step = step * 2;
+    }
+    for 0..16 |k| {
+        var zv = t[k];
+        if mode == 2 {
+            zv = zv + gumbel_scale * noise[w_off + k];
+        }
+        t[k] = zv;
+    }
+
+    let x0 = x[x_off + cast<i64>(indices[idx_off + 0])];
+    let x1 = x[x_off + cast<i64>(indices[idx_off + 1])];
+    let x2 = x[x_off + cast<i64>(indices[idx_off + 2])];
+    let x3 = x[x_off + cast<i64>(indices[idx_off + 3])];
+
+    if mode == 3 {
+        var c: i64 = 0;
+        if x0 >= 0.5 { c = c | 1; }
+        if x1 >= 0.5 { c = c | 2; }
+        if x2 >= 0.5 { c = c | 4; }
+        if x3 >= 0.5 { c = c | 8; }
+        z_out[tid] = t[c];
+        out[tid] = if t[c] >= 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        return;
+    }
+
+    // Butterfly basis (16 terms)
+    var b_arr = [16]f32{};
+    let q0 = cast<f32>(1.0) - x0;
+    let q1 = cast<f32>(1.0) - x1;
+    let q2 = cast<f32>(1.0) - x2;
+    let q3 = cast<f32>(1.0) - x3;
+    let p00 = q0 * q1; let p10 = x0 * q1; let p01 = q0 * x1; let p11 = x0 * x1;
+    let r00 = q2 * q3; let r10 = x2 * q3; let r01 = q2 * x3; let r11 = x2 * x3;
+    b_arr[0] = p00 * r00; b_arr[1] = p10 * r00; b_arr[2] = p01 * r00; b_arr[3] = p11 * r00;
+    b_arr[4] = p00 * r10; b_arr[5] = p10 * r10; b_arr[6] = p01 * r10; b_arr[7] = p11 * r10;
+    b_arr[8] = p00 * r01; b_arr[9] = p10 * r01; b_arr[10] = p01 * r01; b_arr[11] = p11 * r01;
+    b_arr[12] = p00 * r11; b_arr[13] = p10 * r11; b_arr[14] = p01 * r11; b_arr[15] = p11 * r11;
+
+    var z: f32 = 0.0;
+    for 0..16 |k| { z = z + b_arr[k] * t[k]; }
+    z_out[tid] = z;
+    if mode == 0 {
+        out[tid] = gpu_sigmoid(z / tau);
+    } else {
+        out[tid] = if z >= 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+    }
+    return;
+}
+
+/// GPU WARP LUT Backward Step 1: compute d_pin[b, o, p] (for CSR gather)
+/// Dispatched with total threads = batch * out_d
+export "gpu" fn gpu_lut_warp_bwd_dpin(
+    x: []f32,
+    w: []f32,
+    indices: []i32,
+    noise: []f32,
+    z_in: []f32,
+    dout: []f32,
+    dpin: &var []f32,
+    batch: i64,
+    in_d: i64,
+    out_d: i64,
+    n_in: i64,
+    mode: i64,
+    tau: f32,
+    gumbel_scale: f32
+) -> void {
+    let tid = gpu::thread_index();
+    let total = batch * out_d;
+    if tid >= total { return; }
+    let b = tid / out_d;
+    let o = tid - b * out_d;
+    let x_off = b * in_d;
+    let idx_off = o * n_in;
+    let dp_off = tid * n_in;
+
+    let s = gpu_sigmoid(z_in[tid] / tau);
+    let dz = dout[tid] * s * (cast<f32>(1.0) - s) / tau;
+
+    if n_in == 2 {
+        let w_off = o * 4;
+        let a0 = w[w_off + 0]; let a1 = w[w_off + 1]; let a2 = w[w_off + 2]; let a3 = w[w_off + 3];
+        let u0 = a0 + a1; let u1 = a0 - a1; let u2 = a2 + a3; let u3 = a2 - a3;
+        var z0 = u0 + u2;
+        var z1 = u1 + u3;
+        var z2 = u0 - u2;
+        var z3 = u1 - u3;
+        if mode == 2 {
+            z0 = z0 + gumbel_scale * noise[w_off + 0];
+            z1 = z1 + gumbel_scale * noise[w_off + 1];
+            z2 = z2 + gumbel_scale * noise[w_off + 2];
+            z3 = z3 + gumbel_scale * noise[w_off + 3];
+        }
+        let x0 = x[x_off + cast<i64>(indices[idx_off + 0])];
+        let x1 = x[x_off + cast<i64>(indices[idx_off + 1])];
+        let q0 = cast<f32>(1.0) - x0;
+        let q1 = cast<f32>(1.0) - x1;
+        dpin[dp_off + 0] = dz * (q1 * (z1 - z0) + x1 * (z3 - z2));
+        dpin[dp_off + 1] = dz * (q0 * (z2 - z0) + x0 * (z3 - z1));
+        return;
+    }
+
+    // N = 4
+    let w_off = o * 16;
+    var t = [16]f32{};
+    for 0..16 |k| { t[k] = w[w_off + k]; }
+    var step: i64 = 1;
+    while step < 16 {
+        var i: i64 = 0;
+        while i < 16 {
+            for 0..step |j| {
+                let u = t[i + j];
+                let v = t[i + j + step];
+                t[i + j] = u + v;
+                t[i + j + step] = u - v;
+            }
+            i = i + step * 2;
+        }
+        step = step * 2;
+    }
+    for 0..16 |k| {
+        var zv = t[k];
+        if mode == 2 { zv = zv + gumbel_scale * noise[w_off + k]; }
+        t[k] = zv;
+    }
+
+    var xv = [4]f32{};
+    xv[0] = x[x_off + cast<i64>(indices[idx_off + 0])];
+    xv[1] = x[x_off + cast<i64>(indices[idx_off + 1])];
+    xv[2] = x[x_off + cast<i64>(indices[idx_off + 2])];
+    xv[3] = x[x_off + cast<i64>(indices[idx_off + 3])];
+
+    for 0..4 |p| {
+        var acc: f32 = 0.0;
+        let bit_p = 1 << p;
+        for 0..16 |k| {
+            if (k & bit_p) == 0 {
+                var prod: f32 = 1.0;
+                for 0..4 |j| {
+                    if j != p {
+                        let bit_j = (k >> j) & 1;
+                        prod = prod * (if bit_j != 0 { xv[j] } else { cast<f32>(1.0) - xv[j] });
+                    }
+                }
+                acc = acc + prod * (t[k | bit_p] - t[k]);
+            }
+        }
+        dpin[dp_off + p] = dz * acc;
+    }
+    return;
+}
+
+/// GPU WARP LUT Backward Step 2: accumulate dW[o, 0..2^N] across batch (zero atomics!)
+/// Dispatched with total threads = out_d
+export "gpu" fn gpu_lut_warp_bwd_dw(
+    x: []f32,
+    indices: []i32,
+    z_in: []f32,
+    dout: []f32,
+    dw: &var []f32,
+    batch: i64,
+    in_d: i64,
+    out_d: i64,
+    n_in: i64,
+    tau: f32
+) -> void {
+    let o = gpu::thread_index();
+    if o >= out_d { return; }
+    let idx_off = o * n_in;
+
+    if n_in == 2 {
+        let i0 = cast<i64>(indices[idx_off + 0]);
+        let i1 = cast<i64>(indices[idx_off + 1]);
+        var g0: f32 = 0.0; var g1: f32 = 0.0; var g2: f32 = 0.0; var g3: f32 = 0.0;
+        for 0..batch |b| {
+            let tid = b * out_d + o;
+            let s = gpu_sigmoid(z_in[tid] / tau);
+            let dz = dout[tid] * s * (cast<f32>(1.0) - s) / tau;
+            let x0 = x[b * in_d + i0];
+            let x1 = x[b * in_d + i1];
+            let q0 = cast<f32>(1.0) - x0;
+            let q1 = cast<f32>(1.0) - x1;
+            g0 = g0 + dz * (q0 * q1);
+            g1 = g1 + dz * (x0 * q1);
+            g2 = g2 + dz * (q0 * x1);
+            g3 = g3 + dz * (x0 * x1);
+        }
+        // Adjoint of orthogonal FWHT (self-adjoint, scale 0.5)
+        let u0 = g0 + g1; let u1 = g0 - g1;
+        let u2 = g2 + g3; let u3 = g2 - g3;
+        let w_off = o * 4;
+        dw[w_off + 0] = dw[w_off + 0] + (u0 + u2);
+        dw[w_off + 1] = dw[w_off + 1] + (u1 + u3);
+        dw[w_off + 2] = dw[w_off + 2] + (u0 - u2);
+        dw[w_off + 3] = dw[w_off + 3] + (u1 - u3);
+        return;
+    }
+
+    // N = 4
+    let i0 = cast<i64>(indices[idx_off + 0]);
+    let i1 = cast<i64>(indices[idx_off + 1]);
+    let i2 = cast<i64>(indices[idx_off + 2]);
+    let i3 = cast<i64>(indices[idx_off + 3]);
+    var g = [16]f32{};
+    for 0..16 |k| { g[k] = 0.0; }
+    for 0..batch |b| {
+        let tid = b * out_d + o;
+        let s = gpu_sigmoid(z_in[tid] / tau);
+        let dz = dout[tid] * s * (cast<f32>(1.0) - s) / tau;
+        let x_off = b * in_d;
+        let x0 = x[x_off + i0]; let x1 = x[x_off + i1]; let x2 = x[x_off + i2]; let x3 = x[x_off + i3];
+        let q0 = cast<f32>(1.0) - x0; let q1 = cast<f32>(1.0) - x1;
+        let q2 = cast<f32>(1.0) - x2; let q3 = cast<f32>(1.0) - x3;
+        let p00 = q0 * q1; let p10 = x0 * q1; let p01 = q0 * x1; let p11 = x0 * x1;
+        let r00 = q2 * q3; let r10 = x2 * q3; let r01 = q2 * x3; let r11 = x2 * x3;
+        g[0] = g[0] + dz * p00 * r00; g[1] = g[1] + dz * p10 * r00;
+        g[2] = g[2] + dz * p01 * r00; g[3] = g[3] + dz * p11 * r00;
+        g[4] = g[4] + dz * p00 * r10; g[5] = g[5] + dz * p10 * r10;
+        g[6] = g[6] + dz * p01 * r10; g[7] = g[7] + dz * p11 * r10;
+        g[8] = g[8] + dz * p00 * r01; g[9] = g[9] + dz * p10 * r01;
+        g[10] = g[10] + dz * p01 * r01; g[11] = g[11] + dz * p11 * r01;
+        g[12] = g[12] + dz * p00 * r11; g[13] = g[13] + dz * p10 * r11;
+        g[14] = g[14] + dz * p01 * r11; g[15] = g[15] + dz * p11 * r11;
+    }
+    var step: i64 = 1;
+    while step < 16 {
+        var i: i64 = 0;
+        while i < 16 {
+            for 0..step |j| {
+                let u = g[i + j];
+                let v = g[i + j + step];
+                g[i + j] = u + v;
+                g[i + j + step] = u - v;
+            }
+            i = i + step * 2;
+        }
+        step = step * 2;
+    }
+    let w_off = o * 16;
+    for 0..16 |k| {
+        dw[w_off + k] = dw[w_off + k] + g[k];
+    }
+    return;
+}
+
+/// GPU LUT Backward Step 3: zero-atomic CSR gather into dX[b, in_idx]
+/// Dispatched with total threads = batch * in_d
+export "gpu" fn gpu_lut_bwd_dx_csr(
+    dpin: []f32,
+    csr_offsets: []i32,
+    csr_gate: []i32,
+    csr_pin: []i32,
+    dx: &var []f32,
+    batch: i64,
+    in_d: i64,
+    out_d: i64,
+    n_in: i64
+) -> void {
+    let tid = gpu::thread_index();
+    let total = batch * in_d;
+    if tid >= total { return; }
+    let b = tid / in_d;
+    let in_i = tid - b * in_d;
+    let start = cast<i64>(csr_offsets[in_i]);
+    let end = cast<i64>(csr_offsets[in_i + 1]);
+    var acc: f32 = 0.0;
+    let b_off = b * out_d * n_in;
+    for start..end |e| {
+        let g = cast<i64>(csr_gate[e]);
+        let p = cast<i64>(csr_pin[e]);
+        acc = acc + dpin[b_off + g * n_in + p];
+    }
+    dx[tid] = acc;
+    return;
+}

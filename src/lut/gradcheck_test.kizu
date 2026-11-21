@@ -1,0 +1,198 @@
+import griffith::core;
+import std::math;
+import std::mem;
+import std::testing;
+
+fn set_weight(layer: &var LutLayer, idx: i64, value: f32) -> void {
+    let ws = layer.weights.as_mut_slice();
+    ws[idx] = value;
+    return;
+}
+
+fn scalar_loss(out: []f32, coeffs: []f32, count: i64) -> f64 {
+    var acc: f64 = 0.0;
+    for 0..count |i| {
+        acc = acc + cast<f64>(out[i]) * cast<f64>(coeffs[i]);
+    }
+    return acc;
+}
+
+fn check_lut_grad(n_inputs: i64, param_mode: ParamMode, seed: u64) -> mem::Error!void {
+    let allocator = mem::page_allocator();
+    let batch: i64 = 3;
+    let in_dim: i64 = 8;
+    let out_dim: i64 = 6;
+    var rng = core::rng_new(seed);
+    var layer = try lut_layer_new(
+        allocator,
+        in_dim,
+        out_dim,
+        n_inputs,
+        param_mode,
+        SelectMode::Soft,
+        1.0,
+        0.0,
+        batch,
+        &var rng
+    );
+    defer layer.deinit(allocator);
+
+    var x = try core::alloc_f32(allocator, batch * in_dim);
+    defer x.deinit(allocator);
+    var out = try core::alloc_f32(allocator, batch * out_dim);
+    defer out.deinit(allocator);
+    var out_p = try core::alloc_f32(allocator, batch * out_dim);
+    defer out_p.deinit(allocator);
+    var out_m = try core::alloc_f32(allocator, batch * out_dim);
+    defer out_m.deinit(allocator);
+    var coeffs = try core::alloc_f32(allocator, batch * out_dim);
+    defer coeffs.deinit(allocator);
+    var grad_x = try core::alloc_f32(allocator, batch * in_dim);
+    defer grad_x.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    for 0..(batch * in_dim) |i| {
+        xs[i] = 0.1 + 0.8 * rng.next_f32();
+    }
+    let cs = coeffs.as_mut_slice();
+    for 0..(batch * out_dim) |i| {
+        cs[i] = rng.next_normal_f32();
+    }
+    let out_s = out.as_mut_slice();
+    let out_ps = out_p.as_mut_slice();
+    let out_ms = out_m.as_mut_slice();
+    let gx_m = grad_x.as_mut_slice();
+
+    lut_zero_grad(&var layer);
+    lut_forward(&var layer, xs, batch, out_s, true, &var rng);
+    lut_backward(&var layer, cs, gx_m, true);
+
+    let h: f32 = 2e-3;
+    let two_h: f64 = 2.0 * cast<f64>(h);
+
+    // Check grad_x via central finite difference
+    var max_err_x: f64 = 0.0;
+    for 0..(batch * in_dim) |i| {
+        let orig = xs[i];
+        xs[i] = orig + h;
+        lut_forward(&var layer, xs, batch, out_ps, true, &var rng);
+        let lp = scalar_loss(out_ps, cs, batch * out_dim);
+        xs[i] = orig - h;
+        lut_forward(&var layer, xs, batch, out_ms, true, &var rng);
+        let lm = scalar_loss(out_ms, cs, batch * out_dim);
+        xs[i] = orig;
+        let num = (lp - lm) / two_h;
+        let err = math::abs<f64>(num - cast<f64>(gx_m[i]));
+        if err > max_err_x {
+            max_err_x = err;
+        }
+    }
+    testing::expect(max_err_x < 5e-3);
+
+    // Check grad_w via central finite difference (spot-check every entry for N<=4, stride for N=6)
+    let w_total = layer.out_dim * layer.w_cols;
+    var step: i64 = 1;
+    if w_total > 128 {
+        step = 3;
+    }
+    var max_err_w: f64 = 0.0;
+    var wi: i64 = 0;
+    while wi < w_total {
+        let orig = layer.weights.get_or_panic(wi);
+        set_weight(&var layer, wi, orig + h);
+        lut_forward(&var layer, xs, batch, out_ps, true, &var rng);
+        let lp = scalar_loss(out_ps, cs, batch * out_dim);
+        set_weight(&var layer, wi, orig - h);
+        lut_forward(&var layer, xs, batch, out_ms, true, &var rng);
+        let lm = scalar_loss(out_ms, cs, batch * out_dim);
+        set_weight(&var layer, wi, orig);
+        let num = (lp - lm) / two_h;
+        let analytic = cast<f64>(layer.grad_w.get_or_panic(wi));
+        let err = math::abs<f64>(num - analytic);
+        if err > max_err_w {
+            max_err_w = err;
+        }
+        wi = wi + step;
+    }
+    testing::expect(max_err_w < 5e-3);
+
+    // Check hard eval == discretized lookup on binary inputs
+    var disc = try lut_discretize(allocator, &layer);
+    defer disc.deinit(allocator);
+    for 0..(batch * in_dim) |i| {
+        xs[i] = if rng.next_range(2) == 1 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+    }
+    lut_forward(&var layer, xs, batch, out_s, false, &var rng);
+    let d_idx = disc.indices.as_slice();
+    let d_tt = disc.truth_tables.as_slice();
+    for 0..batch |b| {
+        for 0..out_dim |o| {
+            var addr: u64 = 0;
+            for 0..n_inputs |p| {
+                if xs[b * in_dim + cast<i64>(d_idx[o * n_inputs + p])] >= 0.5 {
+                    addr = addr | (cast<u64>(1) << cast<u64>(p));
+                }
+            }
+            let expected = if ((d_tt[o] >> addr) & cast<u64>(1)) != 0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+            testing::expect(math::abs<f64>(cast<f64>(out_s[b * out_dim + o] - expected)) < 1e-6);
+        }
+    }
+    return;
+}
+
+test "finite difference gradcheck all N in {2,4,6} x {Softmax,Warp}" {
+    try check_lut_grad(2, ParamMode::Softmax, 101);
+    try check_lut_grad(4, ParamMode::Softmax, 102);
+    try check_lut_grad(6, ParamMode::Softmax, 103);
+    try check_lut_grad(2, ParamMode::Warp, 201);
+    try check_lut_grad(4, ParamMode::Warp, 202);
+    try check_lut_grad(6, ParamMode::Warp, 203);
+}
+
+test "groupsum and cross entropy gradcheck" {
+    let allocator = mem::page_allocator();
+    let batch: i64 = 2;
+    let in_dim: i64 = 12;
+    let k: i64 = 3;
+    let gs = groupsum_new(in_dim, k, 2.5);
+    var rng = core::rng_new(301);
+    var x = try core::alloc_f32(allocator, batch * in_dim);
+    defer x.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, batch * k);
+    defer logits.deinit(allocator);
+    var grad_logits = try core::alloc_f32(allocator, batch * k);
+    defer grad_logits.deinit(allocator);
+    var grad_x = try core::alloc_f32(allocator, batch * in_dim);
+    defer grad_x.deinit(allocator);
+    var targets = try core::alloc_i32(allocator, batch);
+    defer targets.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    for 0..(batch * in_dim) |i| {
+        xs[i] = rng.next_f32();
+    }
+    let ts = targets.as_mut_slice();
+    ts[0] = 1;
+    ts[1] = 2;
+    let lm_s = logits.as_mut_slice();
+    let gl_s = grad_logits.as_mut_slice();
+    let gx_s = grad_x.as_mut_slice();
+
+    groupsum_forward(&gs, xs, batch, lm_s);
+    let _ = cross_entropy_loss_grad(lm_s, ts, batch, k, gl_s);
+    groupsum_backward(&gs, gl_s, batch, gx_s);
+
+    let h: f32 = 2e-3;
+    for 0..(batch * in_dim) |i| {
+        let orig = xs[i];
+        xs[i] = orig + h;
+        groupsum_forward(&gs, xs, batch, lm_s);
+        let lp = cast<f64>(cross_entropy_loss_grad(lm_s, ts, batch, k, gl_s));
+        xs[i] = orig - h;
+        groupsum_forward(&gs, xs, batch, lm_s);
+        let lm = cast<f64>(cross_entropy_loss_grad(lm_s, ts, batch, k, gl_s));
+        xs[i] = orig;
+        let num = (lp - lm) / (2.0 * cast<f64>(h));
+        testing::expect(math::abs<f64>(num - cast<f64>(gx_s[i])) < 5e-3);
+    }
+}

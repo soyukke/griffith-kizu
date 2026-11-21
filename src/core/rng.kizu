@@ -1,0 +1,161 @@
+import std::array;
+import std::math;
+import std::mem;
+import std::testing;
+
+pub struct Rng {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+}
+
+fn u64_from_halves(hi: u64, lo: u64) -> u64 {
+    return (hi << 32) | lo;
+}
+
+fn splitmix64(state: &var u64) -> u64 {
+    state.* = state.* + u64_from_halves(0x9e3779b9, 0x7f4a7c15);
+    var z = state.*;
+    z = (z ^ (z >> 30)) * u64_from_halves(0xbf58476d, 0x1ce4e5b9);
+    z = (z ^ (z >> 27)) * u64_from_halves(0x94d049bb, 0x133111eb);
+    return z ^ (z >> 31);
+}
+
+pub fn rng_new(seed: u64) -> Rng {
+    var st = seed;
+    let s0 = splitmix64(&var st);
+    let s1 = splitmix64(&var st);
+    let s2 = splitmix64(&var st);
+    let s3 = splitmix64(&var st);
+    return Rng { s0: s0, s1: s1, s2: s2, s3: s3 };
+}
+
+fn rotl64(x: u64, k: u64) -> u64 {
+    return (x << k) | (x >> (cast<u64>(64) - k));
+}
+
+pub fn (self: &var Rng) next_u64() -> u64 {
+    let result = rotl64(self.s1 * cast<u64>(5), 7) * cast<u64>(9);
+    let t = self.s1 << 17;
+    self.s2 = self.s2 ^ self.s0;
+    self.s3 = self.s3 ^ self.s1;
+    self.s1 = self.s1 ^ self.s2;
+    self.s0 = self.s0 ^ self.s3;
+    self.s2 = self.s2 ^ t;
+    self.s3 = rotl64(self.s3, 45);
+    return result;
+}
+
+pub fn (self: &var Rng) next_range(bound: i64) -> i64 {
+    if bound <= 1 {
+        return 0;
+    }
+    return cast<i64>(self.next_u64() % cast<u64>(bound));
+}
+
+pub fn (self: &var Rng) next_f64() -> f64 {
+    let top = self.next_u64() >> 11;
+    return cast<f64>(top) * (1.0 / 9007199254740992.0);
+}
+
+pub fn (self: &var Rng) next_open_f64() -> f64 {
+    var u = self.next_f64();
+    if u < 1e-7 {
+        u = 1e-7;
+    }
+    if u > 1.0 - 1e-7 {
+        u = 1.0 - 1e-7;
+    }
+    return u;
+}
+
+pub fn (self: &var Rng) next_f32() -> f32 {
+    return cast<f32>(self.next_f64());
+}
+
+pub fn (self: &var Rng) next_normal_f32() -> f32 {
+    let u1 = self.next_open_f64();
+    let u2 = self.next_f64();
+    let radius = math::sqrt<f64>(-2.0 * math::log<f64>(u1));
+    let theta = 6.283185307179586 * u2;
+    return cast<f32>(radius * math::cos<f64>(theta));
+}
+
+pub fn (self: &var Rng) next_gumbel_f32() -> f32 {
+    let u = self.next_open_f64();
+    return cast<f32>(-math::log<f64>(-math::log<f64>(u)));
+}
+
+pub fn (self: &var Rng) next_logistic_f32() -> f32 {
+    let u = self.next_open_f64();
+    return cast<f32>(math::log<f64>(u / (1.0 - u)));
+}
+
+pub fn sigmoid_f32(x: f32) -> f32 {
+    if x >= 0.0 {
+        let z = cast<f32>(math::exp<f64>(cast<f64>(-x)));
+        return 1.0 / (1.0 + z);
+    }
+    let z = cast<f32>(math::exp<f64>(cast<f64>(x)));
+    return z / (1.0 + z);
+}
+
+pub fn popcount_u64(value: u64) -> i64 {
+    var x = value;
+    x = x - ((x >> 1) & cast<u64>(0x5555555555555555));
+    x = (x & cast<u64>(0x3333333333333333)) + ((x >> 2) & cast<u64>(0x3333333333333333));
+    x = (x + (x >> 4)) & cast<u64>(0x0f0f0f0f0f0f0f0f);
+    return cast<i64>((x * cast<u64>(0x0101010101010101)) >> 56);
+}
+
+pub fn alloc_f32(allocator: Allocator, count: i64) -> mem::Error!array::Array<f32> {
+    var out = array::new<f32>(allocator);
+    errdefer out.deinit(allocator);
+    try out.reserve(allocator, count);
+    for 0..count |_| {
+        try out.append(allocator, 0.0);
+    }
+    return move out;
+}
+
+pub fn alloc_i32(allocator: Allocator, count: i64) -> mem::Error!array::Array<i32> {
+    var out = array::new<i32>(allocator);
+    errdefer out.deinit(allocator);
+    try out.reserve(allocator, count);
+    for 0..count |_| {
+        try out.append(allocator, 0);
+    }
+    return move out;
+}
+
+pub fn alloc_u64(allocator: Allocator, count: i64) -> mem::Error!array::Array<u64> {
+    var out = array::new<u64>(allocator);
+    errdefer out.deinit(allocator);
+    try out.reserve(allocator, count);
+    for 0..count |_| {
+        try out.append(allocator, 0);
+    }
+    return move out;
+}
+
+pub fn zero_f32(values: &var []f32) -> void {
+    let n = mem::count<f32>(values);
+    for 0..n |i| {
+        values[i] = 0.0;
+    }
+    return;
+}
+
+test "rng deterministic and popcount" {
+    var a = rng_new(42);
+    var b = rng_new(42);
+    for 0..16 |_| {
+        testing::expect_equal<u64>(a.next_u64(), b.next_u64());
+    }
+    testing::expect_equal<i64>(0, popcount_u64(0));
+    testing::expect_equal<i64>(64, popcount_u64(~cast<u64>(0)));
+    testing::expect_equal<i64>(4, popcount_u64(0x10101010));
+    let s0 = sigmoid_f32(0.0);
+    testing::expect(math::abs<f64>(cast<f64>(s0) - 0.5) < 1e-6);
+}

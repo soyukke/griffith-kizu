@@ -1,0 +1,643 @@
+import griffith::core;
+import griffith::lut;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::testing;
+
+pub struct MetalTrainCtx {
+    pub gpu: Gpu,
+    pub library: Library,
+    pub k_lin_fwd: Kernel,
+    pub k_lin_bwd_x: Kernel,
+    pub k_lin_bwd_w: Kernel,
+    pub k_lin_bwd_b: Kernel,
+    pub k_lut_fwd: Kernel,
+    pub k_lut_bwd_dpin: Kernel,
+    pub k_lut_bwd_dw: Kernel,
+    pub k_lut_bwd_dx: Kernel,
+
+    // Preallocated Apple Silicon unified-memory (shared) scratch buffers (zero per-step alloc)
+    pub max_f32: i64,
+    pub max_i32: i64,
+    pub bf0: Buffer,
+    pub bf1: Buffer,
+    pub bf2: Buffer,
+    pub bf3: Buffer,
+    pub bf4: Buffer,
+    pub bf5: Buffer,
+    pub bf6: Buffer,
+    pub bi0: Buffer,
+    pub bi1: Buffer,
+    pub bi2: Buffer,
+    pub status: Buffer,
+}
+
+pub fn (self: MetalTrainCtx) release() -> void {
+    self.status.release();
+    self.bi2.release();
+    self.bi1.release();
+    self.bi0.release();
+    self.bf6.release();
+    self.bf5.release();
+    self.bf4.release();
+    self.bf3.release();
+    self.bf2.release();
+    self.bf1.release();
+    self.bf0.release();
+    self.k_lut_bwd_dx.release();
+    self.k_lut_bwd_dw.release();
+    self.k_lut_bwd_dpin.release();
+    self.k_lut_fwd.release();
+    self.k_lin_bwd_b.release();
+    self.k_lin_bwd_w.release();
+    self.k_lin_bwd_x.release();
+    self.k_lin_fwd.release();
+    self.library.release();
+    self.gpu.release();
+    return;
+}
+
+pub fn metal_train_init(allocator: Allocator, max_f32: i64, max_i32: i64) -> !MetalTrainCtx {
+    let path = "target/kernels.metal";
+    let source = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer source.deinit(allocator);
+    let src_bytes = source.as_bytes();
+
+    let gpu = try open_default_gpu();
+    errdefer gpu.release();
+    let library = try gpu.compile_library(src_bytes);
+    errdefer library.release();
+
+    let k_lin_fwd = try library.kernel(&gpu, c"gpu_linear_fwd");
+    errdefer k_lin_fwd.release();
+    let k_lin_bwd_x = try library.kernel(&gpu, c"gpu_linear_bwd_x");
+    errdefer k_lin_bwd_x.release();
+    let k_lin_bwd_w = try library.kernel(&gpu, c"gpu_linear_bwd_w");
+    errdefer k_lin_bwd_w.release();
+    let k_lin_bwd_b = try library.kernel(&gpu, c"gpu_linear_bwd_b");
+    errdefer k_lin_bwd_b.release();
+    let k_lut_fwd = try library.kernel(&gpu, c"gpu_lut_warp_fwd");
+    errdefer k_lut_fwd.release();
+    let k_lut_bwd_dpin = try library.kernel(&gpu, c"gpu_lut_warp_bwd_dpin");
+    errdefer k_lut_bwd_dpin.release();
+    let k_lut_bwd_dw = try library.kernel(&gpu, c"gpu_lut_warp_bwd_dw");
+    errdefer k_lut_bwd_dw.release();
+    let k_lut_bwd_dx = try library.kernel(&gpu, c"gpu_lut_bwd_dx_csr");
+    errdefer k_lut_bwd_dx.release();
+
+    let fb = cast<u64>(max_f32 * 4);
+    let ib = cast<u64>(max_i32 * 4);
+    let bf0 = try gpu.new_shared_buffer(fb);
+    errdefer bf0.release();
+    let bf1 = try gpu.new_shared_buffer(fb);
+    errdefer bf1.release();
+    let bf2 = try gpu.new_shared_buffer(fb);
+    errdefer bf2.release();
+    let bf3 = try gpu.new_shared_buffer(fb);
+    errdefer bf3.release();
+    let bf4 = try gpu.new_shared_buffer(fb);
+    errdefer bf4.release();
+    let bf5 = try gpu.new_shared_buffer(fb);
+    errdefer bf5.release();
+    let bf6 = try gpu.new_shared_buffer(fb);
+    errdefer bf6.release();
+    let bi0 = try gpu.new_shared_buffer(ib);
+    errdefer bi0.release();
+    let bi1 = try gpu.new_shared_buffer(ib);
+    errdefer bi1.release();
+    let bi2 = try gpu.new_shared_buffer(ib);
+    errdefer bi2.release();
+    let status = try gpu.new_shared_buffer(4);
+    errdefer status.release();
+
+    return MetalTrainCtx {
+        gpu: move gpu,
+        library: move library,
+        k_lin_fwd: move k_lin_fwd,
+        k_lin_bwd_x: move k_lin_bwd_x,
+        k_lin_bwd_w: move k_lin_bwd_w,
+        k_lin_bwd_b: move k_lin_bwd_b,
+        k_lut_fwd: move k_lut_fwd,
+        k_lut_bwd_dpin: move k_lut_bwd_dpin,
+        k_lut_bwd_dw: move k_lut_bwd_dw,
+        k_lut_bwd_dx: move k_lut_bwd_dx,
+        max_f32: max_f32,
+        max_i32: max_i32,
+        bf0: move bf0,
+        bf1: move bf1,
+        bf2: move bf2,
+        bf3: move bf3,
+        bf4: move bf4,
+        bf5: move bf5,
+        bf6: move bf6,
+        bi0: move bi0,
+        bi1: move bi1,
+        bi2: move bi2,
+        status: move status,
+    };
+}
+
+fn copy_to_f32_buf(dst: &Buffer, src: []f32, count: i64) -> void {
+    // SAFETY: dst holds at least count f32 and no GPU work is using it.
+    let out = unsafe mut_view_from_ptr(unsafe cast<ptr<f32>>(dst.contents()), count);
+    for 0..count |i| { out[i] = src[i]; }
+    return;
+}
+
+fn copy_from_f32_buf(src: &Buffer, dst: &var []f32, count: i64) -> void {
+    // SAFETY: src holds at least count f32 and GPU pass has completed.
+    let inp = unsafe view_from_ptr(unsafe cast<ptr<const f32>>(src.contents()), count);
+    for 0..count |i| { dst[i] = inp[i]; }
+    return;
+}
+
+fn copy_to_i32_buf(dst: &Buffer, src: []i32, count: i64) -> void {
+    // SAFETY: dst holds at least count i32 and no GPU work is using it.
+    let out = unsafe mut_view_from_ptr(unsafe cast<ptr<i32>>(dst.contents()), count);
+    for 0..count |i| { out[i] = src[i]; }
+    return;
+}
+
+fn zero_status(buf: &Buffer) -> void {
+    // SAFETY: status buffer holds one u32.
+    let w = unsafe mut_view_from_ptr(unsafe cast<ptr<u32>>(buf.contents()), 1);
+    w[0] = 0;
+    return;
+}
+
+fn read_status(buf: &Buffer) -> u32 {
+    // SAFETY: status buffer holds one u32 and pass completed.
+    let w = unsafe view_from_ptr(unsafe cast<ptr<const u32>>(buf.contents()), 1);
+    return w[0];
+}
+
+fn bind_i64(pass: &ComputePass, idx: u64, v: i64) -> void {
+    let arr = [1]i64{ v };
+    let sl = arr.as_slice();
+    // SAFETY: 8 readable bytes for the duration of bind_bytes.
+    let p = unsafe cast<ptr<const u8>>(ptr_of(sl));
+    // SAFETY: as above.
+    let bs = unsafe view_from_ptr(p, 8);
+    pass.bind_bytes(idx, bs);
+    return;
+}
+
+fn bind_f32(pass: &ComputePass, idx: u64, v: f32) -> void {
+    let arr = [1]f32{ v };
+    let sl = arr.as_slice();
+    // SAFETY: 4 readable bytes for the duration of bind_bytes.
+    let p = unsafe cast<ptr<const u8>>(ptr_of(sl));
+    // SAFETY: as above.
+    let bs = unsafe view_from_ptr(p, 4);
+    pass.bind_bytes(idx, bs);
+    return;
+}
+
+fn bind_i64_slice(pass: &ComputePass, idx: u64, vals: []i64) -> void {
+    let n = mem::count<i64>(vals);
+    // SAFETY: n * 8 readable bytes for the duration of bind_bytes.
+    let p = unsafe cast<ptr<const u8>>(ptr_of(vals));
+    // SAFETY: as above.
+    let bs = unsafe view_from_ptr(p, n * 8);
+    pass.bind_bytes(idx, bs);
+    return;
+}
+
+/// GPU-accelerated Linear Forward: Y = X @ W^T + b
+pub fn metal_linear_fwd(
+    ctx: &MetalTrainCtx,
+    x: []f32,
+    w: []f32,
+    b: []f32,
+    y: &var []f32,
+    m: i64,
+    in_d: i64,
+    out_d: i64
+) -> MetalError!void {
+    let x_n = m * in_d;
+    let w_n = out_d * in_d;
+    let y_n = m * out_d;
+    copy_to_f32_buf(&ctx.bf0, x, x_n);
+    copy_to_f32_buf(&ctx.bf1, w, w_n);
+    copy_to_f32_buf(&ctx.bf2, b, out_d);
+    zero_status(&ctx.status);
+
+    let pass = try ctx.gpu.begin_compute_pass();
+    pass.bind_buffer(0, &ctx.bf0);
+    pass.bind_buffer(1, &ctx.bf1);
+    pass.bind_buffer(2, &ctx.bf2);
+    pass.bind_buffer(3, &ctx.bf3);
+    bind_i64(&pass, 4, m);
+    bind_i64(&pass, 5, in_d);
+    bind_i64(&pass, 6, out_d);
+    let lens = [4]i64{ x_n, w_n, out_d, y_n };
+    let lens_s = lens.as_slice();
+    bind_i64_slice(&pass, 7, lens_s);
+    pass.bind_buffer(8, &ctx.status);
+    pass.dispatch_threads(&ctx.k_lin_fwd, cast<u64>(y_n));
+    try pass.finish();
+
+    if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+    copy_from_f32_buf(&ctx.bf3, y, y_n);
+    return;
+}
+
+/// GPU-accelerated Linear Backward: encodes bwd_x + bwd_w + bwd_b in ONE single Metal pass!
+pub fn metal_linear_bwd(
+    ctx: &MetalTrainCtx,
+    x: []f32,
+    w: []f32,
+    dy: []f32,
+    dx: &var []f32,
+    dw: &var []f32,
+    db: &var []f32,
+    m: i64,
+    in_d: i64,
+    out_d: i64,
+    need_dx: bool
+) -> MetalError!void {
+    let x_n = m * in_d;
+    let w_n = out_d * in_d;
+    let y_n = m * out_d;
+    copy_to_f32_buf(&ctx.bf0, x, x_n);
+    copy_to_f32_buf(&ctx.bf1, w, w_n);
+    copy_to_f32_buf(&ctx.bf2, dy, y_n);
+    copy_to_f32_buf(&ctx.bf4, dw, w_n);
+    copy_to_f32_buf(&ctx.bf5, db, out_d);
+    zero_status(&ctx.status);
+
+    let pass = try ctx.gpu.begin_compute_pass();
+
+    if need_dx {
+        pass.bind_buffer(0, &ctx.bf2); // dy
+        pass.bind_buffer(1, &ctx.bf1); // w
+        pass.bind_buffer(2, &ctx.bf3); // dx
+        bind_i64(&pass, 3, m);
+        bind_i64(&pass, 4, in_d);
+        bind_i64(&pass, 5, out_d);
+        let l_dx = [3]i64{ y_n, w_n, x_n };
+        let l_dx_s = l_dx.as_slice();
+        bind_i64_slice(&pass, 6, l_dx_s);
+        pass.bind_buffer(7, &ctx.status);
+        pass.dispatch_threads(&ctx.k_lin_bwd_x, cast<u64>(x_n));
+    }
+
+    // dW += dY^T @ X
+    pass.bind_buffer(0, &ctx.bf0); // x
+    pass.bind_buffer(1, &ctx.bf2); // dy
+    pass.bind_buffer(2, &ctx.bf4); // dw
+    bind_i64(&pass, 3, m);
+    bind_i64(&pass, 4, in_d);
+    bind_i64(&pass, 5, out_d);
+    let l_dw = [3]i64{ x_n, y_n, w_n };
+    let l_dw_s = l_dw.as_slice();
+    bind_i64_slice(&pass, 6, l_dw_s);
+    pass.bind_buffer(7, &ctx.status);
+    pass.dispatch_threads(&ctx.k_lin_bwd_w, cast<u64>(w_n));
+
+    // db += sum(dY)
+    pass.bind_buffer(0, &ctx.bf2); // dy
+    pass.bind_buffer(1, &ctx.bf5); // db
+    bind_i64(&pass, 2, m);
+    bind_i64(&pass, 3, out_d);
+    let l_db = [2]i64{ y_n, out_d };
+    let l_db_s = l_db.as_slice();
+    bind_i64_slice(&pass, 4, l_db_s);
+    pass.bind_buffer(5, &ctx.status);
+    pass.dispatch_threads(&ctx.k_lin_bwd_b, cast<u64>(out_d));
+
+    try pass.finish();
+    if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+
+    if need_dx { copy_from_f32_buf(&ctx.bf3, dx, x_n); }
+    copy_from_f32_buf(&ctx.bf4, dw, w_n);
+    copy_from_f32_buf(&ctx.bf5, db, out_d);
+    return;
+}
+
+/// GPU-accelerated WARP LUT Forward (N=2 or N=4, Soft/HardSt/GumbelSt/EvalHard).
+/// Saves saved_x, saved_z, saved_noise, saved_batch identically to CPU lut_forward.
+pub fn metal_lut_warp_fwd(
+    ctx: &MetalTrainCtx,
+    layer: &var lut::LutLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32,
+    training: bool,
+    rng: &var core::Rng
+) -> MetalError!void {
+    let in_d = layer.in_dim;
+    let out_d = layer.out_dim;
+    let n_in = layer.n_inputs;
+    let w_n = out_d * layer.w_cols;
+    let x_n = batch * in_d;
+    let y_n = batch * out_d;
+    let idx_n = out_d * n_in;
+
+    var mode: i64 = 3; // EvalHard
+    if training {
+        match layer.select_mode {
+            Soft => { mode = 0; },
+            HardSt => { mode = 1; },
+            GumbelSt => { mode = 2; },
+        }
+    }
+
+    // Save input + sample logistic noise identically to CPU path
+    let sx = layer.saved_x.as_mut_slice();
+    for 0..x_n |i| { sx[i] = x[i]; }
+    layer.saved_batch = batch;
+    let sn = layer.saved_noise.as_mut_slice();
+    if mode == 2 {
+        for 0..w_n |i| { sn[i] = rng.next_logistic_f32(); }
+    } else {
+        for 0..w_n |i| { sn[i] = 0.0; }
+    }
+
+    let lw_s = layer.weights.as_slice();
+    let li_s = layer.conn.indices.as_slice();
+    let ln_s = layer.saved_noise.as_slice();
+    copy_to_f32_buf(&ctx.bf0, x, x_n);
+    copy_to_f32_buf(&ctx.bf1, lw_s, w_n);
+    copy_to_i32_buf(&ctx.bi0, li_s, idx_n);
+    copy_to_f32_buf(&ctx.bf2, ln_s, w_n);
+    zero_status(&ctx.status);
+
+    let pass = try ctx.gpu.begin_compute_pass();
+    pass.bind_buffer(0, &ctx.bf0); // x
+    pass.bind_buffer(1, &ctx.bf1); // w
+    pass.bind_buffer(2, &ctx.bi0); // indices
+    pass.bind_buffer(3, &ctx.bf2); // noise
+    pass.bind_buffer(4, &ctx.bf3); // out
+    pass.bind_buffer(5, &ctx.bf4); // z_out
+    bind_i64(&pass, 6, batch);
+    bind_i64(&pass, 7, in_d);
+    bind_i64(&pass, 8, out_d);
+    bind_i64(&pass, 9, n_in);
+    bind_i64(&pass, 10, mode);
+    bind_f32(&pass, 11, layer.tau);
+    bind_f32(&pass, 12, layer.gumbel_scale);
+    let lens = [6]i64{ x_n, w_n, idx_n, w_n, y_n, y_n };
+    let lens_s = lens.as_slice();
+    bind_i64_slice(&pass, 13, lens_s);
+    pass.bind_buffer(14, &ctx.status);
+    pass.dispatch_threads(&ctx.k_lut_fwd, cast<u64>(y_n));
+    try pass.finish();
+
+    if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+    copy_from_f32_buf(&ctx.bf3, out, y_n);
+    let sz = layer.saved_z.as_mut_slice();
+    copy_from_f32_buf(&ctx.bf4, sz, y_n);
+    return;
+}
+
+/// GPU-accelerated WARP LUT Backward: encodes dpin + dW + CSR gather dX in ONE Metal pass (zero atomics!)
+pub fn metal_lut_warp_bwd(
+    ctx: &MetalTrainCtx,
+    layer: &var lut::LutLayer,
+    dout: []f32,
+    dx: &var []f32,
+    need_dx: bool
+) -> MetalError!void {
+    let batch = layer.saved_batch;
+    let in_d = layer.in_dim;
+    let out_d = layer.out_dim;
+    let n_in = layer.n_inputs;
+    let w_n = out_d * layer.w_cols;
+    let x_n = batch * in_d;
+    let y_n = batch * out_d;
+    let idx_n = out_d * n_in;
+    let dp_n = batch * out_d * n_in;
+
+    var mode: i64 = 0;
+    match layer.select_mode {
+        Soft => { mode = 0; },
+        HardSt => { mode = 1; },
+        GumbelSt => { mode = 2; },
+    }
+
+    let lx_s = layer.saved_x.as_slice();
+    let lw_s = layer.weights.as_slice();
+    let ln_s = layer.saved_noise.as_slice();
+    let lz_s = layer.saved_z.as_slice();
+    let lgw_s = layer.grad_w.as_slice();
+    let li_s = layer.conn.indices.as_slice();
+    copy_to_f32_buf(&ctx.bf0, lx_s, x_n);
+    copy_to_f32_buf(&ctx.bf1, lw_s, w_n);
+    copy_to_f32_buf(&ctx.bf2, ln_s, w_n);
+    copy_to_f32_buf(&ctx.bf3, lz_s, y_n);
+    copy_to_f32_buf(&ctx.bf4, dout, y_n);
+    copy_to_f32_buf(&ctx.bf5, lgw_s, w_n);
+    copy_to_i32_buf(&ctx.bi0, li_s, idx_n);
+    zero_status(&ctx.status);
+
+    let pass = try ctx.gpu.begin_compute_pass();
+
+    // 1. dW (zero atomics, 1 thread per gate)
+    pass.bind_buffer(0, &ctx.bf0); // x
+    pass.bind_buffer(1, &ctx.bi0); // indices
+    pass.bind_buffer(2, &ctx.bf3); // z_in
+    pass.bind_buffer(3, &ctx.bf4); // dout
+    pass.bind_buffer(4, &ctx.bf5); // dw
+    bind_i64(&pass, 5, batch);
+    bind_i64(&pass, 6, in_d);
+    bind_i64(&pass, 7, out_d);
+    bind_i64(&pass, 8, n_in);
+    bind_f32(&pass, 9, layer.tau);
+    let l_dw = [5]i64{ x_n, idx_n, y_n, y_n, w_n };
+    let l_dw_s = l_dw.as_slice();
+    bind_i64_slice(&pass, 10, l_dw_s);
+    pass.bind_buffer(11, &ctx.status);
+    pass.dispatch_threads(&ctx.k_lut_bwd_dw, cast<u64>(out_d));
+
+    if need_dx {
+        // 2. dpin (1 thread per (b, o))
+        pass.bind_buffer(0, &ctx.bf0); // x
+        pass.bind_buffer(1, &ctx.bf1); // w
+        pass.bind_buffer(2, &ctx.bi0); // indices
+        pass.bind_buffer(3, &ctx.bf2); // noise
+        pass.bind_buffer(4, &ctx.bf3); // z_in
+        pass.bind_buffer(5, &ctx.bf4); // dout
+        pass.bind_buffer(6, &ctx.bf6); // dpin
+        bind_i64(&pass, 7, batch);
+        bind_i64(&pass, 8, in_d);
+        bind_i64(&pass, 9, out_d);
+        bind_i64(&pass, 10, n_in);
+        bind_i64(&pass, 11, mode);
+        bind_f32(&pass, 12, layer.tau);
+        bind_f32(&pass, 13, layer.gumbel_scale);
+        let l_dp = [7]i64{ x_n, w_n, idx_n, w_n, y_n, y_n, dp_n };
+        let l_dp_s = l_dp.as_slice();
+        bind_i64_slice(&pass, 14, l_dp_s);
+        pass.bind_buffer(15, &ctx.status);
+        pass.dispatch_threads(&ctx.k_lut_bwd_dpin, cast<u64>(y_n));
+
+        let off_n = in_d + 1;
+        let edge_n = layer.conn.rev_gates.len();
+        try pass.finish();
+        if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+
+        let co_s = layer.conn.rev_offsets.as_slice();
+        let cg_s = layer.conn.rev_gates.as_slice();
+        let cp_s = layer.conn.rev_pins.as_slice();
+        copy_to_i32_buf(&ctx.bi0, co_s, off_n);
+        copy_to_i32_buf(&ctx.bi1, cg_s, edge_n);
+        copy_to_i32_buf(&ctx.bi2, cp_s, edge_n);
+        let pass2 = try ctx.gpu.begin_compute_pass();
+        pass2.bind_buffer(0, &ctx.bf6); // dpin
+        pass2.bind_buffer(1, &ctx.bi0); // csr_offsets
+        pass2.bind_buffer(2, &ctx.bi1); // csr_gate
+        pass2.bind_buffer(3, &ctx.bi2); // csr_pin
+        pass2.bind_buffer(4, &ctx.bf0); // dx output
+        bind_i64(&pass2, 5, batch);
+        bind_i64(&pass2, 6, in_d);
+        bind_i64(&pass2, 7, out_d);
+        bind_i64(&pass2, 8, n_in);
+        let l_dx = [5]i64{ dp_n, off_n, edge_n, edge_n, x_n };
+        let l_dx_s = l_dx.as_slice();
+        bind_i64_slice(&pass2, 9, l_dx_s);
+        pass2.bind_buffer(10, &ctx.status);
+        pass2.dispatch_threads(&ctx.k_lut_bwd_dx, cast<u64>(x_n));
+        try pass2.finish();
+        if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+        copy_from_f32_buf(&ctx.bf0, dx, x_n);
+    } else {
+        try pass.finish();
+        if read_status(&ctx.status) != 0 { return MetalError::KernelFailed; }
+    }
+
+    let gw = layer.grad_w.as_mut_slice();
+    copy_from_f32_buf(&ctx.bf5, gw, w_n);
+    return;
+}
+
+test "Metal GPU linear + WARP LUT (N=2, N=4) forward/backward match CPU within 1e-4" {
+    let allocator = mem::page_allocator();
+    let ctx = try metal_train_init(allocator, 65536, 16384);
+    defer ctx.release();
+
+    // 1. Test Linear fwd + bwd
+    let m: i64 = 32;
+    let in_d: i64 = 64;
+    let out_d: i64 = 48;
+    var rng = core::rng_new(123);
+    var x = try core::alloc_f32(allocator, m * in_d);
+    defer x.deinit(allocator);
+    var w = try core::alloc_f32(allocator, out_d * in_d);
+    defer w.deinit(allocator);
+    var b = try core::alloc_f32(allocator, out_d);
+    defer b.deinit(allocator);
+    var dy = try core::alloc_f32(allocator, m * out_d);
+    defer dy.deinit(allocator);
+    var y_gpu = try core::alloc_f32(allocator, m * out_d);
+    defer y_gpu.deinit(allocator);
+    var dx_gpu = try core::alloc_f32(allocator, m * in_d);
+    defer dx_gpu.deinit(allocator);
+    var dw_gpu = try core::alloc_f32(allocator, out_d * in_d);
+    defer dw_gpu.deinit(allocator);
+    var db_gpu = try core::alloc_f32(allocator, out_d);
+    defer db_gpu.deinit(allocator);
+
+    let xm = x.as_mut_slice();
+    let wm = w.as_mut_slice();
+    let bm = b.as_mut_slice();
+    let dym = dy.as_mut_slice();
+    for 0..(m * in_d) |i| { xm[i] = cast<f32>(rng.next_f64() - 0.5); }
+    for 0..(out_d * in_d) |i| { wm[i] = cast<f32>(rng.next_f64() - 0.5); }
+    for 0..out_d |i| { bm[i] = cast<f32>(rng.next_f64() - 0.5); }
+    for 0..(m * out_d) |i| { dym[i] = cast<f32>(rng.next_f64() - 0.5); }
+
+    let xs = x.as_slice();
+    let ws = w.as_slice();
+    let bs = b.as_slice();
+    let yg_m = y_gpu.as_mut_slice();
+    try metal_linear_fwd(&ctx, xs, ws, bs, yg_m, m, in_d, out_d);
+    let ygs = y_gpu.as_slice();
+    for 0..m |row| {
+        for 0..out_d |o| {
+            var acc = bs[o];
+            for 0..in_d |k| { acc = acc + xs[row * in_d + k] * ws[o * in_d + k]; }
+            testing::expect(math::abs<f64>(cast<f64>(acc) - cast<f64>(ygs[row * out_d + o])) < 1e-4);
+        }
+    }
+
+    let dys = dy.as_slice();
+    let dxg_m = dx_gpu.as_mut_slice();
+    let dwg_m = dw_gpu.as_mut_slice();
+    let dbg_m = db_gpu.as_mut_slice();
+    try metal_linear_bwd(&ctx, xs, ws, dys, dxg_m, dwg_m, dbg_m, m, in_d, out_d, true);
+    let dxgs = dx_gpu.as_slice();
+    let dwgs = dw_gpu.as_slice();
+    let dbgs = db_gpu.as_slice();
+    for 0..m |row| {
+        for 0..in_d |k| {
+            var acc: f32 = 0.0;
+            for 0..out_d |o| { acc = acc + dys[row * out_d + o] * ws[o * in_d + k]; }
+            testing::expect(math::abs<f64>(cast<f64>(acc) - cast<f64>(dxgs[row * in_d + k])) < 1e-4);
+        }
+    }
+    for 0..out_d |o| {
+        var bacc: f32 = 0.0;
+        for 0..m |row| { bacc = bacc + dys[row * out_d + o]; }
+        testing::expect(math::abs<f64>(cast<f64>(bacc) - cast<f64>(dbgs[o])) < 1e-4);
+        for 0..in_d |k| {
+            var wacc: f32 = 0.0;
+            for 0..m |row| { wacc = wacc + dys[row * out_d + o] * xs[row * in_d + k]; }
+            testing::expect(math::abs<f64>(cast<f64>(wacc) - cast<f64>(dwgs[o * in_d + k])) < 1e-4);
+        }
+    }
+
+    // 2. Test WARP LUT N=4 Soft forward + backward vs CPU
+    var r_cpu = core::rng_new(55);
+    var r_gpu = core::rng_new(55);
+    var l_cpu = try lut::lut_layer_new(allocator, 32, 24, 4, lut::ParamMode::Warp, lut::SelectMode::Soft, 0.8, 0.2, 16, &var r_cpu);
+    defer l_cpu.deinit(allocator);
+    var l_gpu = try lut::lut_layer_new(allocator, 32, 24, 4, lut::ParamMode::Warp, lut::SelectMode::Soft, 0.8, 0.2, 16, &var r_gpu);
+    defer l_gpu.deinit(allocator);
+
+    var lx = try core::alloc_f32(allocator, 16 * 32);
+    defer lx.deinit(allocator);
+    var ldy = try core::alloc_f32(allocator, 16 * 24);
+    defer ldy.deinit(allocator);
+    var lo_cpu = try core::alloc_f32(allocator, 16 * 24);
+    defer lo_cpu.deinit(allocator);
+    var lo_gpu = try core::alloc_f32(allocator, 16 * 24);
+    defer lo_gpu.deinit(allocator);
+    var ldx_cpu = try core::alloc_f32(allocator, 16 * 32);
+    defer ldx_cpu.deinit(allocator);
+    var ldx_gpu = try core::alloc_f32(allocator, 16 * 32);
+    defer ldx_gpu.deinit(allocator);
+    let lxm = lx.as_mut_slice();
+    let ldym = ldy.as_mut_slice();
+    for 0..(16 * 32) |i| { lxm[i] = cast<f32>(rng.next_f64()); }
+    for 0..(16 * 24) |i| { ldym[i] = cast<f32>(rng.next_f64() - 0.5); }
+
+    let lxs = lx.as_slice();
+    let loc_m = lo_cpu.as_mut_slice();
+    let log_m = lo_gpu.as_mut_slice();
+    lut::lut_forward(&var l_cpu, lxs, 16, loc_m, true, &var r_cpu);
+    try metal_lut_warp_fwd(&ctx, &var l_gpu, lxs, 16, log_m, true, &var r_gpu);
+    let ocs = lo_cpu.as_slice();
+    let ogs = lo_gpu.as_slice();
+    for 0..(16 * 24) |i| {
+        testing::expect(math::abs<f64>(cast<f64>(ocs[i]) - cast<f64>(ogs[i])) < 1e-4);
+    }
+
+    let ldys = ldy.as_slice();
+    let ldxc_m = ldx_cpu.as_mut_slice();
+    let ldxg_m = ldx_gpu.as_mut_slice();
+    lut::lut_backward(&var l_cpu, ldys, ldxc_m, true);
+    try metal_lut_warp_bwd(&ctx, &var l_gpu, ldys, ldxg_m, true);
+    let dxcs = ldx_cpu.as_slice();
+    let dxgs2 = ldx_gpu.as_slice();
+    for 0..(16 * 32) |i| {
+        testing::expect(math::abs<f64>(cast<f64>(dxcs[i]) - cast<f64>(dxgs2[i])) < 1e-4);
+    }
+    let gwcs = l_cpu.grad_w.as_slice();
+    let gwgs = l_gpu.grad_w.as_slice();
+    for 0..(24 * 16) |i| {
+        testing::expect(math::abs<f64>(cast<f64>(gwcs[i]) - cast<f64>(gwgs[i])) < 1e-4);
+    }
+}

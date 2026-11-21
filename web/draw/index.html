@@ -1,0 +1,2102 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>draw/ — 描いて学習する論理ゲート回路 | griffith/</title>
+  <meta name="description" content="5×5 の手描きドット絵から、ブラウザ上の純 Kizu WASM が逆伝播学習し、論理合成を経て重みゼロ・乗算ゼロのビット演算回路へ結晶化するライブ実験室。">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="../fonts/martian-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    /* soyukke.com / tools.soyukke.com 準拠（紙・墨・橙、Martian Mono）。ライトモード固定・1画面完結（スクロール禁止）。 */
+    @font-face {
+      font-family: 'Martian Mono';
+      font-style: normal;
+      font-display: swap;
+      font-weight: 100 800;
+      src: url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations'),
+           url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2');
+    }
+
+    :root {
+      color-scheme: light;
+      --paper: #f2f0e9;
+      --sheet: #faf9f3;
+      --ink: #141412;
+      --muted: #68665e;
+      --rule: #cfccc0;
+      --grid: #e3e0d6;
+      --tri: #e8e5db;
+      --accent: #ff4d00;
+      --accent-tint: #fff0e8;
+      --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --jp: 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--jp);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .app {
+      height: 100dvh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow: hidden;
+    }
+
+    /* 上の帯 */
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--ink);
+      background: var(--paper);
+      min-height: 48px;
+    }
+    .identity {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      min-width: 0;
+    }
+    .mark {
+      font-family: var(--mono);
+      font-weight: 800;
+      font-stretch: 75%;
+      font-size: clamp(20px, 2vw, 25px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      white-space: nowrap;
+    }
+    .mark .slash { color: var(--accent); }
+    .mark:hover { color: var(--accent); }
+    h1 {
+      margin: 0;
+      font-size: clamp(13px, 1.2vw, 15px);
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tagline {
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .bar__right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .pill-group {
+      display: inline-flex;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      padding: 2px;
+      background: var(--sheet);
+    }
+    .pill-group button {
+      min-height: 26px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-family: var(--mono), var(--jp);
+      font-size: 10.5px;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .pill-group button[aria-pressed="true"] {
+      background: var(--ink);
+      color: var(--paper);
+    }
+
+    .btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+      transition: border-color 100ms, background 100ms, color 100ms;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn--go {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      min-width: 88px;
+    }
+    .btn--go:hover:not(:disabled) {
+      background: #e54400;
+      border-color: #e54400;
+      color: #fff;
+    }
+
+    /* 中央 3 カラム・ワークベンチ（スクロール禁止） */
+    .desk {
+      display: grid;
+      grid-template-columns: clamp(226px, 20.5vw, 256px) minmax(0, 1fr) clamp(266px, 24vw, 316px);
+      gap: 14px;
+      padding: 11px 16px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .kicker {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .kicker-mono {
+      font-family: var(--mono), var(--jp);
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .kicker-mono b { color: var(--accent); }
+
+    /* 左カラム：5x5 手描きキャンバス＆学習データ */
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .mode-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .mode-tabs button {
+      padding: 6px 4px;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--muted);
+      border-right: 1px solid var(--rule);
+    }
+    .mode-tabs button:last-child { border-right: 0; }
+    .mode-tabs button[aria-pressed="true"] {
+      background: var(--ink);
+      color: var(--paper);
+      box-shadow: inset 0 -2.5px 0 var(--accent);
+    }
+
+    .pad-box {
+      display: grid;
+      gap: 7px;
+      justify-items: center;
+    }
+    .grid5 {
+      width: min(100%, 192px);
+      aspect-ratio: 1;
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      grid-template-rows: repeat(5, 1fr);
+      gap: 2px;
+      padding: 5px;
+      background: var(--sheet);
+      border: 1px solid var(--ink);
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .cell {
+      border: 1px solid var(--grid);
+      background: var(--paper);
+      cursor: crosshair;
+      position: relative;
+      transition: background 60ms, border-color 60ms;
+    }
+    .cell:hover { border-color: var(--ink); }
+    .cell.on { background: var(--ink); border-color: var(--ink); }
+    .cell.pin-hi { outline: 2.5px solid var(--accent); outline-offset: -2.5px; z-index: 2; }
+    .cell.on.pin-hi { background: var(--accent); border-color: var(--accent); }
+
+    .pad-actions {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 5px;
+    }
+    .mini-btn {
+      min-height: 26px;
+      padding: 0 8px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .mini-btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .mini-btn--accent {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .mini-btn--accent:hover:not(:disabled) { background: #e54400; border-color: #e54400; color: #fff; }
+
+    .verdict-card {
+      width: 100%;
+      padding: 7px 10px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .verdict-main {
+      display: flex;
+      align-items: baseline;
+      gap: 7px;
+      min-width: 0;
+    }
+    .verdict-lbl { font-size: 10.5px; color: var(--muted); }
+    .verdict-sym {
+      font-family: var(--mono), var(--jp);
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--accent);
+      line-height: 1;
+    }
+    .verdict-tag {
+      font-family: var(--mono);
+      font-size: 9.5px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: var(--ink);
+      color: var(--paper);
+      white-space: nowrap;
+    }
+
+    .edit-controls { width: 100%; display: grid; gap: 6px; }
+    .cls-pick {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .cls-pick button {
+      padding: 4px 2px;
+      font-size: 11px;
+      font-weight: 700;
+      border-right: 1px solid var(--rule);
+      color: var(--muted);
+    }
+    .cls-pick button:last-child { border-right: 0; }
+    .cls-pick button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+
+    /* 学習サンプル一覧（3行コンパクト） */
+    .samples-wrap {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 5px;
+      min-height: 0;
+      flex: 1;
+      align-content: start;
+      overflow: hidden;
+    }
+    .preset-row { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
+    .preset-btns { display: flex; gap: 4px; }
+    .preset-btn {
+      font-size: 10px;
+      padding: 1px 6px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      color: var(--muted);
+    }
+    .preset-btn:hover { border-color: var(--ink); color: var(--ink); }
+    .preset-btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
+    .cls-row {
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr);
+      align-items: center;
+      gap: 6px;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--grid);
+    }
+    .cls-row:last-child { border-bottom: 0; }
+    .cls-badge {
+      width: 24px;
+      height: 24px;
+      display: grid;
+      place-items: center;
+      font-size: 13px;
+      font-weight: 800;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .cls-badge.win { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .thumbs { display: flex; align-items: center; gap: 4px; overflow: hidden; flex-wrap: nowrap; }
+    .thumb {
+      position: relative;
+      width: 26px;
+      height: 26px;
+      padding: 2px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 0.5px;
+      flex-shrink: 0;
+    }
+    .thumb:hover { border-color: var(--accent); }
+    .thumb i { display: block; background: transparent; }
+    .thumb i.on { background: var(--ink); }
+    .thumb-del {
+      position: absolute;
+      top: -5px;
+      right: -5px;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 9px;
+      line-height: 13px;
+      text-align: center;
+    }
+    .thumb-more { font-family: var(--mono); font-size: 9.5px; color: var(--muted); }
+
+    /* 中央カラム：製図ステージ */
+    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--rule);
+      background-color: var(--sheet);
+      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
+      background-size: 20px 20px;
+      background-position: 9px 9px;
+    }
+    .stage::before,
+    .stage::after {
+      content: '';
+      pointer-events: none;
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: solid var(--muted);
+      opacity: 0.45;
+      z-index: 2;
+    }
+    .stage::before { top: 8px; left: 8px; border-width: 1px 0 0 1px; }
+    .stage::after { right: 8px; bottom: 8px; border-width: 0 1px 1px 0; }
+
+    .stage-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 16px 4px;
+      z-index: 1;
+    }
+    .steps-bar {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--mono), var(--jp);
+      font-size: 10.5px;
+      color: var(--muted);
+      min-width: 0;
+      overflow: hidden;
+    }
+    .st-pill {
+      padding: 2px 7px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--paper);
+      white-space: nowrap;
+    }
+    .st-pill.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 700;
+    }
+    .st-pill.done {
+      background: var(--ink);
+      border-color: var(--ink);
+      color: var(--paper);
+    }
+    .st-arr { color: var(--rule); }
+
+    .canvas-wrap {
+      position: relative;
+      min-height: 0;
+      min-width: 0;
+      padding: 2px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #circuit {
+      width: 100%;
+      height: 100%;
+      display: block;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .svg-gate { cursor: pointer; }
+    .svg-gate:hover .g-box { stroke: var(--accent) !important; stroke-width: 1.9 !important; }
+
+    /* 学習中・合成移行時の控えめなステータス帯 */
+    .stage-banner {
+      position: absolute;
+      left: 50%;
+      bottom: 8px;
+      transform: translateX(-50%);
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: var(--ink);
+      color: var(--paper);
+      font-family: var(--mono), var(--jp);
+      font-size: 11px;
+      font-weight: 700;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 3;
+      box-shadow: 0 4px 14px rgba(20, 20, 18, 0.16);
+    }
+    .stage-banner b { color: var(--accent); }
+
+    .stage-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 4px 16px 9px;
+      font-size: 11px;
+      color: var(--muted);
+      z-index: 1;
+    }
+    #inspector {
+      font-family: var(--mono), var(--jp);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #inspector b { color: var(--ink); }
+    #inspector .hi { color: var(--accent); font-weight: 700; }
+
+    /* 右カラム：ロスカーブ & 論理合成テレメトリ */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .rblock {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .rblock:first-child { border-top: 0; padding-top: 0; }
+
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 4px;
+    }
+    .stat-mini {
+      padding: 4px 5px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      display: grid;
+      gap: 1px;
+    }
+    .stat-mini span { font-size: 9.5px; color: var(--muted); white-space: nowrap; }
+    .stat-mini strong {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      font-weight: 800;
+      line-height: 1.15;
+    }
+    .stat-mini strong.accent { color: var(--accent); }
+
+    .chart-box {
+      position: relative;
+      height: 118px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      padding: 4px 6px 2px;
+    }
+    #loss-chart { width: 100%; height: 100%; display: block; }
+    .chart-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .chart-legend {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono), var(--jp);
+      font-size: 9.5px;
+      color: var(--muted);
+    }
+    .cl-item { display: inline-flex; align-items: center; gap: 3px; }
+    .cl-line { width: 10px; height: 2px; display: inline-block; }
+    .cl-line--ink { background: var(--ink); }
+    .cl-line--acc { background: var(--accent); }
+    .cl-line--dash { border-top: 1.5px dashed #8b887d; height: 0; }
+
+    .pace-toggle {
+      display: inline-flex;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      padding: 1px;
+      background: var(--sheet);
+    }
+    .pace-toggle button {
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 9.5px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .pace-toggle button[aria-pressed="true"] {
+      background: var(--ink);
+      color: var(--paper);
+    }
+
+    /* GroupSum 投票バー */
+    .vote-stack { display: grid; gap: 5px; }
+    .vote-row {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr) 54px;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--mono), var(--jp);
+      font-size: 11px;
+    }
+    .vote-sym { font-weight: 800; text-align: center; }
+    .vote-val { text-align: right; font-family: var(--mono); font-size: 10.5px; font-weight: 700; }
+    .track { height: 8px; background: var(--tri); border-radius: 2px; overflow: hidden; }
+    .fill { height: 100%; background: var(--ink); transition: width 140ms ease; }
+    .fill--win { background: var(--accent); }
+
+    /* 論理合成サマリ */
+    .synth-top { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+    .big-num {
+      font-family: var(--mono);
+      font-size: 19px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1.1;
+    }
+    .big-num .arr { color: var(--muted); font-weight: 400; margin: 0 3px; }
+    .big-num .opt { color: var(--accent); }
+    .pct-tag { font-family: var(--mono); font-size: 11.5px; font-weight: 800; color: var(--accent); }
+    .pass-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      color: var(--muted);
+    }
+    .pass-chips span { padding: 1px 5px; background: var(--sheet); border: 1px solid var(--grid); }
+
+    .meta-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .meta-cell {
+      padding: 5px 7px;
+      border-right: 1px solid var(--rule);
+      display: grid;
+      gap: 1px;
+    }
+    .meta-cell:last-child { border-right: 0; }
+    .meta-cell span { font-size: 9.5px; color: var(--muted); white-space: nowrap; }
+    .meta-cell strong { font-family: var(--mono); font-size: 11.5px; font-weight: 800; }
+    .meta-cell strong.accent { color: var(--accent); }
+
+    .cta-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .action-tile {
+      min-height: 30px;
+      padding: 0 9px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--sheet);
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .action-tile:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .action-tile span { font-family: var(--mono); color: var(--accent); }
+
+    /* 下の帯 */
+    .foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 5px 16px;
+      border-top: 1px solid var(--rule);
+      font-size: 10.5px;
+      color: var(--muted);
+      background: var(--paper);
+      min-height: 28px;
+    }
+    .foot-mono { font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+    .foot-mono a:hover { color: var(--accent); }
+    .foot-mid { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* オーバーレイシート（split-post 準拠） */
+    .sheet { position: fixed; inset: 0; background: rgba(20, 20, 18, 0.28); z-index: 30; }
+    .sheet__body {
+      position: absolute;
+      top: 56px;
+      right: 16px;
+      width: min(560px, calc(100vw - 24px));
+      max-height: calc(100dvh - 76px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: 12px;
+      box-shadow: 0 18px 46px rgba(20, 20, 18, 0.18);
+      overflow: hidden;
+    }
+    .sheet__head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .sheet__tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+    .sheet__tabs button {
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+    .sheet__close {
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      border: 1px solid var(--rule);
+      font-family: var(--mono);
+      font-size: 14px;
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+    }
+    .sheet__close:hover { border-color: var(--ink); background: var(--tri); }
+    .sheet__content { padding: 14px 16px; overflow-y: auto; min-height: 0; }
+    .code-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .code-note { margin: 0; font-size: 11.5px; color: var(--muted); }
+    pre.code {
+      margin: 0;
+      padding: 12px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      line-height: 1.5;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .about-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+    .about-list li { padding: 10px 12px; background: var(--sheet); border: 1px solid var(--rule); }
+    .about-list strong { display: block; margin-bottom: 3px; font-size: 12px; }
+    .about-list p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+    .about-step { font-family: var(--mono); color: var(--accent); margin-right: 6px; }
+
+    /* 中幅・モバイルでも完全 1 画面（ページスクロール禁止） */
+    @media (max-width: 1020px) {
+      .tagline, .foot-mid { display: none; }
+      .desk {
+        grid-template-columns: 210px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr) auto;
+        gap: 10px;
+        padding: 8px 12px;
+      }
+      .left-col { grid-row: 1 / 3; }
+      .stage-col { grid-column: 2; grid-row: 1; }
+      .right-col {
+        grid-column: 2;
+        grid-row: 2;
+        flex-direction: row;
+        gap: 10px;
+        align-items: stretch;
+      }
+      .rblock { border-top: 0; border-left: 1px solid var(--rule); padding-top: 0; padding-left: 10px; flex: 1; }
+      .rblock:first-child { border-left: 0; padding-left: 0; }
+      .rblock--hide-md { display: none; }
+      .chart-box { height: 84px; }
+    }
+
+    @media (max-width: 700px) {
+      .bar { padding: 6px 10px; min-height: 44px; }
+      h1, .pill-group { display: none; }
+      .btn { min-height: 28px; padding: 0 9px; font-size: 11px; }
+      .desk {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        gap: 8px;
+        padding: 8px 10px;
+      }
+      .left-col { grid-row: 1; flex-direction: row; align-items: center; gap: 10px; }
+      .grid5 { width: 126px; }
+      .samples-wrap, .mode-tabs { display: none; }
+      .stage-col { grid-column: 1; grid-row: 2; }
+      .right-col { grid-column: 1; grid-row: 3; }
+      .rblock--hide-sm { display: none; }
+      .sheet__body {
+        top: auto; left: 0; right: 0; bottom: 0; width: auto;
+        max-height: 76dvh; border-radius: 14px 14px 0 0; border-bottom: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="identity">
+        <a class="mark" href="../" aria-label="griffith/ デモ一覧へ戻る">griffith<span class="slash">/</span></a>
+        <h1>描いて学習する論理ゲート回路</h1>
+        <span class="tagline">draw/ · 5×5 → 120 LUT → 論理合成</span>
+      </div>
+      <div class="bar__right">
+        <div class="pill-group" role="group" aria-label="パラメータ化方式">
+          <button type="button" id="pm-warp" aria-pressed="true" title="Walsh-Hadamard 基底 + Gumbel-ST（Griffith 方式）">WARP</button>
+          <button type="button" id="pm-soft" aria-pressed="false" title="16 ゲート Softmax 連続緩和">Softmax</button>
+        </div>
+        <button type="button" class="btn" id="btn-reset">初期化</button>
+        <button type="button" class="btn" id="btn-code" aria-expanded="false">生成コード</button>
+        <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
+        <button type="button" class="btn btn--go" id="btn-train">学習する</button>
+      </div>
+    </header>
+
+    <main class="desk">
+      <!-- 左：5×5 ドット絵キャンバス＆学習データ -->
+      <section class="left-col" aria-label="5×5 入力と学習データ">
+        <div class="mode-tabs" role="group" aria-label="操作モード">
+          <button type="button" id="mode-test" aria-pressed="true">テスト描画</button>
+          <button type="button" id="mode-edit" aria-pressed="false">データ編集</button>
+        </div>
+
+        <div class="pad-box">
+          <div class="grid5" id="grid5" role="application" aria-label="5×5 ドット絵キャンバス（ドラッグで描画）"></div>
+
+          <div class="pad-actions" id="test-actions">
+            <button type="button" class="mini-btn" id="btn-clear">消す</button>
+            <button type="button" class="mini-btn" id="btn-shift" title="1マス横にずらして汎化を試す">1マスずらす</button>
+            <button type="button" class="mini-btn" id="btn-noise" title="ランダムに1bit反転して頑健性を試す">1bitノイズ</button>
+          </div>
+
+          <div class="verdict-card" id="verdict-card">
+            <div class="verdict-main">
+              <span class="verdict-lbl">判定</span>
+              <span class="verdict-sym" id="verdict-sym">-</span>
+            </div>
+            <span class="verdict-tag" id="verdict-tag">学習待機</span>
+          </div>
+
+          <div class="edit-controls" id="edit-controls" hidden>
+            <div class="cls-pick" id="cls-pick" role="group" aria-label="登録先クラス">
+              <button type="button" data-c="0" aria-pressed="true">○</button>
+              <button type="button" data-c="1" aria-pressed="false">×</button>
+              <button type="button" data-c="2" aria-pressed="false">△</button>
+            </div>
+            <div class="pad-actions">
+              <button type="button" class="mini-btn" id="btn-clear-edit">消す</button>
+              <button type="button" class="mini-btn mini-btn--accent" id="btn-add-sample">この絵を学習データに追加</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="samples-wrap">
+          <div class="preset-row">
+            <span class="kicker">学習データ <span class="kicker-mono" id="sample-count">(12)</span></span>
+            <div class="preset-btns">
+              <button type="button" class="preset-btn" data-preset="shapes" aria-pressed="true">○×△</button>
+              <button type="button" class="preset-btn" data-preset="lines" aria-pressed="false">−│／</button>
+              <button type="button" class="preset-btn" data-preset="digits" aria-pressed="false">0 1 7</button>
+            </div>
+          </div>
+          <div id="samples-list"></div>
+        </div>
+      </section>
+
+      <!-- 中央：製図ステージ（ライブ結晶化 ↔ 論理合成後回路） -->
+      <section class="stage-col" aria-label="ニューラル LUT 結晶化と論理合成回路">
+        <div class="stage">
+          <div class="stage-head">
+            <div class="steps-bar" aria-label="変換ステップ">
+              <span class="st-pill" id="st-1">1 確率ネット</span>
+              <span class="st-arr">→</span>
+              <span class="st-pill" id="st-2">2 逆伝播・結晶化</span>
+              <span class="st-arr">→</span>
+              <span class="st-pill" id="st-3">3 論理合成</span>
+            </div>
+            <div class="pill-group" role="group" aria-label="表示ステージ">
+              <button type="button" id="view-net" aria-pressed="true">学習ネット (120)</button>
+              <button type="button" id="view-synth" aria-pressed="false" disabled>合成回路</button>
+            </div>
+          </div>
+
+          <div class="canvas-wrap">
+            <svg id="circuit" viewBox="0 0 780 460" preserveAspectRatio="xMidYMid meet" role="img" aria-label="論理ゲートネットワークと合成済み回路"></svg>
+            <div class="stage-banner" id="stage-banner" hidden></div>
+          </div>
+
+          <div class="stage-foot">
+            <span id="inspector">左の 5×5 に描くとリアルタイムで発火します（ゲートにカーソルで参照ピクセルを表示）</span>
+            <div class="pill-group" role="group" aria-label="推論モード">
+              <button type="button" id="inf-soft" aria-pressed="false" title="連続確率のニューラルネット推論">Soft</button>
+              <button type="button" id="inf-hard" aria-pressed="true" title="離散化・乗算 0 回の純ビット演算推論">Hard (乗算0)</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右：ライブ Loss カーブ & 論理合成テレメトリ -->
+      <aside class="right-col" aria-label="学習カーブと論理合成メトリクス">
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">学習カーブ（ブラウザ WASM）</span>
+            <span class="kicker-mono" id="train-speed">実計算 -</span>
+          </div>
+          <div class="stat-row">
+            <div class="stat-mini"><span>Step</span><strong id="m-step">0</strong></div>
+            <div class="stat-mini"><span>Loss</span><strong id="m-loss">-</strong></div>
+            <div class="stat-mini"><span>Hard精度</span><strong class="accent" id="m-hacc">-</strong></div>
+            <div class="stat-mini"><span>結晶度</span><strong id="m-sharp">-</strong></div>
+          </div>
+          <div class="chart-box">
+            <svg id="loss-chart" aria-label="Loss と Hard 精度の推移グラフ"></svg>
+          </div>
+          <div class="chart-foot">
+            <div class="chart-legend" aria-hidden="true">
+              <span class="cl-item"><i class="cl-line cl-line--ink"></i>Loss</span>
+              <span class="cl-item"><i class="cl-line cl-line--acc"></i>Hard精度</span>
+              <span class="cl-item"><i class="cl-line cl-line--dash"></i>結晶度</span>
+            </div>
+            <div class="pace-toggle" role="group" aria-label="学習の再生速度">
+              <button type="button" id="pace-obs" aria-pressed="true" title="過程が見えるように約3.2秒かけて再生（実計算時間はそのまま表示）">観察 3s</button>
+              <button type="button" id="pace-fast" aria-pressed="false" title="スロットルなしで最速実行">最速</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="rblock rblock--hide-sm">
+          <div class="block-head">
+            <span class="kicker">GroupSum 論理ゲート投票</span>
+            <span class="kicker-mono" id="vote-mode-lbl">8 ゲート / クラス</span>
+          </div>
+          <div class="vote-stack" id="vote-stack"></div>
+        </div>
+
+        <div class="rblock rblock--hide-md">
+          <div class="block-head">
+            <span class="kicker">論理合成（DCE / CSE / 定数畳込）</span>
+            <span class="pct-tag" id="m-pct">未合成</span>
+          </div>
+          <div class="synth-top">
+            <div class="big-num" id="m-synth">120<span class="arr">→</span><span class="opt">-</span></div>
+            <button type="button" class="mini-btn mini-btn--accent" id="btn-synth">いま論理合成</button>
+          </div>
+          <div class="pass-chips" id="pass-chips">
+            <span>定数畳込 -</span><span>短絡 -</span><span>CSE -</span><span>DCE -</span>
+          </div>
+        </div>
+
+        <div class="rblock rblock--hide-md">
+          <div class="meta-strip">
+            <div class="meta-cell"><span>浮動小数乗算</span><strong class="accent">0 回</strong></div>
+            <div class="meta-cell"><span>重みファイル</span><strong>0 B</strong></div>
+            <div class="meta-cell"><span>64並列推論</span><strong id="m-ns">-</strong></div>
+          </div>
+          <div class="cta-row">
+            <button type="button" class="action-tile" id="open-code">生成 Kizu コード <span>→</span></button>
+            <button type="button" class="action-tile" id="open-ir">Griffith IR <span>→</span></button>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
+      <span class="foot-mid">実際の WASM 計算は数十 ms。学習の過程が見えるように観察モードでは最低 3.2 秒かけて再生しています</span>
+      <span class="foot-mono" id="foot-stat">loading wasm…</span>
+    </footer>
+
+    <!-- オーバーレイシート（生成 Kizu コード / Griffith IR / しくみ） -->
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="生成成果物と解説">
+        <div class="sheet__head">
+          <div class="sheet__tabs" role="tablist">
+            <button type="button" role="tab" data-tab="code" aria-selected="true">生成 Kizu コード</button>
+            <button type="button" role="tab" data-tab="ir" aria-selected="false">Griffith IR JSON</button>
+            <button type="button" role="tab" data-tab="about" aria-selected="false">この実験のしくみ</button>
+          </div>
+          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+        </div>
+        <div class="sheet__content">
+          <div id="tab-code">
+            <div class="code-bar">
+              <p class="code-note" id="code-note">論理合成を実行すると、いま学習した 5×5 分類器の重みゼロ Kizu コードがここに生成されます。</p>
+              <button type="button" class="mini-btn" id="btn-copy-code">コピー</button>
+            </div>
+            <pre class="code" id="code-pre">// まだ論理合成されていません。「学習する」または「いま論理合成」を押してください。</pre>
+          </div>
+          <div id="tab-ir" hidden>
+            <div class="code-bar">
+              <p class="code-note">WASM 内の Kizu 論理合成パスが出力した Griffith 互換 IR JSON です。</p>
+              <button type="button" class="mini-btn" id="btn-copy-ir">コピー</button>
+            </div>
+            <pre class="code" id="ir-pre">{}</pre>
+          </div>
+          <div id="tab-about" hidden>
+            <ul class="about-list">
+              <li>
+                <strong><span class="about-step">01</span>固定回路ではなく、ブラウザ内でゼロから学習している</strong>
+                <p>このページの <code>app.wasm</code> には学習済みモデルではなく、純 Kizu 製の微分可能 LUT 学習器（WARP + Gumbel-ST / Softmax + AdamW）が入っています。「データ編集」で完全にオリジナルの図形を描き足して学習しても、その場で解く回路が生まれます。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">02</span>灰色の確率雲から論理ゲートが「結晶化」する</strong>
+                <p>学習前は 120 個のゲートがすべて曖昧な連続確率ですが、勾配降下が進むと各ゲートが <code>XOR</code> / <code>XNOR</code> / <code>AND</code> / <code>NOR</code> などの純粋な論理演算へ尖っていきます。純計算は数十 ms で終わるため、観察モードではあえて 3.2 秒かけて推移を見やすく再生しています。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">03</span>論理合成で不要・重複ゲートを削ぎ落とし、重みを 0 B にする</strong>
+                <p>学習後に 4 パスの論理合成（定数畳み込み・パススルー／反転吸収・CSE・DCE）を走らせると、生き残った数十個のゲートだけで乗算 0 回の 64 並列ビット演算推論（数 ns/回）ができます。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">04</span>次の Lab 02 へ：このまま Transformer（LLM）にスケールする</strong>
+                <p>同じ Kizu 微分可能 LUT 基盤で構築した <code>LogicLadderGPT</code>（FFN・QKV・Attention まで論理ゲート＋MUX 化した極小 LLM）を次の <code>ladder/</code> として追加予定です。</p>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { instantiate } from "../dist/app.mjs";
+
+    const pack = (r0, r1, r2, r3, r4) => r0 | (r1 << 5) | (r2 << 10) | (r3 << 15) | (r4 << 20);
+
+    const PRESETS = {
+      shapes: {
+        labels: ["○", "×", "△"],
+        samples: [
+          [pack(0b01110, 0b10001, 0b10001, 0b10001, 0b01110), 0],
+          [pack(0b00100, 0b01010, 0b01010, 0b01010, 0b00100), 0],
+          [pack(0b01110, 0b10001, 0b10001, 0b01110, 0b00000), 0],
+          [pack(0b00000, 0b01110, 0b10001, 0b10001, 0b01110), 0],
+          [pack(0b10001, 0b01010, 0b00100, 0b01010, 0b10001), 1],
+          [pack(0b00000, 0b01010, 0b00100, 0b01010, 0b00000), 1],
+          [pack(0b10001, 0b11011, 0b00100, 0b11011, 0b10001), 1],
+          [pack(0b10010, 0b01100, 0b00100, 0b01100, 0b10010), 1],
+          [pack(0b00100, 0b01010, 0b01010, 0b10001, 0b11111), 2],
+          [pack(0b00100, 0b01110, 0b10001, 0b11111, 0b00000), 2],
+          [pack(0b00000, 0b00100, 0b01010, 0b11111, 0b00000), 2],
+          [pack(0b00100, 0b01010, 0b10001, 0b10001, 0b11111), 2],
+        ],
+        testDefault: pack(0b01110, 0b10001, 0b10001, 0b10001, 0b01110),
+      },
+      lines: {
+        labels: ["−", "│", "／"],
+        samples: [
+          [pack(0b00000, 0b00000, 0b11111, 0b00000, 0b00000), 0],
+          [pack(0b00000, 0b11111, 0b00000, 0b00000, 0b00000), 0],
+          [pack(0b00000, 0b00000, 0b00000, 0b11111, 0b00000), 0],
+          [pack(0b00000, 0b01110, 0b11111, 0b00000, 0b00000), 0],
+          [pack(0b00100, 0b00100, 0b00100, 0b00100, 0b00100), 1],
+          [pack(0b01000, 0b01000, 0b01000, 0b01000, 0b01000), 1],
+          [pack(0b00010, 0b00010, 0b00010, 0b00010, 0b00010), 1],
+          [pack(0b00100, 0b00100, 0b00100, 0b00100, 0b01100), 1],
+          [pack(0b00001, 0b00010, 0b00100, 0b01000, 0b10000), 2],
+          [pack(0b00010, 0b00100, 0b01000, 0b10000, 0b00000), 2],
+          [pack(0b00000, 0b00001, 0b00010, 0b00100, 0b01000), 2],
+          [pack(0b00011, 0b00110, 0b01100, 0b11000, 0b10000), 2],
+        ],
+        testDefault: pack(0b00001, 0b00010, 0b00100, 0b01000, 0b10000),
+      },
+      digits: {
+        labels: ["0", "1", "7"],
+        samples: [
+          [pack(0b01110, 0b10001, 0b10001, 0b10001, 0b01110), 0],
+          [pack(0b01110, 0b10011, 0b10101, 0b11001, 0b01110), 0],
+          [pack(0b11110, 0b10010, 0b10010, 0b10010, 0b11110), 0],
+          [pack(0b01111, 0b01001, 0b01001, 0b01001, 0b01111), 0],
+          [pack(0b00100, 0b01100, 0b00100, 0b00100, 0b01110), 1],
+          [pack(0b00100, 0b00100, 0b00100, 0b00100, 0b00100), 1],
+          [pack(0b01100, 0b00100, 0b00100, 0b00100, 0b01110), 1],
+          [pack(0b00010, 0b00110, 0b00010, 0b00010, 0b00111), 1],
+          [pack(0b11111, 0b00001, 0b00010, 0b00100, 0b00100), 2],
+          [pack(0b11111, 0b00010, 0b00100, 0b01000, 0b01000), 2],
+          [pack(0b11110, 0b00010, 0b00100, 0b00100, 0b01000), 2],
+          [pack(0b11111, 0b10001, 0b00010, 0b00100, 0b01000), 2],
+        ],
+        testDefault: pack(0b11111, 0b00001, 0b00010, 0b00100, 0b00100),
+      },
+    };
+
+    const GATE_NAMES_2 = {
+      0x0: "0", 0x1: "NOR", 0x2: "A&~B", 0x3: "~B",
+      0x4: "~A&B", 0x5: "~A", 0x6: "XOR", 0x7: "NAND",
+      0x8: "AND", 0x9: "XNOR", 0xa: "A", 0xb: "A|~B",
+      0xc: "B", 0xd: "~A|B", 0xe: "OR", 0xf: "1",
+    };
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    function svgEl(tag, attrs = {}, text = null) {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+      if (text !== null) el.textContent = text;
+      return el;
+    }
+
+    let ex = null;
+    let handle = 0;
+    let paramMode = 0; // 0=WARP, 1=Softmax
+    let seed = 42;
+    let activePreset = "shapes";
+    let classLabels = [...PRESETS.shapes.labels];
+    let samples = PRESETS.shapes.samples.map(([bits, label]) => ({ bits, label }));
+    let canvasBits = PRESETS.shapes.testDefault;
+    let padMode = "test";
+    let editClass = 0;
+    let stageView = "net";
+    let useHard = true;
+    let observePace = true; // true = 最低 3.2 秒かけて人間が学習過程を見える速度で再生（実計算時間は本物を表示）
+    let isTraining = false;
+    let trainRaf = 0;
+    let synthTimer = 0;
+    let targetSteps = 260;
+    let hasSynth = false;
+    let history = [];
+    let generatedCode = "";
+    let generatedIr = null;
+    let generatedIrRaw = "{}";
+    let sheetTab = "code";
+    let wasmKB = "-";
+
+    // 5×5 グリッド DOM 構築
+    const gridEl = document.getElementById("grid5");
+    const cellEls = [];
+    let dragMode = null;
+
+    for (let i = 0; i < 25; i++) {
+      const d = document.createElement("div");
+      d.className = "cell";
+      d.dataset.idx = String(i);
+      d.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        const isOn = ((canvasBits >> i) & 1) !== 0;
+        dragMode = isOn ? 0 : 1;
+        setPixel(i, dragMode);
+      });
+      d.addEventListener("pointerenter", (e) => {
+        if (dragMode !== null && (e.buttons & 1)) {
+          setPixel(i, dragMode);
+        }
+      });
+      gridEl.appendChild(d);
+      cellEls.push(d);
+    }
+    window.addEventListener("pointerup", () => { dragMode = null; });
+
+    function setBanner(htmlText) {
+      const el = document.getElementById("stage-banner");
+      if (!htmlText) {
+        el.hidden = true;
+        el.innerHTML = "";
+      } else {
+        el.hidden = false;
+        el.innerHTML = htmlText;
+      }
+    }
+
+    function setPixel(idx, val) {
+      const next = val ? (canvasBits | (1 << idx)) : (canvasBits & ~(1 << idx));
+      if (next === canvasBits) return;
+      canvasBits = next;
+      renderGrid();
+      runLiveInfer();
+    }
+
+    function renderGrid(hiPins = []) {
+      const hiSet = new Set(hiPins);
+      for (let i = 0; i < 25; i++) {
+        cellEls[i].classList.toggle("on", ((canvasBits >> i) & 1) !== 0);
+        cellEls[i].classList.toggle("pin-hi", hiSet.has(i));
+      }
+    }
+
+    function highlightInputPins(pins) {
+      renderGrid(pins.filter((p) => p >= 0 && p < 25));
+    }
+
+    function syncSamplesToWasm() {
+      ex.live_clear_samples(handle);
+      for (const s of samples) {
+        ex.live_add_sample(handle, s.bits >>> 0, s.label);
+      }
+      ex.live_eval_metrics(handle);
+    }
+
+    function renderSamples() {
+      document.getElementById("sample-count").textContent = `(${samples.length})`;
+      const box = document.getElementById("samples-list");
+      box.innerHTML = "";
+      for (let c = 0; c < 3; c++) {
+        const row = document.createElement("div");
+        row.className = "cls-row";
+        const badge = document.createElement("span");
+        badge.className = "cls-badge";
+        badge.id = `cls-badge-${c}`;
+        badge.textContent = classLabels[c];
+        row.appendChild(badge);
+
+        const thumbs = document.createElement("div");
+        thumbs.className = "thumbs";
+        const list = samples.map((s, idx) => ({ ...s, idx })).filter((s) => s.label === c);
+        const maxShow = 5;
+        list.slice(0, maxShow).forEach((s) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "thumb";
+          btn.title = `${classLabels[c]} の標本を読み込む`;
+          for (let i = 0; i < 25; i++) {
+            const px = document.createElement("i");
+            if ((s.bits >> i) & 1) px.className = "on";
+            btn.appendChild(px);
+          }
+          btn.onclick = () => {
+            canvasBits = s.bits;
+            renderGrid();
+            runLiveInfer();
+          };
+          if (padMode === "edit") {
+            const del = document.createElement("span");
+            del.className = "thumb-del";
+            del.textContent = "×";
+            del.title = "この標本を削除";
+            del.onclick = (e) => {
+              e.stopPropagation();
+              samples.splice(s.idx, 1);
+              syncSamplesToWasm();
+              renderSamples();
+              updateMetricsUI();
+            };
+            btn.appendChild(del);
+          }
+          thumbs.appendChild(btn);
+        });
+        if (list.length > maxShow) {
+          const more = document.createElement("span");
+          more.className = "thumb-more";
+          more.textContent = `+${list.length - maxShow}`;
+          thumbs.appendChild(more);
+        }
+        row.appendChild(thumbs);
+        box.appendChild(row);
+      }
+
+      const pickBtns = document.querySelectorAll("#cls-pick button");
+      pickBtns.forEach((b, c) => {
+        b.textContent = classLabels[c];
+        b.setAttribute("aria-pressed", String(c === editClass));
+      });
+    }
+
+    function pushHistoryPoint() {
+      const step = ex.live_step(handle);
+      const loss = ex.live_metric_milli(handle, 0) / 1000;
+      const softAcc = ex.live_metric_milli(handle, 1) / 1000;
+      const hardAcc = ex.live_metric_milli(handle, 2) / 1000;
+      const sharp = ex.live_metric_milli(handle, 3) / 1000;
+      history.push({ step, loss, softAcc, hardAcc, sharp });
+      return { step, loss, softAcc, hardAcc, sharp };
+    }
+
+    function updateStepsBar() {
+      const s1 = document.getElementById("st-1");
+      const s2 = document.getElementById("st-2");
+      const s3 = document.getElementById("st-3");
+      const step = ex ? ex.live_step(handle) : 0;
+      s1.className = "st-pill" + (step === 0 ? " active" : " done");
+      s2.className = "st-pill" + (isTraining ? " active" : (step > 0 ? " done" : ""));
+      s3.className = "st-pill" + (hasSynth ? " active" : "");
+    }
+
+    function updateMetricsUI() {
+      const step = ex.live_step(handle);
+      const loss = ex.live_metric_milli(handle, 0) / 1000;
+      const hardAcc = ex.live_metric_milli(handle, 2) / 1000;
+      const sharp = ex.live_metric_milli(handle, 3) / 1000;
+
+      document.getElementById("m-step").textContent = String(step);
+      document.getElementById("m-loss").textContent = loss.toFixed(3);
+      document.getElementById("m-hacc").textContent = `${Math.round(hardAcc * 100)}%`;
+      document.getElementById("m-sharp").textContent = `${Math.round(sharp * 100)}%`;
+
+      updateStepsBar();
+      renderLossChart();
+    }
+
+    function renderLossChart() {
+      const svg = document.getElementById("loss-chart");
+      svg.innerHTML = "";
+      const rect = svg.getBoundingClientRect();
+      const W = Math.max(160, Math.round(rect.width || 280));
+      const H = Math.max(80, Math.round(rect.height || 110));
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+      const ml = 26, mr = 28, mt = 10, mb = 18;
+      const pw = Math.max(40, W - ml - mr);
+      const ph = Math.max(30, H - mt - mb);
+
+      for (let i = 0; i <= 4; i++) {
+        const y = Math.round(mt + (ph * i) / 4) + 0.5;
+        svg.appendChild(svgEl("line", {
+          x1: ml, y1: y, x2: W - mr, y2: y,
+          stroke: i === 4 ? "#cfccc0" : "#e3e0d6", "stroke-width": 1,
+        }));
+      }
+      svg.appendChild(svgEl("text", { x: ml - 4, y: mt + 4, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 9, fill: "#68665e" }, "1.3"));
+      svg.appendChild(svgEl("text", { x: ml - 4, y: mt + ph + 3, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 9, fill: "#68665e" }, "0"));
+      svg.appendChild(svgEl("text", { x: W - mr + 4, y: mt + 4, "text-anchor": "start", "font-family": "var(--mono)", "font-size": 9, fill: "#ff4d00" }, "100"));
+      svg.appendChild(svgEl("text", { x: W - mr + 4, y: mt + ph + 3, "text-anchor": "start", "font-family": "var(--mono)", "font-size": 9, fill: "#ff4d00" }, "0%"));
+
+      const maxStep = Math.max(targetSteps, history.length ? history[history.length - 1].step : 1);
+      svg.appendChild(svgEl("text", { x: ml, y: H - 4, "font-family": "var(--mono)", "font-size": 9, fill: "#68665e" }, "0"));
+      svg.appendChild(svgEl("text", { x: W - mr, y: H - 4, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 9, fill: "#68665e" }, `step ${maxStep}`));
+
+      if (history.length < 1) return;
+
+      const xOf = (s) => ml + (Math.min(s, maxStep) / Math.max(maxStep, 1)) * pw;
+      const yLoss = (l) => mt + (1 - Math.min(1.3, Math.max(0, l)) / 1.3) * ph;
+      const yPct = (p) => mt + (1 - Math.min(1, Math.max(0, p))) * ph;
+      const makePath = (fn) => history.map((pt, i) => `${i === 0 ? "M" : "L"}${xOf(pt.step).toFixed(1)},${fn(pt).toFixed(1)}`).join(" ");
+
+      svg.appendChild(svgEl("path", {
+        d: makePath((pt) => yPct(pt.sharp)),
+        fill: "none", stroke: "#8b887d", "stroke-width": 1.2, "stroke-dasharray": "3 2.5",
+      }));
+      svg.appendChild(svgEl("path", {
+        d: makePath((pt) => yLoss(pt.loss)),
+        fill: "none", stroke: "#141412", "stroke-width": 1.9, "stroke-linecap": "round", "stroke-linejoin": "round",
+      }));
+      svg.appendChild(svgEl("path", {
+        d: makePath((pt) => yPct(pt.hardAcc)),
+        fill: "none", stroke: "#ff4d00", "stroke-width": 2.0, "stroke-linecap": "round", "stroke-linejoin": "round",
+      }));
+
+      const last = history[history.length - 1];
+      svg.appendChild(svgEl("circle", { cx: xOf(last.step), cy: yLoss(last.loss), r: 2.8, fill: "#141412" }));
+      svg.appendChild(svgEl("circle", { cx: xOf(last.step), cy: yPct(last.hardAcc), r: 3.0, fill: "#ff4d00" }));
+    }
+
+    function runLiveInfer() {
+      if (!ex || !handle) return;
+      const pred = ex.live_infer(handle, canvasBits >>> 0, useHard ? 1 : 0);
+
+      document.getElementById("verdict-sym").textContent = pred >= 0 ? classLabels[pred] : "-";
+      document.getElementById("verdict-tag").textContent =
+        isTraining ? "学習中…" : (useHard ? (hasSynth ? "合成VM · 乗算0" : "Hard LUT · 乗算0") : "Soft 連続NN");
+
+      for (let c = 0; c < 3; c++) {
+        const b = document.getElementById(`cls-badge-${c}`);
+        if (b) b.classList.toggle("win", c === pred);
+      }
+
+      const stack = document.getElementById("vote-stack");
+      stack.innerHTML = "";
+      document.getElementById("vote-mode-lbl").textContent = useHard ? "8 ゲート / クラス" : "Softmax 確率";
+      for (let c = 0; c < 3; c++) {
+        const val = ex.live_vote(handle, c, useHard ? 1 : 0);
+        const pct = useHard ? (val / 8) * 100 : val / 10;
+        const row = document.createElement("div");
+        row.className = "vote-row";
+        row.innerHTML =
+          `<span class="vote-sym">${classLabels[c]}</span>` +
+          `<div class="track"><div class="fill ${c === pred ? "fill--win" : ""}" style="width:${Math.max(2, pct).toFixed(1)}%"></div></div>` +
+          `<span class="vote-val">${useHard ? `${val}/8 票` : `${(val / 10).toFixed(1)}%`}</span>`;
+        stack.appendChild(row);
+      }
+
+      renderStageSVG(pred);
+    }
+
+    function renderStageSVG(pred) {
+      if (stageView === "synth" && hasSynth && generatedIr) {
+        renderSynthCircuitSVG(pred);
+      } else {
+        renderLearningNetSVG(pred);
+      }
+    }
+
+    function renderLearningNetSVG(pred) {
+      const svg = document.getElementById("circuit");
+      svg.innerHTML = "";
+      const H = 460;
+
+      const inG = svgEl("g");
+      svg.appendChild(inG);
+      inG.appendChild(svgEl("text", {
+        x: 56, y: 26, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, "5×5 IN (25)"));
+
+      const cellS = 14, gap = 2, ox = 16, oy = 188;
+      const inPos = [];
+      for (let i = 0; i < 25; i++) {
+        const r = Math.floor(i / 5), c = i % 5;
+        const x = ox + c * (cellS + gap);
+        const y = oy + r * (cellS + gap);
+        const on = ((canvasBits >> i) & 1) !== 0;
+        inPos.push({ x: x + cellS / 2, y: y + cellS / 2 });
+        inG.appendChild(svgEl("rect", {
+          x, y, width: cellS, height: cellS, rx: 2,
+          fill: on ? "#ff4d00" : "#f2f0e9",
+          stroke: on ? "#ff4d00" : "#cfccc0", "stroke-width": 1,
+        }));
+      }
+
+      const gates = [];
+      for (let g = 0; g < 120; g++) {
+        const pk = ex.live_gate_packed(handle, g);
+        const layer = (pk >>> 28) & 3;
+        const tt = (pk >>> 24) & 15;
+        const sharp = ((pk >>> 16) & 255) / 255;
+        const p0 = (pk >>> 8) & 255;
+        const p1 = pk & 255;
+        const act = ex.live_wire_milli(handle, 0, 25 + g) / 1000;
+        gates.push({ g, layer, tt, sharp, p0, p1, act });
+      }
+
+      const colSpecs = [
+        { title: "L1 · 48 LUT", start: 0, count: 48, cols: 4, rows: 12, x0: 132, w: 36, h: 27, gx: 4, gy: 5 },
+        { title: "L2 · 48 LUT", start: 48, count: 48, cols: 4, rows: 12, x0: 332, w: 36, h: 27, gx: 4, gy: 5 },
+        { title: "L3 · 24 OUT", start: 96, count: 24, cols: 2, rows: 12, x0: 532, w: 46, h: 27, gx: 6, gy: 5 },
+      ];
+
+      const gPos = new Array(120);
+      for (const sp of colSpecs) {
+        const totalW = sp.cols * sp.w + (sp.cols - 1) * sp.gx;
+        const totalH = sp.rows * sp.h + (sp.rows - 1) * sp.gy;
+        const y0 = 42 + (H - 58 - totalH) / 2;
+        svg.appendChild(svgEl("text", {
+          x: sp.x0 + totalW / 2, y: 26, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+        }, sp.title));
+        for (let i = 0; i < sp.count; i++) {
+          const r = i % sp.rows;
+          const c = Math.floor(i / sp.rows);
+          const x = sp.x0 + c * (sp.w + sp.gx);
+          const y = y0 + r * (sp.h + sp.gy);
+          gPos[sp.start + i] = { x, y, w: sp.w, h: sp.h, cx: x + sp.w / 2, cy: y + sp.h / 2 };
+        }
+      }
+
+      const hoverWireLayer = svgEl("g", { id: "hover-wires", "pointer-events": "none" });
+      svg.appendChild(hoverWireLayer);
+
+      const outX = 670;
+      svg.appendChild(svgEl("text", {
+        x: outX + 46, y: 26, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, "GroupSum"));
+
+      for (let c = 0; c < 3; c++) {
+        const y = 78 + c * 124;
+        const win = c === pred;
+        const votes = ex.live_vote(handle, c, useHard ? 1 : 0);
+        svg.appendChild(svgEl("path", {
+          d: `M 636 ${y + 18} C 652 ${y + 18}, 654 ${y + 42}, ${outX} ${y + 42}`,
+          fill: "none", stroke: win ? "#ff4d00" : "#cfccc0", "stroke-width": win ? 2.2 : 1.1,
+        }));
+        svg.appendChild(svgEl("rect", {
+          x: outX, y: y + 8, width: 92, height: 68, rx: 7,
+          fill: win ? "#141412" : "#faf9f3",
+          stroke: win ? "#ff4d00" : "#141412", "stroke-width": win ? 2 : 1.2,
+        }));
+        svg.appendChild(svgEl("text", {
+          x: outX + 46, y: y + 39, "text-anchor": "middle",
+          "font-family": "var(--jp)", "font-size": 21, "font-weight": 800,
+          fill: win ? "#ff4d00" : "#141412",
+        }, classLabels[c]));
+        svg.appendChild(svgEl("text", {
+          x: outX + 46, y: y + 61, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 10.5, "font-weight": 700,
+          fill: win ? "#f2f0e9" : "#68665e",
+        }, useHard ? `${votes}/8 票` : `${(votes / 10).toFixed(0)}%`));
+      }
+
+      const nodesG = svgEl("g");
+      svg.appendChild(nodesG);
+
+      for (const gt of gates) {
+        const p = gPos[gt.g];
+        const op = GATE_NAMES_2[gt.tt] || "?";
+        const isConst = gt.tt === 0 || gt.tt === 15;
+        const active = gt.act > 0.5;
+        const sharp = gt.sharp;
+
+        const borderAlpha = 0.2 + sharp * 0.8;
+        const fill = active
+          ? `rgba(255, 77, 0, ${(0.07 + sharp * 0.19 * gt.act).toFixed(2)})`
+          : (isConst ? "#eceae2" : "#faf9f3");
+        const stroke = active
+          ? `rgba(255, 77, 0, ${(0.42 + sharp * 0.58).toFixed(2)})`
+          : `rgba(20, 20, 18, ${borderAlpha.toFixed(2)})`;
+
+        const gEl = svgEl("g", { class: "svg-gate" });
+        gEl.appendChild(svgEl("rect", {
+          class: "g-box",
+          x: p.x, y: p.y, width: p.w, height: p.h, rx: 3.5,
+          fill, stroke,
+          "stroke-width": active ? (0.85 + sharp * 0.95) : (0.65 + sharp * 0.55),
+          "stroke-dasharray": sharp < 0.55 ? "2 1.8" : "none",
+        }));
+
+        gEl.appendChild(svgEl("rect", {
+          x: p.x + 2, y: p.y + p.h - 3.2, width: Math.max(2, (p.w - 4) * sharp), height: 2, rx: 1,
+          fill: active ? "#ff4d00" : (sharp > 0.72 ? "#141412" : "#a8a496"),
+          opacity: (0.35 + sharp * 0.65).toFixed(2),
+        }));
+
+        gEl.appendChild(svgEl("text", {
+          x: p.cx, y: p.cy + 2.5, "text-anchor": "middle",
+          "font-family": "var(--mono)",
+          "font-size": op.length >= 4 ? 7.5 : 8.5,
+          "font-weight": sharp > 0.65 ? 800 : 500,
+          fill: active ? "#ff4d00" : "#141412",
+          opacity: (0.32 + sharp * 0.68).toFixed(2),
+        }, op));
+
+        gEl.addEventListener("mouseenter", () => {
+          const pinLabel = (idx) => gt.layer === 0 ? `p${idx}` : `L${gt.layer}#${idx}`;
+          const clsNote = gt.layer === 2 ? ` · ${classLabels[Math.floor((gt.g - 96) / 8)]}票` : "";
+          document.getElementById("inspector").innerHTML =
+            `<b>L${gt.layer + 1}#${gt.g}</b> ${op}(${pinLabel(gt.p0)}, ${pinLabel(gt.p1)})${clsNote} · 結晶度 <b>${Math.round(sharp * 100)}%</b> · 出力 <span class="${active ? "hi" : ""}">${gt.act.toFixed(2)}</span>`;
+
+          hoverWireLayer.innerHTML = "";
+          const drawPinWire = (srcPt) => {
+            const dx = Math.max(18, (p.x - srcPt.x) * 0.45);
+            hoverWireLayer.appendChild(svgEl("path", {
+              d: `M ${srcPt.x} ${srcPt.y} C ${srcPt.x + dx} ${srcPt.y}, ${p.x - dx} ${p.cy}, ${p.x} ${p.cy}`,
+              fill: "none", stroke: "#ff4d00", "stroke-width": 1.8,
+            }));
+          };
+          if (gt.layer === 0) {
+            highlightInputPins([gt.p0, gt.p1]);
+            drawPinWire(inPos[gt.p0]);
+            drawPinWire(inPos[gt.p1]);
+          } else {
+            const base = gt.layer === 1 ? 0 : 48;
+            drawPinWire({ x: gPos[base + gt.p0].x + gPos[base + gt.p0].w, y: gPos[base + gt.p0].cy });
+            drawPinWire({ x: gPos[base + gt.p1].x + gPos[base + gt.p1].w, y: gPos[base + gt.p1].cy });
+          }
+        });
+        gEl.addEventListener("mouseleave", () => {
+          hoverWireLayer.innerHTML = "";
+          highlightInputPins([]);
+          resetInspector();
+        });
+        nodesG.appendChild(gEl);
+      }
+    }
+
+    function renderSynthCircuitSVG(pred) {
+      const svg = document.getElementById("circuit");
+      svg.innerHTML = "";
+      const H = 460;
+      const dag = generatedIr.nodes[0].params;
+      const gates = dag.gates;
+      const outWires = dag.out_wires;
+
+      const usedInputs = new Set();
+      for (const g of gates) {
+        for (const p of g.pins) if (p >= 0 && p < 25) usedInputs.add(p);
+      }
+      for (const w of outWires) if (w >= 0 && w < 25) usedInputs.add(w);
+
+      const depthMap = new Map();
+      for (let i = 0; i < 25; i++) depthMap.set(i, 0);
+      let maxD = 1;
+      for (const g of gates) {
+        let d = 0;
+        for (const p of g.pins) d = Math.max(d, depthMap.get(p) || 0);
+        depthMap.set(g.id, d + 1);
+        maxD = Math.max(maxD, d + 1);
+      }
+      const cols = Array.from({ length: maxD }, () => []);
+      for (const g of gates) cols[depthMap.get(g.id) - 1].push(g);
+
+      const pos = new Map();
+      svg.appendChild(svgEl("text", {
+        x: 56, y: 24, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, `USED ${usedInputs.size}/25`));
+
+      const cellS = 14, gap = 2, ox = 16, oy = 188;
+      for (let i = 0; i < 25; i++) {
+        const r = Math.floor(i / 5), c = i % 5;
+        const x = ox + c * (cellS + gap);
+        const y = oy + r * (cellS + gap);
+        const used = usedInputs.has(i);
+        const on = ((canvasBits >> i) & 1) !== 0;
+        pos.set(i, { x: x + cellS / 2, y: y + cellS / 2, w: cellS, h: cellS });
+        svg.appendChild(svgEl("rect", {
+          x, y, width: cellS, height: cellS, rx: 2,
+          fill: on ? (used ? "#ff4d00" : "#cfccc0") : "#f2f0e9",
+          stroke: used ? (on ? "#ff4d00" : "#141412") : "#e3e0d6",
+          "stroke-width": used ? 1.1 : 0.8,
+          opacity: used ? 1 : 0.45,
+        }));
+      }
+
+      const leftX = 160, rightX = 590;
+      const gW = 54, gH = 14;
+      for (let c = 0; c < maxD; c++) {
+        const col = cols[c];
+        const cx = maxD === 1 ? (leftX + rightX) / 2 : leftX + ((rightX - leftX) * c) / (maxD - 1);
+        svg.appendChild(svgEl("text", {
+          x: cx, y: 24, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+        }, `D${c + 1} (${col.length})`));
+        const usableH = H - 56;
+        const topY = 38;
+        col.forEach((g, idx) => {
+          const y = col.length === 1 ? H / 2 : topY + (usableH * idx) / (col.length - 1);
+          pos.set(g.id, { x: cx, y, w: gW, h: gH });
+        });
+      }
+
+      const outX = 674;
+      svg.appendChild(svgEl("text", {
+        x: outX + 44, y: 24, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, "VM OUT"));
+      const outCenters = [118, 232, 346];
+
+      const offW = svgEl("g"), onW = svgEl("g");
+      svg.appendChild(offW);
+      svg.appendChild(onW);
+
+      const wireVal = (wid) => {
+        if (wid === -2) return 1;
+        if (wid === -1) return 0;
+        return ex.live_wire_milli(handle, 1, wid) > 500 ? 1 : 0;
+      };
+
+      const addWire = (x1, y1, x2, y2, on) => {
+        const dx = Math.max(20, (x2 - x1) * 0.45);
+        (on ? onW : offW).appendChild(svgEl("path", {
+          d: `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + dx).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - dx).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`,
+          fill: "none",
+          stroke: on ? "#ff4d00" : "#cfccc0",
+          "stroke-width": on ? 1.35 : 0.7,
+          "stroke-opacity": on ? 0.62 : 0.42,
+        }));
+      };
+
+      for (const g of gates) {
+        const dst = pos.get(g.id);
+        for (const p of g.pins) {
+          if (p < 0) continue;
+          const src = pos.get(p);
+          if (!src) continue;
+          addWire(src.x + src.w / 2, src.y, dst.x - dst.w / 2, dst.y, wireVal(p));
+        }
+      }
+      outWires.forEach((wId, idx) => {
+        if (wId < 0) return;
+        const src = pos.get(wId);
+        if (!src) return;
+        const cls = Math.floor(idx / 8);
+        addWire(src.x + src.w / 2, src.y, outX, outCenters[cls], wireVal(wId));
+      });
+
+      const nodesG = svgEl("g");
+      svg.appendChild(nodesG);
+      for (const g of gates) {
+        const p = pos.get(g.id);
+        const on = wireVal(g.id);
+        const ttNum = parseInt(g.tt, 16);
+        const op = g.arity === 1 ? (ttNum === 1 ? "NOT" : "BUF") : (GATE_NAMES_2[ttNum & 15] || g.tt);
+
+        const el = svgEl("g", { class: "svg-gate" });
+        el.appendChild(svgEl("rect", {
+          class: "g-box",
+          x: p.x - p.w / 2, y: p.y - p.h / 2, width: p.w, height: p.h, rx: 3,
+          fill: on ? "#fff0e8" : "#faf9f3",
+          stroke: on ? "#ff4d00" : "#141412",
+          "stroke-width": on ? 1.3 : 0.85,
+        }));
+        el.appendChild(svgEl("text", {
+          x: p.x - 5, y: p.y + 3, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 7.6, "font-weight": 700,
+          fill: on ? "#141412" : "#68665e",
+        }, op));
+        el.appendChild(svgEl("text", {
+          x: p.x + p.w / 2 - 7, y: p.y + 3, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 7.8, "font-weight": 800,
+          fill: on ? "#ff4d00" : "#8b887d",
+        }, String(on)));
+
+        el.addEventListener("mouseenter", () => {
+          const pinStr = g.pins.map((id) => id < 25 ? `p${id}` : `w${id - 25}`).join(", ");
+          document.getElementById("inspector").innerHTML =
+            `<b>w${g.id - 25}</b> = ${op}(${pinStr}) · tt=${g.tt} · VM出力 <span class="${on ? "hi" : ""}">${on}</span>`;
+          highlightInputPins(g.pins);
+        });
+        el.addEventListener("mouseleave", () => {
+          highlightInputPins([]);
+          resetInspector();
+        });
+        nodesG.appendChild(el);
+      }
+
+      for (let c = 0; c < 3; c++) {
+        const cy = outCenters[c];
+        const win = c === pred;
+        const votes = ex.live_vote(handle, c, 1);
+        nodesG.appendChild(svgEl("rect", {
+          x: outX, y: cy - 34, width: 88, height: 68, rx: 7,
+          fill: win ? "#141412" : "#faf9f3",
+          stroke: win ? "#ff4d00" : "#141412", "stroke-width": win ? 2 : 1.2,
+        }));
+        nodesG.appendChild(svgEl("text", {
+          x: outX + 44, y: cy - 3, "text-anchor": "middle",
+          "font-family": "var(--jp)", "font-size": 21, "font-weight": 800,
+          fill: win ? "#ff4d00" : "#141412",
+        }, classLabels[c]));
+        nodesG.appendChild(svgEl("text", {
+          x: outX + 44, y: cy + 20, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 10.5, "font-weight": 700,
+          fill: win ? "#f2f0e9" : "#68665e",
+        }, `${votes}/8 票`));
+      }
+    }
+
+    function resetInspector() {
+      document.getElementById("inspector").innerHTML = stageView === "synth"
+        ? "不要・重複ゲート削除後の <b>純ビット演算回路</b> が 5×5 描画にリアルタイム応答しています"
+        : "左の 5×5 に描くとリアルタイム発火 · ゲートにカーソルで参照ピクセルを表示";
+    }
+
+    function runSynthesize(switchView = true) {
+      if (!ex || !handle) return;
+      const optG = ex.live_synthesize(handle);
+      if (optG < 0) return;
+      hasSynth = true;
+      ex.live_emit_artifacts(handle);
+
+      const rawG = ex.live_synth_stat(handle, 0);
+      const optD = ex.live_synth_stat(handle, 3);
+      const cFold = ex.live_synth_stat(handle, 4);
+      const passR = ex.live_synth_stat(handle, 5) + ex.live_synth_stat(handle, 6);
+      const cse = ex.live_synth_stat(handle, 7);
+      const dce = ex.live_synth_stat(handle, 8);
+      const pct = (((rawG - optG) / Math.max(rawG, 1)) * 100).toFixed(1);
+
+      document.getElementById("m-synth").innerHTML = `${rawG}<span class="arr">→</span><span class="opt">${optG}</span>`;
+      document.getElementById("m-pct").textContent = `-${pct}% (深さ${optD})`;
+      document.getElementById("pass-chips").innerHTML =
+        `<span>定数畳込 ${cFold}</span><span>短絡 ${passR}</span><span>CSE ${cse}</span><span>DCE ${dce}</span>`;
+
+      const vsBtn = document.getElementById("view-synth");
+      vsBtn.disabled = false;
+      vsBtn.textContent = `合成回路 (${optG})`;
+
+      ex.live_bench_synth_64way(handle, 400);
+      const b0 = performance.now();
+      ex.live_bench_synth_64way(handle, 20000);
+      const b1 = performance.now();
+      const ns = ((b1 - b0) * 1e6) / (20000 * 64);
+      document.getElementById("m-ns").textContent = `${ns.toFixed(1)} ns`;
+
+      document.getElementById("code-note").textContent =
+        `いま学習した 5×5 分類器（${rawG} → ${optG} ゲート・-${pct}%）から WASM が自動生成した重みゼロ Kizu コードです。`;
+      document.getElementById("code-pre").textContent = generatedCode;
+      document.getElementById("ir-pre").textContent = generatedIrRaw;
+
+      setBanner(null);
+      if (switchView) {
+        setStageView("synth");
+      }
+      updateStepsBar();
+      runLiveInfer();
+    }
+
+    function setStageView(v) {
+      stageView = v;
+      document.getElementById("view-net").setAttribute("aria-pressed", String(v === "net"));
+      document.getElementById("view-synth").setAttribute("aria-pressed", String(v === "synth"));
+      resetInspector();
+      runLiveInfer();
+    }
+
+    function stopTraining() {
+      isTraining = false;
+      if (trainRaf) cancelAnimationFrame(trainRaf);
+      if (synthTimer) clearTimeout(synthTimer);
+      trainRaf = 0;
+      synthTimer = 0;
+      setBanner(null);
+      document.getElementById("btn-train").textContent = "再学習";
+      updateStepsBar();
+    }
+
+    function startTraining(fromScratch = false) {
+      if (samples.length < 2) return;
+      if (isTraining) { stopTraining(); return; }
+      if (synthTimer) { clearTimeout(synthTimer); synthTimer = 0; }
+
+      if (fromScratch || ex.live_step(handle) === 0) {
+        seed = (seed + 17) >>> 0;
+        ex.live_reseed(handle, seed);
+        syncSamplesToWasm();
+        hasSynth = false;
+        history = [];
+        pushHistoryPoint();
+        document.getElementById("view-synth").disabled = true;
+        document.getElementById("view-synth").textContent = "合成回路";
+        document.getElementById("m-synth").innerHTML = `120<span class="arr">→</span><span class="opt">-</span>`;
+        document.getElementById("m-pct").textContent = "学習中…";
+        setStageView("net");
+      }
+
+      isTraining = true;
+      const startStep = ex.live_step(handle);
+      const runSteps = 260;
+      targetSteps = startStep + runSteps;
+      const lrMilli = paramMode === 0 ? 85 : 140;
+      document.getElementById("btn-train").textContent = "停止";
+      updateStepsBar();
+
+      // 観察モード: 最低 3.2 秒かけて推移を可視化（WASM 実計算時間は本物を正確に計測表示）
+      const minVisualMs = observePace ? 3200 : 0;
+      const animStartMs = performance.now();
+      let realWasmMs = 0;
+      let curStep = startStep;
+
+      function finishTraining() {
+        isTraining = false;
+        trainRaf = 0;
+        document.getElementById("btn-train").textContent = "再学習";
+        document.getElementById("train-speed").innerHTML =
+          `実計算 <b>${realWasmMs.toFixed(1)} ms</b> (${runSteps} step)`;
+
+        if (observePace) {
+          // 結晶化完了を 0.7 秒見せてから不要ゲート削減（論理合成）へ切り替える
+          setBanner(`学習完了（WASM 実計算 <b>${realWasmMs.toFixed(1)} ms</b>）→ 不要ゲートを論理合成中…`);
+          synthTimer = setTimeout(() => {
+            synthTimer = 0;
+            runSynthesize(true);
+          }, 700);
+        } else {
+          runSynthesize(true);
+        }
+      }
+
+      function tick(now) {
+        if (!isTraining) return;
+        let stepDelta = 0;
+        if (observePace) {
+          const u = Math.min(1, Math.max(0, (now - animStartMs) / minVisualMs));
+          // 序盤（Loss 急落＆結晶化開始）をじっくり、終盤を滑らかに進めるカーブ
+          const desired = startStep + Math.round(Math.pow(u, 1.35) * runSteps);
+          stepDelta = Math.min(8, Math.max(0, desired - curStep));
+          if (u >= 1 && curStep < targetSteps) {
+            stepDelta = targetSteps - curStep;
+          }
+        } else {
+          stepDelta = Math.min(26, targetSteps - curStep);
+        }
+
+        if (stepDelta > 0) {
+          const t0 = performance.now();
+          curStep = ex.live_train_steps(handle, stepDelta, lrMilli);
+          const t1 = performance.now();
+          realWasmMs += (t1 - t0);
+
+          const pt = pushHistoryPoint();
+          document.getElementById("train-speed").innerHTML =
+            `実計算 <b>${realWasmMs.toFixed(1)} ms</b>` + (observePace ? " · 観察再生" : "");
+          setBanner(
+            `逆伝播学習中 Step <b>${curStep}</b>/${targetSteps} · Loss ${pt.loss.toFixed(3)} · 結晶度 <b>${Math.round(pt.sharp * 100)}%</b>（WASM 実計算 ${realWasmMs.toFixed(1)} ms）`
+          );
+          updateMetricsUI();
+          runLiveInfer();
+        }
+
+        if (curStep >= targetSteps) {
+          finishTraining();
+          return;
+        }
+        trainRaf = requestAnimationFrame(tick);
+      }
+      trainRaf = requestAnimationFrame(tick);
+    }
+
+    function createTrainer(newParamMode) {
+      stopTraining();
+      paramMode = newParamMode;
+      document.getElementById("pm-warp").setAttribute("aria-pressed", String(paramMode === 0));
+      document.getElementById("pm-soft").setAttribute("aria-pressed", String(paramMode === 1));
+      handle = ex.live_create(seed, paramMode) >>> 0;
+      hasSynth = false;
+      history = [];
+      syncSamplesToWasm();
+      pushHistoryPoint();
+      document.getElementById("view-synth").disabled = true;
+      document.getElementById("view-synth").textContent = "合成回路";
+      document.getElementById("m-synth").innerHTML = `120<span class="arr">→</span><span class="opt">-</span>`;
+      document.getElementById("m-pct").textContent = "未合成";
+      document.getElementById("m-ns").textContent = "-";
+      document.getElementById("train-speed").textContent = "実計算 -";
+      setStageView("net");
+      updateMetricsUI();
+      runLiveInfer();
+    }
+
+    function loadPreset(key) {
+      stopTraining();
+      activePreset = key;
+      const p = PRESETS[key];
+      classLabels = [...p.labels];
+      samples = p.samples.map(([bits, label]) => ({ bits, label }));
+      canvasBits = p.testDefault;
+      for (const b of document.querySelectorAll(".preset-btn")) {
+        b.setAttribute("aria-pressed", String(b.dataset.preset === key));
+      }
+      renderGrid();
+      renderSamples();
+      startTraining(true);
+    }
+
+    function setPadMode(m) {
+      padMode = m;
+      document.getElementById("mode-test").setAttribute("aria-pressed", String(m === "test"));
+      document.getElementById("mode-edit").setAttribute("aria-pressed", String(m === "edit"));
+      document.getElementById("test-actions").hidden = m !== "test";
+      document.getElementById("verdict-card").hidden = m !== "test";
+      document.getElementById("edit-controls").hidden = m !== "edit";
+      renderSamples();
+    }
+
+    function setPace(isObserve) {
+      observePace = isObserve;
+      document.getElementById("pace-obs").setAttribute("aria-pressed", String(isObserve));
+      document.getElementById("pace-fast").setAttribute("aria-pressed", String(!isObserve));
+    }
+
+    const sheet = document.getElementById("sheet");
+    const btnCode = document.getElementById("btn-code");
+    const btnAbout = document.getElementById("btn-about");
+
+    function openSheet(tab) {
+      sheetTab = tab;
+      sheet.hidden = false;
+      btnCode.setAttribute("aria-expanded", String(tab !== "about"));
+      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
+      for (const b of document.querySelectorAll(".sheet__tabs button")) {
+        b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+      }
+      document.getElementById("tab-code").hidden = tab !== "code";
+      document.getElementById("tab-ir").hidden = tab !== "ir";
+      document.getElementById("tab-about").hidden = tab !== "about";
+    }
+    function closeSheet() {
+      sheet.hidden = true;
+      btnCode.setAttribute("aria-expanded", "false");
+      btnAbout.setAttribute("aria-expanded", "false");
+    }
+
+    document.getElementById("pm-warp").onclick = () => { createTrainer(0); startTraining(true); };
+    document.getElementById("pm-soft").onclick = () => { createTrainer(1); startTraining(true); };
+    document.getElementById("btn-reset").onclick = () => createTrainer(paramMode);
+    document.getElementById("btn-train").onclick = () => {
+      if (isTraining) { stopTraining(); return; }
+      const fromScratch = ex.live_step(handle) >= 200;
+      startTraining(fromScratch);
+    };
+    document.getElementById("btn-synth").onclick = () => runSynthesize(true);
+    document.getElementById("view-net").onclick = () => setStageView("net");
+    document.getElementById("view-synth").onclick = () => { if (hasSynth) setStageView("synth"); };
+    document.getElementById("pace-obs").onclick = () => setPace(true);
+    document.getElementById("pace-fast").onclick = () => setPace(false);
+    document.getElementById("inf-soft").onclick = () => {
+      useHard = false;
+      document.getElementById("inf-soft").setAttribute("aria-pressed", "true");
+      document.getElementById("inf-hard").setAttribute("aria-pressed", "false");
+      runLiveInfer();
+    };
+    document.getElementById("inf-hard").onclick = () => {
+      useHard = true;
+      document.getElementById("inf-soft").setAttribute("aria-pressed", "false");
+      document.getElementById("inf-hard").setAttribute("aria-pressed", "true");
+      runLiveInfer();
+    };
+
+    document.getElementById("mode-test").onclick = () => setPadMode("test");
+    document.getElementById("mode-edit").onclick = () => setPadMode("edit");
+    document.getElementById("btn-clear").onclick = () => { canvasBits = 0; renderGrid(); runLiveInfer(); };
+    document.getElementById("btn-clear-edit").onclick = () => { canvasBits = 0; renderGrid(); runLiveInfer(); };
+    document.getElementById("btn-shift").onclick = () => {
+      let out = 0;
+      for (let r = 0; r < 5; r++) {
+        for (let c = 0; c < 5; c++) {
+          if ((canvasBits >> (r * 5 + c)) & 1) {
+            out |= 1 << (r * 5 + ((c + 1) % 5));
+          }
+        }
+      }
+      canvasBits = out;
+      renderGrid();
+      runLiveInfer();
+    };
+    document.getElementById("btn-noise").onclick = () => {
+      const bit = Math.floor(Math.random() * 25);
+      canvasBits ^= (1 << bit);
+      renderGrid();
+      runLiveInfer();
+    };
+
+    document.querySelectorAll("#cls-pick button").forEach((b) => {
+      b.onclick = () => { editClass = Number(b.dataset.c); renderSamples(); };
+    });
+    document.getElementById("btn-add-sample").onclick = () => {
+      if (canvasBits === 0) return;
+      samples.push({ bits: canvasBits, label: editClass });
+      syncSamplesToWasm();
+      renderSamples();
+      updateMetricsUI();
+      startTraining(true);
+    };
+    document.querySelectorAll(".preset-btn").forEach((b) => {
+      b.onclick = () => loadPreset(b.dataset.preset);
+    });
+
+    btnCode.onclick = () => (!sheet.hidden && sheetTab !== "about") ? closeSheet() : openSheet("code");
+    btnAbout.onclick = () => (!sheet.hidden && sheetTab === "about") ? closeSheet() : openSheet("about");
+    document.getElementById("open-code").onclick = () => openSheet("code");
+    document.getElementById("open-ir").onclick = () => openSheet("ir");
+    document.getElementById("sheet-close").onclick = closeSheet;
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    document.querySelectorAll(".sheet__tabs button").forEach((b) => {
+      b.onclick = () => openSheet(b.dataset.tab);
+    });
+    document.getElementById("btn-copy-code").onclick = () => { navigator.clipboard?.writeText(generatedCode); };
+    document.getElementById("btn-copy-ir").onclick = () => { navigator.clipboard?.writeText(generatedIrRaw); };
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => { renderLossChart(); }).observe(document.getElementById("loss-chart"));
+    }
+
+    async function boot() {
+      const wasmResp = await fetch("../dist/app.wasm");
+      const wasmBytes = await wasmResp.arrayBuffer();
+      wasmKB = `${(wasmBytes.byteLength / 1024).toFixed(0)} KB`;
+
+      const program = await instantiate({
+        write(_stream, _bytes) { return true; },
+        host: {
+          read_input() { return 0; },
+          give_bytes(host, kind, ptr, len) {
+            const text = new TextDecoder().decode(host.readBytes(ptr, len));
+            if (kind === 0) generatedCode = text;
+            if (kind === 1) {
+              generatedIrRaw = text;
+              try { generatedIr = JSON.parse(text); } catch { generatedIr = null; }
+            }
+          },
+        },
+      });
+      program.start();
+      ex = program.exports;
+
+      document.getElementById("foot-stat").textContent = `${wasmKB} .wasm · kizu wasm32-browser`;
+      renderGrid();
+      renderSamples();
+      createTrainer(0);
+
+      // Step 0（未学習の灰色 120 ゲート）を 0.45 秒見せてから、観察モード（3.2秒）で学習開始
+      setTimeout(() => startTraining(true), 450);
+    }
+
+    boot();
+  </script>
+</body>
+</html>

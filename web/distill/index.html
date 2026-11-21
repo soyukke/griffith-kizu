@@ -1,0 +1,1034 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>distill/ — 日本語マイクロ秒ルーター（知識蒸留）| griffith/</title>
+  <meta name="description" content="実数 Teacher MLP から日本語意図ルーターを論理ゲート回路へ KL 知識蒸留し、論理合成を経て乗算 0 回・重み 0 B の WASM で 1 文字打つたびにマイクロ秒推論する実験室。">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="../fonts/martian-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Martian Mono';
+      font-style: normal;
+      font-display: swap;
+      font-weight: 100 800;
+      src: url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations'),
+           url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2');
+    }
+
+    :root {
+      color-scheme: light;
+      --paper: #f2f0e9;
+      --sheet: #faf9f3;
+      --ink: #141412;
+      --muted: #68665e;
+      --rule: #cfccc0;
+      --grid: #e3e0d6;
+      --tri: #e8e5db;
+      --accent: #ff4d00;
+      --accent-tint: #fff0e8;
+      --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --jp: 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--jp);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .app {
+      height: 100dvh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow: hidden;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--ink);
+      background: var(--paper);
+      min-height: 48px;
+    }
+    .identity { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+    .mark {
+      font-family: var(--mono);
+      font-weight: 800;
+      font-stretch: 75%;
+      font-size: clamp(20px, 2vw, 25px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      white-space: nowrap;
+    }
+    .mark .slash { color: var(--accent); }
+    .mark:hover { color: var(--accent); }
+    h1 { margin: 0; font-size: clamp(13px, 1.2vw, 15px); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tagline { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+
+    .bar__right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; min-width: 96px; }
+    .btn--go:hover:not(:disabled) { background: #e54400; border-color: #e54400; color: #fff; }
+
+    /* 中央 3 カラム（スクロールなし） */
+    .desk {
+      display: grid;
+      grid-template-columns: clamp(256px, 25vw, 304px) minmax(0, 1fr) clamp(256px, 23vw, 304px);
+      gap: 14px;
+      padding: 11px 16px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .block-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; color: var(--ink); white-space: nowrap; }
+    .kicker-mono { font-family: var(--mono), var(--jp); font-size: 10px; color: var(--muted); white-space: nowrap; }
+    .kicker-mono b { color: var(--accent); }
+
+    /* 左カラム：日本語リアルタイム入力 & 64bit UTF-8 指紋 & 追加学習 */
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .lblock {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 6px;
+    }
+    .lblock:first-child { border-top: 0; padding-top: 0; }
+
+    .jp-input {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1.5px solid var(--ink);
+      background: var(--sheet);
+      font-size: 13.5px;
+      font-weight: 600;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip {
+      padding: 3px 7px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+    .chip:hover { border-color: var(--ink); color: var(--ink); background: var(--tri); }
+
+    /* 64-bit UTF-8 バイナリ指紋グリッド */
+    .fp-grid {
+      display: grid;
+      grid-template-columns: repeat(16, 1fr);
+      gap: 2px;
+      padding: 6px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+    }
+    .fp-bit {
+      aspect-ratio: 1;
+      border-radius: 1.5px;
+      background: var(--paper);
+      border: 1px solid var(--grid);
+      transition: background 80ms;
+    }
+    .fp-bit.on { background: var(--accent); border-color: var(--accent); }
+
+    .add-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .add-row button {
+      padding: 4px 2px;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--muted);
+      border-right: 1px solid var(--rule);
+    }
+    .add-row button:last-child { border-right: 0; }
+    .add-row button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+
+    .mini-btn {
+      min-height: 28px;
+      padding: 0 10px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .mini-btn:hover { border-color: var(--ink); background: var(--tri); }
+
+    /* 中央ステージ：3 モデル同時判定 + 蒸留学習カーブ */
+    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      gap: 10px;
+      padding: 12px 16px 10px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--rule);
+      background-color: var(--sheet);
+      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
+      background-size: 20px 20px;
+      background-position: 9px 9px;
+    }
+    .stage::before, .stage::after {
+      content: '';
+      pointer-events: none;
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: solid var(--muted);
+      opacity: 0.45;
+    }
+    .stage::before { top: 8px; left: 8px; border-width: 1px 0 0 1px; }
+    .stage::after { right: 8px; bottom: 8px; border-width: 0 1px 1px 0; }
+
+    .stage-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .stage-title { font-size: 13px; font-weight: 800; }
+
+    .cards3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .mcard {
+      padding: 10px 11px;
+      background: var(--paper);
+      border: 1px solid var(--rule);
+      display: grid;
+      gap: 7px;
+    }
+    .mcard--kd {
+      background: var(--sheet);
+      border: 1.5px solid var(--accent);
+    }
+    .mcard__head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; }
+    .mcard__name { font-size: 11px; font-weight: 800; }
+    .mcard__tag { font-family: var(--mono); font-size: 9.5px; color: var(--muted); }
+    .mcard--kd .mcard__tag { color: var(--accent); font-weight: 700; }
+    .mcard__verdict {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding-bottom: 5px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .mcard__verdict strong { font-size: 17px; font-weight: 800; }
+    .mcard--kd .mcard__verdict strong { color: var(--accent); }
+    .mcard__verdict span { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+    .bars4 { display: grid; gap: 4px; }
+    .brow {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr) 36px;
+      align-items: center;
+      gap: 5px;
+      font-size: 10px;
+    }
+    .brow .v { font-family: var(--mono); text-align: right; color: var(--muted); font-size: 9.5px; }
+    .track { height: 6px; background: var(--tri); border-radius: 2px; overflow: hidden; }
+    .fill { height: 100%; background: var(--ink); transition: width 120ms; }
+    .fill--acc { background: var(--accent); }
+
+    /* 蒸留学習カーブ */
+    .chart-panel {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 5px;
+      min-height: 0;
+      overflow: hidden;
+      padding: 8px 10px;
+      background: var(--paper);
+      border: 1px solid var(--rule);
+    }
+    #distill-chart { width: 100%; height: 100%; display: block; min-height: 0; }
+
+    .pace-toggle {
+      display: inline-flex;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      padding: 1px;
+      background: var(--sheet);
+    }
+    .pace-toggle button { padding: 1px 7px; border-radius: 999px; font-size: 9.5px; font-weight: 700; color: var(--muted); }
+    .pace-toggle button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+
+    .stage-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 11px; color: var(--muted); }
+    .legend { display: flex; gap: 12px; font-family: var(--mono), var(--jp); font-size: 10px; }
+    .lg-i { display: inline-flex; align-items: center; gap: 4px; }
+    .lg-l { width: 11px; height: 2px; display: inline-block; }
+
+    /* 右カラム：未知文精度 & 論理合成 & 速度ベンチ */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .rblock { border-top: 1px solid var(--rule); padding-top: 8px; display: grid; gap: 6px; min-width: 0; }
+    .rblock:first-child { border-top: 0; padding-top: 0; }
+
+    .acc-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .acc-cell {
+      padding: 6px 8px;
+      border-right: 1px solid var(--rule);
+      border-bottom: 1px solid var(--rule);
+      display: grid;
+      gap: 1px;
+    }
+    .acc-cell:nth-child(2n) { border-right: 0; }
+    .acc-cell:nth-last-child(-n+2) { border-bottom: 0; }
+    .acc-cell span { font-size: 9.5px; color: var(--muted); }
+    .acc-cell strong { font-family: var(--mono); font-size: 13px; font-weight: 800; }
+    .acc-cell strong.accent { color: var(--accent); }
+
+    .big-num { font-family: var(--mono); font-size: 19px; font-weight: 800; letter-spacing: -0.04em; line-height: 1.1; }
+    .big-num .arr { color: var(--muted); font-weight: 400; margin: 0 3px; }
+    .big-num .opt { color: var(--accent); }
+    .pass-chips { display: flex; flex-wrap: wrap; gap: 4px; font-family: var(--mono); font-size: 9.5px; color: var(--muted); }
+    .pass-chips span { padding: 1px 5px; background: var(--sheet); border: 1px solid var(--grid); }
+
+    .speed-bars { display: grid; gap: 6px; }
+    .srow { display: grid; grid-template-columns: 64px minmax(0, 1fr) 62px; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10px; }
+    .srow .lbl { color: var(--muted); }
+    .srow .val { text-align: right; font-weight: 800; }
+
+    .action-tile {
+      min-height: 32px;
+      padding: 0 11px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--sheet);
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .action-tile:hover { border-color: var(--ink); background: var(--tri); }
+    .action-tile span { font-family: var(--mono); color: var(--accent); }
+
+    .foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 5px 16px;
+      border-top: 1px solid var(--rule);
+      font-size: 10.5px;
+      color: var(--muted);
+      background: var(--paper);
+      min-height: 28px;
+    }
+    .foot-mono { font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+    .foot-mono a:hover { color: var(--accent); }
+    .foot-mid { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .sheet { position: fixed; inset: 0; background: rgba(20, 20, 18, 0.28); z-index: 30; }
+    .sheet__body {
+      position: absolute;
+      top: 56px;
+      right: 16px;
+      width: min(560px, calc(100vw - 24px));
+      max-height: calc(100dvh - 76px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: 12px;
+      box-shadow: 0 18px 46px rgba(20, 20, 18, 0.18);
+      overflow: hidden;
+    }
+    .sheet__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--rule); background: var(--sheet); }
+    .sheet__tabs { display: flex; gap: 4px; }
+    .sheet__tabs button { min-height: 28px; padding: 0 10px; border-radius: 999px; font-size: 11.5px; font-weight: 700; color: var(--muted); }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+    .sheet__close { width: 28px; height: 28px; border-radius: 999px; border: 1px solid var(--rule); font-family: var(--mono); font-size: 14px; display: grid; place-items: center; }
+    .sheet__content { padding: 14px 16px; overflow-y: auto; min-height: 0; }
+    pre.code { margin: 0; padding: 12px; background: var(--sheet); border: 1px solid var(--rule); font-family: var(--mono); font-size: 10.5px; line-height: 1.5; overflow-x: auto; white-space: pre; }
+    .about-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+    .about-list li { padding: 10px 12px; background: var(--sheet); border: 1px solid var(--rule); }
+    .about-list strong { display: block; margin-bottom: 3px; font-size: 12px; }
+    .about-list p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+    .about-step { font-family: var(--mono); color: var(--accent); margin-right: 6px; }
+
+    @media (max-width: 1040px) {
+      .tagline, .foot-mid { display: none; }
+      .desk { grid-template-columns: 240px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; gap: 10px; padding: 8px 12px; }
+      .left-col { grid-row: 1 / 3; }
+      .stage-col { grid-column: 2; grid-row: 1; }
+      .right-col { grid-column: 2; grid-row: 2; flex-direction: row; gap: 10px; }
+      .rblock { border-top: 0; border-left: 1px solid var(--rule); padding-top: 0; padding-left: 10px; flex: 1; }
+      .rblock:first-child { border-left: 0; padding-left: 0; }
+      .rblock--hide-md { display: none; }
+    }
+    @media (max-width: 720px) {
+      h1 { display: none; }
+      .desk { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+      .left-col .lblock:not(:first-child), .right-col { display: none; }
+      .stage-col { grid-column: 1; grid-row: 2; }
+      .cards3 { grid-template-columns: 1fr; }
+      .chart-panel { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="identity">
+        <a class="mark" href="../" aria-label="griffith/ デモ一覧へ戻る">griffith<span class="slash">/</span></a>
+        <h1>日本語マイクロ秒ルーター（知識蒸留）</h1>
+        <span class="tagline">distill/ · UTF-8 64bit → FP Teacher → KL蒸留 LUT</span>
+      </div>
+      <div class="bar__right">
+        <button type="button" class="btn" id="btn-code" aria-expanded="false">生成コード</button>
+        <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
+        <button type="button" class="btn btn--go" id="btn-distill">蒸留を再実行</button>
+      </div>
+    </header>
+
+    <main class="desk">
+      <!-- 左：リアルタイム日本語入力 & 64bit UTF-8 指紋 -->
+      <section class="left-col" aria-label="日本語テキスト入力と特徴">
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">日本語を入力（1文字ごとに即判定）</span>
+            <span class="kicker-mono" id="keystroke-us">-</span>
+          </div>
+          <input class="jp-input" id="jp-in" type="text" value="どうやって論理ゲートで動くんですか？" placeholder="日本語を打ってみてください…">
+          <div class="chips" id="sample-chips">
+            <button type="button" class="chip">どうやって論理ゲートで動くんですか？</button>
+            <button type="button" class="chip">この画面のデザインを直してお願い</button>
+            <button type="button" class="chip">めちゃくちゃ速くて最高！ありがとう</button>
+            <button type="button" class="chip">エラーが出て保存できず困った</button>
+            <button type="button" class="chip">設定はどこにありますか？</button>
+            <button type="button" class="chip">新しい機能を作ってほしいです</button>
+          </div>
+        </div>
+
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">UTF-8 N-gram 64-bit 指紋（辞書 0 B）</span>
+            <span class="kicker-mono" id="fp-pop">0 / 64 bit</span>
+          </div>
+          <div class="fp-grid" id="fp-grid" aria-label="64ビット UTF-8 特徴ビット"></div>
+          <span class="kicker-mono">日本語 1 文字 = UTF-8 3 バイトをそのままビット化</span>
+        </div>
+
+        <div class="lblock">
+          <div class="block-head">
+            <span class="kicker">入力文を学習データに追加</span>
+            <span class="kicker-mono" id="data-count">学習 24 + 無ラベル 32</span>
+          </div>
+          <div class="add-row" id="add-cls" role="group" aria-label="追加する正解クラス">
+            <button type="button" data-c="0" aria-pressed="true">質問</button>
+            <button type="button" data-c="1" aria-pressed="false">依頼</button>
+            <button type="button" data-c="2" aria-pressed="false">称賛</button>
+            <button type="button" data-c="3" aria-pressed="false">不満</button>
+          </div>
+          <button type="button" class="mini-btn" id="btn-add-text">この文を登録して再蒸留する</button>
+        </div>
+      </section>
+
+      <!-- 中央：3モデル同時判定 & 蒸留カーブ -->
+      <section class="stage-col" aria-label="Teacher vs Scratch vs KL蒸留比較">
+        <div class="stage">
+          <div class="stage-head">
+            <span class="stage-title">実数 Teacher → 論理ゲート回路（乗算 0 回）のリアルタイム比較</span>
+            <span class="kicker-mono" id="distill-status">初期化中…</span>
+          </div>
+
+          <div class="cards3">
+            <div class="mcard">
+              <div class="mcard__head"><span class="mcard__name">Teacher (FP32 MLP)</span><span class="mcard__tag">2,176 乗算</span></div>
+              <div class="mcard__verdict"><strong id="v-teacher">-</strong><span id="v-teacher-sub">確率</span></div>
+              <div class="bars4" id="bars-teacher"></div>
+            </div>
+            <div class="mcard">
+              <div class="mcard__head"><span class="mcard__name">Student A (Scratch)</span><span class="mcard__tag">0 乗算 · CEのみ</span></div>
+              <div class="mcard__verdict"><strong id="v-scratch">-</strong><span id="v-scratch-sub">/8 票</span></div>
+              <div class="bars4" id="bars-scratch"></div>
+            </div>
+            <div class="mcard mcard--kd">
+              <div class="mcard__head"><span class="mcard__name">Student B (KL蒸留＋合成)</span><span class="mcard__tag">0 乗算 · 0 B</span></div>
+              <div class="mcard__verdict"><strong id="v-kd">-</strong><span id="v-kd-sub">/8 票</span></div>
+              <div class="bars4" id="bars-kd"></div>
+            </div>
+          </div>
+
+          <div class="chart-panel">
+            <div class="block-head">
+              <span class="kicker">未知日本語 16 文の精度カーブ（Scratch vs KL 蒸留）</span>
+              <div class="pace-toggle" role="group" aria-label="再生ペース">
+                <button type="button" id="pace-obs" aria-pressed="true">観察 3s</button>
+                <button type="button" id="pace-fast" aria-pressed="false">最速</button>
+              </div>
+            </div>
+            <svg id="distill-chart" aria-label="蒸留学習カーブ"></svg>
+          </div>
+
+          <div class="stage-foot">
+            <div class="legend" aria-hidden="true">
+              <span class="lg-i"><i class="lg-l" style="background:#ff4d00"></i>KL 蒸留 LUT（未知精度）</span>
+              <span class="lg-i"><i class="lg-l" style="background:#141412"></i>Scratch LUT（未知精度）</span>
+              <span class="lg-i"><i class="lg-l" style="border-top:1.5px dashed #8b887d;height:0"></i>FP Teacher 天井</span>
+            </div>
+            <span class="kicker-mono" id="real-ms">WASM 実計算 -</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右：未知精度サマリ・論理合成圧縮・速度ベンチ -->
+      <aside class="right-col" aria-label="蒸留精度と速度実測">
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">未知の日本語テスト精度</span>
+            <span class="kicker-mono">16 文ホールドアウト</span>
+          </div>
+          <div class="acc-grid">
+            <div class="acc-cell"><span>FP Teacher</span><strong id="a-teacher">-</strong></div>
+            <div class="acc-cell"><span>Scratch LUT</span><strong id="a-scratch">-</strong></div>
+            <div class="acc-cell"><span>KL 蒸留 LUT</span><strong class="accent" id="a-kd">-</strong></div>
+            <div class="acc-cell"><span>Teacher 一致率</span><strong id="a-agree">-</strong></div>
+          </div>
+        </div>
+
+        <div class="rblock rblock--hide-md">
+          <div class="block-head">
+            <span class="kicker">論理合成（蒸留回路の圧縮）</span>
+            <span class="kicker-mono"><b id="s-pct">-</b></span>
+          </div>
+          <div class="big-num" id="s-gates">160<span class="arr">→</span><span class="opt">-</span></div>
+          <div class="pass-chips" id="s-chips"><span>定数畳込 -</span><span>短絡 -</span><span>CSE -</span><span>DCE -</span></div>
+        </div>
+
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">ブラウザ WASM 速度比較</span>
+            <span class="kicker-mono"><b id="b-speedup">-</b></span>
+          </div>
+          <div class="speed-bars">
+            <div class="srow"><span class="lbl">FP Teacher</span><div class="track"><div class="fill" id="b-fp" style="width:100%"></div></div><span class="val" id="b-fp-val">-</span></div>
+            <div class="srow"><span class="lbl">蒸留 64並列</span><div class="track"><div class="fill fill--acc" id="b-vm" style="width:6%"></div></div><span class="val" id="b-vm-val">-</span></div>
+          </div>
+          <span class="kicker-mono">重み 0 B · 乗算 0 回 · 辞書 0 B</span>
+        </div>
+
+        <div class="rblock rblock--hide-md">
+          <button type="button" class="action-tile" id="open-code">蒸留済み Kizu AOT コードを見る <span>→</span></button>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
+      <span class="foot-mid">日本語 UTF-8 N-gram → 実数 Teacher 学習 → 論理ゲートへ KL 蒸留 → 論理合成（乗算 0 回・重み 0 B WASM）</span>
+      <span class="foot-mono" id="foot-stat">kizu wasm32-browser</span>
+    </footer>
+
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="生成コードとしくみ">
+        <div class="sheet__head">
+          <div class="sheet__tabs" role="tablist">
+            <button type="button" role="tab" data-tab="code" aria-selected="true">生成 Kizu コード</button>
+            <button type="button" role="tab" data-tab="about" aria-selected="false">蒸留ルーターのしくみ</button>
+          </div>
+          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+        </div>
+        <div class="sheet__content">
+          <div id="tab-code">
+            <div class="block-head" style="margin-bottom:8px">
+              <span class="kicker-mono" id="code-note">KL 蒸留＋論理合成で生成された重みゼロ日本語ルーター（aot_jp_router_64）</span>
+              <button type="button" class="mini-btn" id="btn-copy">コピー</button>
+            </div>
+            <pre class="code" id="code-pre">// 蒸留・合成の完了後にここへ生成されます</pre>
+          </div>
+          <div id="tab-about" hidden>
+            <ul class="about-list">
+              <li>
+                <strong><span class="about-step">01</span>辞書 0 B の UTF-8 コードポイント N-gram 64-bit 指紋</strong>
+                <p>UTF-8 の文字境界から漢字・カタカナの 1 文字特徴と 2 文字バイグラムを直接ハッシュし、語彙辞書ゼロのまま高密度にならない約 25% 活性の 64-bit 特徴ベクトルへ変換します。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">02</span>実数 Teacher（2,176 乗算）からラベルなし日本語経由で KL 蒸留</strong>
+                <p>同じ初期配線・160 LUT 構成（第1層 N=4 WARP + 2/3層 N=2）の 2 生徒を比較します。Scratch はラベル付き 24 文のみ CE 学習するのに対し、KL 蒸留生徒は Teacher がラベルなし日本語ログ 32 文へ付けた柔らかい確率分布まで丸ごと吸収して未知文の汎化精度を引き上げます。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">03</span>論理合成＋64 並列ビットスライスで数十 ns/文の超高速ルーティング</strong>
+                <p>蒸留後の回路に DCE / CSE / 定数畳み込みをかけて数十ゲートへ圧縮。1 文字打つたびに乗算 0 回で応答するキャッシュ常駐エッジ分類器になります。</p>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { instantiate } from "../dist/app.mjs";
+
+    const CLASSES = ["質問", "依頼", "称賛", "不満"];
+
+    const TRAIN_DATA = [
+      // 0: 質問（ラベル付き 6文）
+      ["これどうやって使うんですか？", 0], ["なぜ論理ゲートで動くのですか？", 0],
+      ["料金プランの違いを教えて？", 0], ["設定はどこにありますか？", 0],
+      ["対応しているブラウザは何ですか？", 0], ["オフラインでも使えますか？", 0],
+      // 1: 依頼（ラベル付き 6文）
+      ["この画面のデザインを直して", 1], ["明日までに資料をまとめてお願い", 1],
+      ["新しいデモページを作ってほしい", 1], ["日本語の要約をお願いします", 1],
+      ["ライトモードに変更してください", 1], ["テストを全部回しておいてお願い", 1],
+      // 2: 称賛（ラベル付き 6文）
+      ["めちゃくちゃ速くて最高！ありがとう", 2], ["すごくわかりやすい！助かりました", 2],
+      ["素晴らしいデザインですね！感動", 2], ["とても綺麗に動いて嬉しい！", 2],
+      ["神ツールすぎる！本当にありがとう", 2], ["軽くて気持ちいい！最高です", 2],
+      // 3: 不満・バグ（ラベル付き 6文）
+      ["エラーが出て全く動かない", 3], ["重すぎてフリーズして困った", 3],
+      ["バグで保存できず最悪です", 3], ["読み込みが遅くて失敗する", 3],
+      ["文字が崩れて読めない不具合", 3], ["クラッシュしてデータが消えた", 3],
+    ];
+
+    // ラベルなし日本語ログ（人手ラベル一切なし：FP Teacher が柔らかい確率分布を付けて KL 蒸留にだけ使う）
+    const UNLABELED_DATA = [
+      "どうやって設定を変更しますか？", "仕組みを詳しく教えてください？",
+      "保存先はどのフォルダですか？", "無料でも使えますか？",
+      "どこから始めればよいですか？", "なぜこんなに速いのですか？",
+      "どのファイルを見ればいいですか？", "日本語入力に対応していますか？",
+      "グラフを追加してほしいお願い", "コードを綺麗に直してください",
+      "この色を変更してほしいです", "資料を短くまとめてください",
+      "ボタンの位置を調整してお願い", "レポートを作成お願いします",
+      "新しい画面を追加してください", "設定をリセットしてほしいお願い",
+      "見やすくて完璧！助かる！", "想像以上にすごくて感動した！",
+      "すごく軽くて最高ですね！", "本当にわかりやすい！ありがとう！",
+      "綺麗で使いやすい！嬉しい！", "デザイン最高すぎる！感謝！",
+      "とても快適で素晴らしい！", "めちゃくちゃ助かりました！最高！",
+      "ボタンを押しても反応しないエラー", "スクロールがガタついて使いにくい",
+      "画面が真っ白で表示されない不具合", "保存に失敗して消えた最悪",
+      "起動が遅くてフリーズして困る", "バグが多くて全く使えない",
+      "エラー表示が出て止まって困った", "読み込みエラーで落ちる不具合",
+    ];
+
+    const VAL_DATA = [
+      // 0: 質問（未知 4文）
+      ["どうやって動いているの？", 0], ["どこから設定を変えますか？", 0],
+      ["使い方を教えていただけますか？", 0], ["なぜ乗算ゼロで動くんですか？", 0],
+      // 1: 依頼（未知 4文）
+      ["ここを直してほしいお願い", 1], ["新しい画面を作ってください", 1],
+      ["要約をまとめてお願いします", 1], ["デザインを変更してください", 1],
+      // 2: 称賛（未知 4文）
+      ["すごく速くてありがとう！", 2], ["最高にわかりやすい！助かる！", 2],
+      ["デザインが綺麗で感動した！", 2], ["軽くて快適！素晴らしい！", 2],
+      // 3: 不満（未知 4文）
+      ["エラーで動かない困った", 3], ["バグで失敗して最悪です", 3],
+      ["重すぎて反応しない不具合", 3], ["フリーズして消えた最悪", 3],
+    ];
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svgEl = (tag, attrs = {}, text = null) => {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+      if (text !== null) el.textContent = text;
+      return el;
+    };
+
+    const encoder = new TextEncoder();
+    const slotBuffers = { 1: new Uint8Array(0) };
+
+    let ex = null;
+    let handle = 0;
+    let seed = 18;
+    let trainSet = TRAIN_DATA.map(([text, label]) => ({ text, label }));
+    let valSet = VAL_DATA.map(([text, label]) => ({ text, label }));
+    let addClass = 0;
+    let observePace = true;
+    let isRunning = false;
+    let rafId = 0;
+    let history = [];
+    let generatedCode = "";
+    let sheetTab = "code";
+
+    // 64bit 指紋グリッド DOM
+    const fpGrid = document.getElementById("fp-grid");
+    const fpCells = [];
+    for (let i = 0; i < 64; i++) {
+      const c = document.createElement("div");
+      c.className = "fp-bit";
+      fpGrid.appendChild(c);
+      fpCells.push(c);
+    }
+
+    function sendTextToSlot(str) {
+      const bytes = encoder.encode(str);
+      slotBuffers[1] = bytes;
+      return bytes.byteLength;
+    }
+
+    function loadDatasetIntoWasm() {
+      ex.distill_clear(handle);
+      for (const s of trainSet) {
+        const len = sendTextToSlot(s.text);
+        ex.distill_add_text(handle, len, s.label, 0);
+      }
+      for (const u of UNLABELED_DATA) {
+        const len = sendTextToSlot(u);
+        ex.distill_add_text(handle, len, -1, 2);
+      }
+      for (const s of valSet) {
+        const len = sendTextToSlot(s.text);
+        ex.distill_add_text(handle, len, s.label, 1);
+      }
+      document.getElementById("data-count").textContent = `学習 ${trainSet.length} + 無ラベル ${UNLABELED_DATA.length}`;
+    }
+
+    function renderInfer() {
+      if (!ex || !handle) return;
+      const text = document.getElementById("jp-in").value || "";
+      const len = sendTextToSlot(text);
+      const t0 = performance.now();
+      ex.distill_infer(handle, len);
+      const t1 = performance.now();
+      document.getElementById("keystroke-us").textContent = `${((t1 - t0) * 1000).toFixed(0)} µs (JS+WASM)`;
+
+      const tPred = ex.distill_result(handle, 3, 0);
+      const sPred = ex.distill_result(handle, 3, 1);
+      const kPred = ex.distill_result(handle, 3, 2);
+      const pop = ex.distill_result(handle, 3, 3);
+
+      document.getElementById("fp-pop").textContent = `${pop} / 64 bit`;
+      for (let i = 0; i < 64; i++) {
+        fpCells[i].classList.toggle("on", ex.distill_fp_bit(handle, i) !== 0);
+      }
+
+      document.getElementById("v-teacher").textContent = CLASSES[tPred];
+      document.getElementById("v-scratch").textContent = CLASSES[sPred];
+      document.getElementById("v-kd").textContent = CLASSES[kPred];
+      document.getElementById("v-kd-sub").textContent = kPred === tPred ? "Teacher 一致" : "不一致";
+
+      const renderBars = (elId, which, pred, isProb) => {
+        const el = document.getElementById(elId);
+        el.innerHTML = "";
+        for (let c = 0; c < 4; c++) {
+          const v = ex.distill_result(handle, which, c);
+          const pct = isProb ? (v / 10) : (v / 8) * 100;
+          const row = document.createElement("div");
+          row.className = "brow";
+          row.innerHTML =
+            `<span>${CLASSES[c]}</span>` +
+            `<div class="track"><div class="fill ${c === pred ? "fill--acc" : ""}" style="width:${Math.max(2, pct).toFixed(1)}%"></div></div>` +
+            `<span class="v">${isProb ? `${(v / 10).toFixed(0)}%` : `${v}/8`}</span>`;
+          el.appendChild(row);
+        }
+      };
+      renderBars("bars-teacher", 0, tPred, true);
+      renderBars("bars-scratch", 1, sPred, false);
+      renderBars("bars-kd", 2, kPred, false);
+    }
+
+    function updateMetricsAndChart() {
+      const tVal = ex.distill_metric_milli(handle, 1) / 1000;
+      const sVal = ex.distill_metric_milli(handle, 4) / 1000;
+      const kVal = ex.distill_metric_milli(handle, 7) / 1000;
+      const agree = ex.distill_metric_milli(handle, 8) / 1000;
+
+      document.getElementById("a-teacher").textContent = `${Math.round(tVal * 100)}%`;
+      document.getElementById("a-scratch").textContent = `${Math.round(sVal * 100)}%`;
+      document.getElementById("a-kd").textContent = `${Math.round(kVal * 100)}%`;
+      document.getElementById("a-agree").textContent = `${Math.round(agree * 100)}%`;
+
+      const svg = document.getElementById("distill-chart");
+      svg.innerHTML = "";
+      const rect = svg.getBoundingClientRect();
+      const W = Math.max(200, Math.round(rect.width || 540));
+      const H = Math.max(90, Math.round(rect.height || 130));
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+      const ml = 38, mr = 14, mt = 12, mb = 22;
+      const pw = Math.max(40, W - ml - mr), ph = Math.max(30, H - mt - mb);
+
+      for (let i = 0; i <= 4; i++) {
+        const y = Math.round(mt + (ph * i) / 4) + 0.5;
+        svg.appendChild(svgEl("line", { x1: ml, y1: y, x2: W - mr, y2: y, stroke: i === 4 ? "#cfccc0" : "#e3e0d6", "stroke-width": 1 }));
+      }
+      svg.appendChild(svgEl("text", { x: ml - 6, y: mt + 4, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 10, fill: "#68665e" }, "100%"));
+      svg.appendChild(svgEl("text", { x: ml - 6, y: Math.round(mt + ph * 0.5) + 4, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 10, fill: "#68665e" }, "50%"));
+      svg.appendChild(svgEl("text", { x: ml - 6, y: mt + ph + 3, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 10, fill: "#68665e" }, "0%"));
+
+      const maxS = 240;
+      svg.appendChild(svgEl("text", { x: ml, y: H - 5, "font-family": "var(--mono)", "font-size": 10, fill: "#68665e" }, "step 0"));
+      svg.appendChild(svgEl("text", { x: W - mr, y: H - 5, "text-anchor": "end", "font-family": "var(--mono)", "font-size": 10, fill: "#68665e" }, `step ${maxS}`));
+
+      // FP Teacher 天井ライン
+      const yT = Math.round(mt + (1 - tVal) * ph) + 0.5;
+      svg.appendChild(svgEl("line", { x1: ml, y1: yT, x2: W - mr, y2: yT, stroke: "#8b887d", "stroke-width": 1.4, "stroke-dasharray": "4 3" }));
+
+      if (history.length < 1) return;
+      const xOf = (s) => ml + (Math.min(s, maxS) / maxS) * pw;
+      const yOf = (v) => mt + (1 - Math.min(1, Math.max(0, v))) * ph;
+      const mk = (fn) => history.map((pt, i) => `${i === 0 ? "M" : "L"}${xOf(pt.step).toFixed(1)},${yOf(fn(pt)).toFixed(1)}`).join(" ");
+
+      svg.appendChild(svgEl("path", { d: mk((p) => p.sVal), fill: "none", stroke: "#141412", "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+      svg.appendChild(svgEl("path", { d: mk((p) => p.kVal), fill: "none", stroke: "#ff4d00", "stroke-width": 2.4, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+
+      const last = history[history.length - 1];
+      svg.appendChild(svgEl("circle", { cx: xOf(last.step), cy: yOf(last.sVal), r: 3.2, fill: "#141412" }));
+      svg.appendChild(svgEl("circle", { cx: xOf(last.step), cy: yOf(last.kVal), r: 3.6, fill: "#ff4d00" }));
+    }
+
+    function finishAndSynthesize(realWasmMs) {
+      const optG = ex.distill_synthesize(handle);
+      const rawG = ex.distill_synth_stat(handle, 0);
+      const pct = (((rawG - optG) / Math.max(rawG, 1)) * 100).toFixed(1);
+      const cf = ex.distill_synth_stat(handle, 4);
+      const pr = ex.distill_synth_stat(handle, 5) + ex.distill_synth_stat(handle, 6);
+      const cse = ex.distill_synth_stat(handle, 7);
+      const dce = ex.distill_synth_stat(handle, 8);
+
+      document.getElementById("s-gates").innerHTML = `${rawG}<span class="arr">→</span><span class="opt">${optG}</span>`;
+      document.getElementById("s-pct").textContent = `-${pct}%`;
+      document.getElementById("s-chips").innerHTML = `<span>定数畳込 ${cf}</span><span>短絡 ${pr}</span><span>CSE ${cse}</span><span>DCE ${dce}</span>`;
+
+      ex.distill_emit_code(handle);
+      document.getElementById("code-pre").textContent = generatedCode;
+      document.getElementById("code-note").textContent =
+        `KL 蒸留＋論理合成（${rawG} → ${optG} ゲート・-${pct}%）で生成された重みゼロ日本語ルーター（aot_jp_router_64）`;
+
+      // 速度実測: FP Teacher (single) vs Synthesized Bit-Slice VM (64-way)
+      ex.distill_bench(handle, 0, 200);
+      ex.distill_bench(handle, 1, 200);
+      const fpIters = 2000;
+      const vmIters = 20000;
+      const t0 = performance.now();
+      ex.distill_bench(handle, 0, fpIters);
+      const t1 = performance.now();
+      ex.distill_bench(handle, 1, vmIters);
+      const t2 = performance.now();
+
+      const fpNs = ((t1 - t0) * 1e6) / fpIters;
+      const vmNs = ((t2 - t1) * 1e6) / (vmIters * 64);
+      const ratio = fpNs / Math.max(vmNs, 0.1);
+
+      document.getElementById("b-fp-val").textContent = `${(fpNs / 1000).toFixed(2)} µs`;
+      document.getElementById("b-vm-val").textContent = `${vmNs.toFixed(1)} ns`;
+      document.getElementById("b-speedup").textContent = `${ratio.toFixed(0)}× 高速`;
+      document.getElementById("b-vm").style.width = `${Math.max(3, Math.min(100, (vmNs / Math.max(fpNs, 1)) * 100)).toFixed(1)}%`;
+
+      document.getElementById("distill-status").innerHTML = `蒸留・論理合成 完了`;
+      document.getElementById("real-ms").innerHTML = `WASM 実計算 <b>${realWasmMs.toFixed(1)} ms</b>`;
+      renderInfer();
+    }
+
+    function startDistillation() {
+      if (isRunning) {
+        isRunning = false;
+        if (rafId) cancelAnimationFrame(rafId);
+        document.getElementById("btn-distill").textContent = "蒸留を再実行";
+        return;
+      }
+
+      seed = (seed + 7) >>> 0;
+      handle = ex.distill_create(seed) >>> 0;
+      loadDatasetIntoWasm();
+      history = [];
+
+      // 1. 実数 FP Teacher を学習
+      const t0 = performance.now();
+      ex.distill_train_teacher(handle, 80, 30);
+      let realWasmMs = performance.now() - t0;
+
+      // 初期状態（Step 0）記録
+      ex.distill_train_students(handle, 0, 80);
+      history.push({
+        step: 0,
+        sVal: ex.distill_metric_milli(handle, 4) / 1000,
+        kVal: ex.distill_metric_milli(handle, 7) / 1000,
+      });
+      updateMetricsAndChart();
+      renderInfer();
+
+      isRunning = true;
+      document.getElementById("btn-distill").textContent = "停止";
+      const totalSteps = 240;
+      const minVisualMs = observePace ? 3000 : 0;
+      const startAnim = performance.now();
+      let curStep = 0;
+
+      function tick(now) {
+        if (!isRunning) return;
+        let delta = 0;
+        if (observePace) {
+          const u = Math.min(1, Math.max(0, (now - startAnim) / minVisualMs));
+          const desired = Math.round(Math.pow(u, 1.3) * totalSteps);
+          delta = Math.min(8, Math.max(0, desired - curStep));
+          if (u >= 1 && curStep < totalSteps) delta = totalSteps - curStep;
+        } else {
+          delta = Math.min(25, totalSteps - curStep);
+        }
+
+        if (delta > 0) {
+          const s0 = performance.now();
+          curStep = ex.distill_train_students(handle, delta, 60);
+          realWasmMs += (performance.now() - s0);
+          history.push({
+            step: curStep,
+            sVal: ex.distill_metric_milli(handle, 4) / 1000,
+            kVal: ex.distill_metric_milli(handle, 7) / 1000,
+          });
+          document.getElementById("distill-status").innerHTML = `KL 蒸留中 Step <b>${curStep}</b>/${totalSteps}`;
+          document.getElementById("real-ms").innerHTML = `WASM 実計算 <b>${realWasmMs.toFixed(1)} ms</b>` + (observePace ? " · 観察再生" : "");
+          updateMetricsAndChart();
+          renderInfer();
+        }
+
+        if (curStep >= totalSteps) {
+          isRunning = false;
+          rafId = 0;
+          document.getElementById("btn-distill").textContent = "蒸留を再実行";
+          finishAndSynthesize(realWasmMs);
+          return;
+        }
+        rafId = requestAnimationFrame(tick);
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+
+    // シート
+    const sheet = document.getElementById("sheet"), btnCode = document.getElementById("btn-code"), btnAbout = document.getElementById("btn-about");
+    function openSheet(tab) {
+      sheetTab = tab; sheet.hidden = false;
+      btnCode.setAttribute("aria-expanded", String(tab === "code"));
+      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
+      document.querySelectorAll(".sheet__tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+      document.getElementById("tab-code").hidden = tab !== "code";
+      document.getElementById("tab-about").hidden = tab !== "about";
+    }
+    function closeSheet() { sheet.hidden = true; btnCode.setAttribute("aria-expanded", "false"); btnAbout.setAttribute("aria-expanded", "false"); }
+
+    document.getElementById("jp-in").addEventListener("input", renderInfer);
+    document.querySelectorAll("#sample-chips button").forEach((b) => {
+      b.onclick = () => { document.getElementById("jp-in").value = b.textContent; renderInfer(); };
+    });
+    document.querySelectorAll("#add-cls button").forEach((b) => {
+      b.onclick = () => {
+        addClass = Number(b.dataset.c);
+        document.querySelectorAll("#add-cls button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      };
+    });
+    document.getElementById("btn-add-text").onclick = () => {
+      const txt = (document.getElementById("jp-in").value || "").trim();
+      if (!txt) return;
+      trainSet.push({ text: txt, label: addClass });
+      startDistillation();
+    };
+    document.getElementById("pace-obs").onclick = () => {
+      observePace = true;
+      document.getElementById("pace-obs").setAttribute("aria-pressed", "true");
+      document.getElementById("pace-fast").setAttribute("aria-pressed", "false");
+    };
+    document.getElementById("pace-fast").onclick = () => {
+      observePace = false;
+      document.getElementById("pace-obs").setAttribute("aria-pressed", "false");
+      document.getElementById("pace-fast").setAttribute("aria-pressed", "true");
+    };
+    document.getElementById("btn-distill").onclick = startDistillation;
+    btnCode.onclick = () => (!sheet.hidden && sheetTab === "code") ? closeSheet() : openSheet("code");
+    btnAbout.onclick = () => (!sheet.hidden && sheetTab === "about") ? closeSheet() : openSheet("about");
+    document.getElementById("open-code").onclick = () => openSheet("code");
+    document.getElementById("sheet-close").onclick = closeSheet;
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    document.querySelectorAll(".sheet__tabs button").forEach((b) => { b.onclick = () => openSheet(b.dataset.tab); });
+    document.getElementById("btn-copy").onclick = () => { navigator.clipboard?.writeText(generatedCode); };
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => { if (ex && handle) updateMetricsAndChart(); }).observe(document.getElementById("distill-chart"));
+    }
+
+    async function boot() {
+      const wasmResp = await fetch("../dist/app.wasm");
+      const kb = `${((await wasmResp.arrayBuffer()).byteLength / 1024).toFixed(0)} KB`;
+      const program = await instantiate({
+        write() { return true; },
+        host: {
+          read_input(host, slot, offset, ptr, cap) {
+            const src = slotBuffers[slot];
+            if (!src || offset >= src.byteLength) return 0;
+            const end = Math.min(src.byteLength, offset + (cap >>> 0));
+            return host.writeBytes(ptr, src.subarray(offset, end));
+          },
+          give_bytes(host, kind, ptr, len) {
+            if (kind === 0) generatedCode = new TextDecoder().decode(host.readBytes(ptr, len));
+          },
+        },
+      });
+      program.start();
+      ex = program.exports;
+      document.getElementById("foot-stat").textContent = `${kb} .wasm · kizu wasm32-browser`;
+      setTimeout(() => startDistillation(), 300);
+    }
+
+    boot();
+  </script>
+</body>
+</html>

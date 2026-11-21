@@ -1,0 +1,1209 @@
+import griffith::core;
+import griffith::data;
+import griffith::lut;
+import std::array;
+import std::math;
+import std::mem;
+import std::string;
+
+pub enum LadderRung {
+    L0,
+    L0b,
+    L1,
+    L2,
+    L3c,
+}
+
+pub enum EvalMode {
+    Train,
+    EvalSoft,
+    EvalHard,
+}
+
+pub struct LadderConfig {
+    pub vocab_size: i64,
+    pub seq_len: i64,
+    pub d_model: i64,
+    pub n_heads: i64,
+    pub n_layers: i64,
+    pub ffn_hidden: i64,
+    pub ffn_gates: i64,
+    pub ffn_group_factor: i64,
+    pub qkv_n_inputs: i64,
+    pub ffn_n_inputs: i64,
+    pub max_batch: i64,
+    pub rung: LadderRung,
+    pub attn_tau: f32,
+    pub attn_gumbel_scale: f32,
+}
+
+pub fn rung_uses_logic_ffn(rung: LadderRung) -> bool {
+    match rung {
+        L0 => { return false; },
+        L0b => { return true; },
+        L1 => { return true; },
+        L2 => { return true; },
+        L3c => { return true; },
+    }
+}
+
+pub fn rung_uses_logic_qkv(rung: LadderRung) -> bool {
+    match rung {
+        L0 => { return false; },
+        L0b => { return false; },
+        L1 => { return true; },
+        L2 => { return true; },
+        L3c => { return true; },
+    }
+}
+
+pub fn rung_uses_xnor(rung: LadderRung) -> bool {
+    match rung {
+        L0 => { return false; },
+        L0b => { return false; },
+        L1 => { return false; },
+        L2 => { return true; },
+        L3c => { return true; },
+    }
+}
+
+pub fn rung_uses_mux(rung: LadderRung) -> bool {
+    match rung {
+        L0 => { return false; },
+        L0b => { return false; },
+        L1 => { return false; },
+        L2 => { return false; },
+        L3c => { return true; },
+    }
+}
+
+pub struct LadderBlock {
+    pub d_model: i64,
+    pub n_heads: i64,
+    pub seq_len: i64,
+    pub ffn_hidden: i64,
+    pub ffn_gates: i64,
+    pub ffn_group_factor: i64,
+    pub rung: LadderRung,
+    pub attn_tau: f32,
+    pub attn_gumbel_scale: f32,
+
+    pub ln1: LayerNorm,
+    pub ln2: LayerNorm,
+
+    // FP attention (L0, L0b)
+    pub wq: LinearLayer,
+    pub wk: LinearLayer,
+    pub wv: LinearLayer,
+    pub wo: LinearLayer,
+
+    // Logic attention projections (L1, L2, L3c)
+    pub lq: lut::LutLayer,
+    pub lk: lut::LutLayer,
+    pub lv: lut::LutLayer,
+
+    // FP FFN (L0)
+    pub fc1: LinearLayer,
+    pub fc2: LinearLayer,
+
+    // Logic FFN (L0b..L3c)
+    pub ffn_lut1: lut::LutLayer,
+    pub ffn_lut2: lut::LutLayer,
+    pub ffn_gs: lut::GroupSum,
+
+    // Learnable scalars: [0]=score_scale, [1]=attn_out_scale, [2]=ffn_out_scale
+    pub scalars: array::Array<f32>,
+    pub g_scalars: array::Array<f32>,
+    pub m_scalars: array::Array<f32>,
+    pub v_scalars: array::Array<f32>,
+
+    // Saved activations for backward
+    pub buf_ln1: array::Array<f32>,
+    pub buf_bin1: array::Array<f32>,
+    pub buf_q: array::Array<f32>,
+    pub buf_k: array::Array<f32>,
+    pub buf_v: array::Array<f32>,
+    pub buf_attn_soft: array::Array<f32>,
+    pub buf_attn_hard: array::Array<f32>,
+    pub buf_ctx: array::Array<f32>,
+    pub buf_ln2: array::Array<f32>,
+    pub buf_bin2: array::Array<f32>,
+    pub buf_ffn_h1: array::Array<f32>,
+    pub buf_ffn_h2: array::Array<f32>,
+    pub buf_ffn_gs: array::Array<f32>,
+}
+
+pub fn (self: LadderBlock) deinit(allocator: Allocator) -> void {
+    self.ln1.deinit(allocator);
+    self.ln2.deinit(allocator);
+    self.wq.deinit(allocator);
+    self.wk.deinit(allocator);
+    self.wv.deinit(allocator);
+    self.wo.deinit(allocator);
+    self.lq.deinit(allocator);
+    self.lk.deinit(allocator);
+    self.lv.deinit(allocator);
+    self.fc1.deinit(allocator);
+    self.fc2.deinit(allocator);
+    self.ffn_lut1.deinit(allocator);
+    self.ffn_lut2.deinit(allocator);
+    self.scalars.deinit(allocator);
+    self.g_scalars.deinit(allocator);
+    self.m_scalars.deinit(allocator);
+    self.v_scalars.deinit(allocator);
+    self.buf_ln1.deinit(allocator);
+    self.buf_bin1.deinit(allocator);
+    self.buf_q.deinit(allocator);
+    self.buf_k.deinit(allocator);
+    self.buf_v.deinit(allocator);
+    self.buf_attn_soft.deinit(allocator);
+    self.buf_attn_hard.deinit(allocator);
+    self.buf_ctx.deinit(allocator);
+    self.buf_ln2.deinit(allocator);
+    self.buf_bin2.deinit(allocator);
+    self.buf_ffn_h1.deinit(allocator);
+    self.buf_ffn_h2.deinit(allocator);
+    self.buf_ffn_gs.deinit(allocator);
+    return;
+}
+
+fn ladder_block_new(
+    allocator: Allocator,
+    cfg: &LadderConfig,
+    rng: &var core::Rng
+) -> mem::Error!LadderBlock {
+    let d = cfg.d_model;
+    let max_bt = cfg.max_batch * cfg.seq_len;
+    let ffn_out_bits = d * cfg.ffn_group_factor;
+    let max_ffn1 = if cfg.ffn_hidden > cfg.ffn_gates { cfg.ffn_hidden } else { cfg.ffn_gates };
+    let max_ffn2 = if cfg.ffn_hidden > ffn_out_bits { cfg.ffn_hidden } else { ffn_out_bits };
+
+    // Use small dummy sizes for unused path so memory stays tiny while keeping one struct type.
+    let fp_qkv_dim = if rung_uses_logic_qkv(cfg.rung) { 1 } else { d };
+    let fp_qkv_bt = if rung_uses_logic_qkv(cfg.rung) { 1 } else { max_bt };
+    let lg_qkv_dim = if rung_uses_logic_qkv(cfg.rung) { d } else { 2 };
+    let lg_qkv_bt = if rung_uses_logic_qkv(cfg.rung) { max_bt } else { 1 };
+    let lg_qkv_n = if rung_uses_logic_qkv(cfg.rung) { cfg.qkv_n_inputs } else { 2 };
+
+    let fp_ffn_h = if rung_uses_logic_ffn(cfg.rung) { 1 } else { cfg.ffn_hidden };
+    let fp_ffn_d = if rung_uses_logic_ffn(cfg.rung) { 1 } else { d };
+    let fp_ffn_bt = if rung_uses_logic_ffn(cfg.rung) { 1 } else { max_bt };
+    let lg_ffn_in = if rung_uses_logic_ffn(cfg.rung) { d } else { 2 };
+    let lg_ffn_g = if rung_uses_logic_ffn(cfg.rung) { cfg.ffn_gates } else { 2 };
+    let lg_ffn_out = if rung_uses_logic_ffn(cfg.rung) { ffn_out_bits } else { 2 };
+    let lg_ffn_bt = if rung_uses_logic_ffn(cfg.rung) { max_bt } else { 1 };
+
+    let qkv_sel = lut::SelectMode::GumbelSt;
+    let ffn_sel = lut::SelectMode::GumbelSt;
+
+    var ln1 = try layernorm_new(allocator, d, max_bt);
+    errdefer ln1.deinit(allocator);
+    var ln2 = try layernorm_new(allocator, d, max_bt);
+    errdefer ln2.deinit(allocator);
+
+    var wq = try linear_new(allocator, fp_qkv_dim, fp_qkv_dim, fp_qkv_bt, rng);
+    errdefer wq.deinit(allocator);
+    var wk = try linear_new(allocator, fp_qkv_dim, fp_qkv_dim, fp_qkv_bt, rng);
+    errdefer wk.deinit(allocator);
+    var wv = try linear_new(allocator, fp_qkv_dim, fp_qkv_dim, fp_qkv_bt, rng);
+    errdefer wv.deinit(allocator);
+    var wo = try linear_new(allocator, fp_qkv_dim, fp_qkv_dim, fp_qkv_bt, rng);
+    errdefer wo.deinit(allocator);
+
+    var lq = try lut::lut_layer_new(allocator, lg_qkv_dim, lg_qkv_dim, lg_qkv_n, lut::ParamMode::Warp, qkv_sel, 1.0, 0.25, lg_qkv_bt, rng);
+    errdefer lq.deinit(allocator);
+    var lk = try lut::lut_layer_new(allocator, lg_qkv_dim, lg_qkv_dim, lg_qkv_n, lut::ParamMode::Warp, qkv_sel, 1.0, 0.25, lg_qkv_bt, rng);
+    errdefer lk.deinit(allocator);
+    var lv = try lut::lut_layer_new(allocator, lg_qkv_dim, lg_qkv_dim, lg_qkv_n, lut::ParamMode::Warp, qkv_sel, 1.0, 0.25, lg_qkv_bt, rng);
+    errdefer lv.deinit(allocator);
+
+    var fc1 = try linear_new(allocator, fp_ffn_d, fp_ffn_h, fp_ffn_bt, rng);
+    errdefer fc1.deinit(allocator);
+    var fc2 = try linear_new(allocator, fp_ffn_h, fp_ffn_d, fp_ffn_bt, rng);
+    errdefer fc2.deinit(allocator);
+
+    var ffn_lut1 = try lut::lut_layer_new(allocator, lg_ffn_in, lg_ffn_g, cfg.ffn_n_inputs, lut::ParamMode::Warp, ffn_sel, 1.0, 0.25, lg_ffn_bt, rng);
+    errdefer ffn_lut1.deinit(allocator);
+    var ffn_lut2 = try lut::lut_layer_new(allocator, lg_ffn_g, lg_ffn_out, cfg.ffn_n_inputs, lut::ParamMode::Warp, ffn_sel, 1.0, 0.25, lg_ffn_bt, rng);
+    errdefer ffn_lut2.deinit(allocator);
+    let ffn_gs = lut::groupsum_new(ffn_out_bits, d, cast<f32>(cfg.ffn_group_factor));
+
+    var scalars = try core::alloc_f32(allocator, 3);
+    errdefer scalars.deinit(allocator);
+    var g_scalars = try core::alloc_f32(allocator, 3);
+    errdefer g_scalars.deinit(allocator);
+    var m_scalars = try core::alloc_f32(allocator, 3);
+    errdefer m_scalars.deinit(allocator);
+    var v_scalars = try core::alloc_f32(allocator, 3);
+    errdefer v_scalars.deinit(allocator);
+
+    let sc_s = scalars.as_mut_slice();
+    sc_s[0] = 1.0;
+    sc_s[1] = 0.5;
+    sc_s[2] = 0.5;
+
+    let attn_len = cfg.max_batch * cfg.n_heads * cfg.seq_len * cfg.seq_len;
+    var buf_ln1 = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_ln1.deinit(allocator);
+    var buf_bin1 = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_bin1.deinit(allocator);
+    var buf_q = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_q.deinit(allocator);
+    var buf_k = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_k.deinit(allocator);
+    var buf_v = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_v.deinit(allocator);
+    var buf_attn_soft = try core::alloc_f32(allocator, attn_len);
+    errdefer buf_attn_soft.deinit(allocator);
+    var buf_attn_hard = try core::alloc_f32(allocator, attn_len);
+    errdefer buf_attn_hard.deinit(allocator);
+    var buf_ctx = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_ctx.deinit(allocator);
+    var buf_ln2 = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_ln2.deinit(allocator);
+    var buf_bin2 = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_bin2.deinit(allocator);
+    var buf_ffn_h1 = try core::alloc_f32(allocator, max_bt * max_ffn1);
+    errdefer buf_ffn_h1.deinit(allocator);
+    var buf_ffn_h2 = try core::alloc_f32(allocator, max_bt * max_ffn2);
+    errdefer buf_ffn_h2.deinit(allocator);
+    var buf_ffn_gs = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_ffn_gs.deinit(allocator);
+
+    return LadderBlock {
+        d_model: d,
+        n_heads: cfg.n_heads,
+        seq_len: cfg.seq_len,
+        ffn_hidden: cfg.ffn_hidden,
+        ffn_gates: cfg.ffn_gates,
+        ffn_group_factor: cfg.ffn_group_factor,
+        rung: cfg.rung,
+        attn_tau: cfg.attn_tau,
+        attn_gumbel_scale: cfg.attn_gumbel_scale,
+        ln1: move ln1,
+        ln2: move ln2,
+        wq: move wq,
+        wk: move wk,
+        wv: move wv,
+        wo: move wo,
+        lq: move lq,
+        lk: move lk,
+        lv: move lv,
+        fc1: move fc1,
+        fc2: move fc2,
+        ffn_lut1: move ffn_lut1,
+        ffn_lut2: move ffn_lut2,
+        ffn_gs: ffn_gs,
+        scalars: move scalars,
+        g_scalars: move g_scalars,
+        m_scalars: move m_scalars,
+        v_scalars: move v_scalars,
+        buf_ln1: move buf_ln1,
+        buf_bin1: move buf_bin1,
+        buf_q: move buf_q,
+        buf_k: move buf_k,
+        buf_v: move buf_v,
+        buf_attn_soft: move buf_attn_soft,
+        buf_attn_hard: move buf_attn_hard,
+        buf_ctx: move buf_ctx,
+        buf_ln2: move buf_ln2,
+        buf_bin2: move buf_bin2,
+        buf_ffn_h1: move buf_ffn_h1,
+        buf_ffn_h2: move buf_ffn_h2,
+        buf_ffn_gs: move buf_ffn_gs,
+    };
+}
+
+fn block_zero_grad(blk: &var LadderBlock) -> void {
+    layernorm_zero_grad(&var blk.ln1);
+    layernorm_zero_grad(&var blk.ln2);
+    let gsc = blk.g_scalars.as_mut_slice();
+    core::zero_f32(gsc);
+    if rung_uses_logic_qkv(blk.rung) {
+        lut::lut_zero_grad(&var blk.lq);
+        lut::lut_zero_grad(&var blk.lk);
+        lut::lut_zero_grad(&var blk.lv);
+    } else {
+        linear_zero_grad(&var blk.wq);
+        linear_zero_grad(&var blk.wk);
+        linear_zero_grad(&var blk.wv);
+        linear_zero_grad(&var blk.wo);
+    }
+    if rung_uses_logic_ffn(blk.rung) {
+        lut::lut_zero_grad(&var blk.ffn_lut1);
+        lut::lut_zero_grad(&var blk.ffn_lut2);
+    } else {
+        linear_zero_grad(&var blk.fc1);
+        linear_zero_grad(&var blk.fc2);
+    }
+    return;
+}
+
+fn block_adamw_step(blk: &var LadderBlock, lr_fp: f32, lr_lut: f32, wd: f32, step: i64) -> void {
+    layernorm_adamw_step(&var blk.ln1, lr_fp, step);
+    layernorm_adamw_step(&var blk.ln2, lr_fp, step);
+    let sc = blk.scalars.as_mut_slice();
+    let gsc = blk.g_scalars.as_slice();
+    let msc = blk.m_scalars.as_mut_slice();
+    let vsc = blk.v_scalars.as_mut_slice();
+    lut::adamw_update_slice(sc, gsc, msc, vsc, lr_fp, 0.9, 0.999, 1e-8, 0.0, step);
+
+    if rung_uses_logic_qkv(blk.rung) {
+        lut::lut_adamw_step(&var blk.lq, lr_lut, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var blk.lk, lr_lut, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var blk.lv, lr_lut, 0.9, 0.999, 1e-8, 0.0, step);
+    } else {
+        linear_adamw_step(&var blk.wq, lr_fp, wd, step);
+        linear_adamw_step(&var blk.wk, lr_fp, wd, step);
+        linear_adamw_step(&var blk.wv, lr_fp, wd, step);
+        linear_adamw_step(&var blk.wo, lr_fp, wd, step);
+    }
+    if rung_uses_logic_ffn(blk.rung) {
+        lut::lut_adamw_step(&var blk.ffn_lut1, lr_lut, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var blk.ffn_lut2, lr_lut, 0.9, 0.999, 1e-8, 0.0, step);
+    } else {
+        linear_adamw_step(&var blk.fc1, lr_fp, wd, step);
+        linear_adamw_step(&var blk.fc2, lr_fp, wd, step);
+    }
+    return;
+}
+
+fn lut_forward_mode(
+    layer: &var lut::LutLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32,
+    mode: EvalMode,
+    rng: &var core::Rng
+) -> void {
+    match mode {
+        Train => {
+            lut::lut_forward(layer, x, batch, out, true, rng);
+        },
+        EvalSoft => {
+            let saved_sel = layer.select_mode;
+            layer.select_mode = lut::SelectMode::Soft;
+            lut::lut_forward(layer, x, batch, out, true, rng);
+            layer.select_mode = saved_sel;
+        },
+        EvalHard => {
+            lut::lut_forward(layer, x, batch, out, false, rng);
+        },
+    }
+    return;
+}
+
+fn block_forward(
+    blk: &var LadderBlock,
+    x_in: []f32,
+    batch: i64,
+    seq_len: i64,
+    x_out: &var []f32,
+    tmp_proj: &var []f32,
+    mode: EvalMode,
+    rng: &var core::Rng
+) -> void {
+    let bt = batch * seq_len;
+    let d = blk.d_model;
+    let n_heads = blk.n_heads;
+    let dk = d / n_heads;
+    let inv_sqrt_dk = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(dk)));
+    let use_lqkv = rung_uses_logic_qkv(blk.rung);
+    let use_xnor = rung_uses_xnor(blk.rung);
+    let use_mux_rung = rung_uses_mux(blk.rung);
+    let use_lffn = rung_uses_logic_ffn(blk.rung);
+
+    var is_train = false;
+    var is_eval_soft = false;
+    match mode {
+        Train => { is_train = true; },
+        EvalSoft => { is_eval_soft = true; },
+        EvalHard => {},
+    }
+    let use_mux = use_mux_rung and !is_eval_soft;
+
+    let sc = blk.scalars.as_slice();
+    let score_scale = sc[0];
+    let attn_out_scale = sc[1];
+    let ffn_out_scale = sc[2];
+
+    let ln1_s = blk.buf_ln1.as_mut_slice();
+    let bin1_s = blk.buf_bin1.as_mut_slice();
+    let q_s = blk.buf_q.as_mut_slice();
+    let k_s = blk.buf_k.as_mut_slice();
+    let v_s = blk.buf_v.as_mut_slice();
+    let a_soft = blk.buf_attn_soft.as_mut_slice();
+    let a_hard = blk.buf_attn_hard.as_mut_slice();
+    let ctx_s = blk.buf_ctx.as_mut_slice();
+
+    // 1. Pre-LN1 + Q/K/V projections
+    layernorm_forward(&var blk.ln1, x_in, bt, ln1_s);
+    if use_lqkv {
+        binarize_forward_ste(ln1_s, bin1_s, bt * d);
+        lut_forward_mode(&var blk.lq, bin1_s, bt, q_s, mode, rng);
+        lut_forward_mode(&var blk.lk, bin1_s, bt, k_s, mode, rng);
+        lut_forward_mode(&var blk.lv, bin1_s, bt, v_s, mode, rng);
+    } else {
+        linear_forward(&var blk.wq, ln1_s, bt, q_s);
+        linear_forward(&var blk.wk, ln1_s, bt, k_s);
+        linear_forward(&var blk.wv, ln1_s, bt, v_s);
+    }
+
+    // 2. Causal multi-head attention
+    var scores = [256]f32{};
+    let sc_buf = scores.as_mut_slice();
+    let half_dk = cast<f32>(dk) * 0.5;
+    let inv_tau = 1.0 / blk.attn_tau;
+
+    for 0..batch |b| {
+        for 0..n_heads |h| {
+            let h_off = h * dk;
+            for 0..seq_len |t| {
+                let qt_off = (b * seq_len + t) * d + h_off;
+                let row_off = ((b * n_heads + h) * seq_len + t) * seq_len;
+
+                for 0..(t + 1) |s| {
+                    let ks_off = (b * seq_len + s) * d + h_off;
+                    var dot: f32 = 0.0;
+                    if !use_lqkv {
+                        for 0..dk |j| {
+                            dot = dot + q_s[qt_off + j] * k_s[ks_off + j];
+                        }
+                        sc_buf[s] = dot * inv_sqrt_dk;
+                    } else if !use_xnor {
+                        for 0..dk |j| {
+                            let qc = 2.0 * q_s[qt_off + j] - 1.0;
+                            let kc = 2.0 * k_s[ks_off + j] - 1.0;
+                            dot = dot + qc * kc;
+                        }
+                        sc_buf[s] = score_scale * dot * inv_sqrt_dk;
+                    } else {
+                        for 0..dk |j| {
+                            let qv = q_s[qt_off + j];
+                            let kv = k_s[ks_off + j];
+                            dot = dot + (1.0 - qv - kv + 2.0 * qv * kv);
+                        }
+                        sc_buf[s] = score_scale * (dot - half_dk) * inv_sqrt_dk;
+                    }
+                }
+
+                if use_mux {
+                    var best_s: i64 = 0;
+                    var best_v: f32 = -1e30;
+                    for 0..(t + 1) |s| {
+                        var noisy = sc_buf[s];
+                        if is_train {
+                            noisy = noisy + blk.attn_gumbel_scale * rng.next_gumbel_f32();
+                        } else {
+                            noisy = noisy + 1e-4 * cast<f32>(s) / cast<f32>(seq_len);
+                        }
+                        sc_buf[s] = noisy;
+                        if noisy > best_v {
+                            best_v = noisy;
+                            best_s = s;
+                        }
+                    }
+                    // Hard MUX one-hot for forward
+                    for 0..seq_len |s| {
+                        a_hard[row_off + s] = if s == best_s { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                    }
+                    // Soft Gumbel-Softmax weights saved for STE backward
+                    if is_train {
+                        var max_s = sc_buf[0] * inv_tau;
+                        for 1..(t + 1) |s| {
+                            let v = sc_buf[s] * inv_tau;
+                            if v > max_s { max_s = v; }
+                        }
+                        var sum_e: f64 = 0.0;
+                        for 0..(t + 1) |s| {
+                            let e = math::exp<f64>(cast<f64>(sc_buf[s] * inv_tau - max_s));
+                            a_soft[row_off + s] = cast<f32>(e);
+                            sum_e = sum_e + e;
+                        }
+                        let inv_sum = cast<f32>(1.0 / sum_e);
+                        for 0..(t + 1) |s| {
+                            a_soft[row_off + s] = a_soft[row_off + s] * inv_sum;
+                        }
+                        for (t + 1)..seq_len |s| {
+                            a_soft[row_off + s] = 0.0;
+                        }
+                    }
+                    // Pure MUX value selection (no weighted sum in eval!)
+                    let vw_off = (b * seq_len + best_s) * d + h_off;
+                    for 0..dk |j| {
+                        ctx_s[qt_off + j] = 2.0 * v_s[vw_off + j] - 1.0;
+                    }
+                } else {
+                    var max_s = sc_buf[0];
+                    for 1..(t + 1) |s| {
+                        if sc_buf[s] > max_s { max_s = sc_buf[s]; }
+                    }
+                    var sum_e: f64 = 0.0;
+                    for 0..(t + 1) |s| {
+                        let e = math::exp<f64>(cast<f64>(sc_buf[s] - max_s));
+                        a_soft[row_off + s] = cast<f32>(e);
+                        sum_e = sum_e + e;
+                    }
+                    let inv_sum = cast<f32>(1.0 / sum_e);
+                    for 0..(t + 1) |s| {
+                        let w = a_soft[row_off + s] * inv_sum;
+                        a_soft[row_off + s] = w;
+                        a_hard[row_off + s] = w;
+                    }
+                    for (t + 1)..seq_len |s| {
+                        a_soft[row_off + s] = 0.0;
+                        a_hard[row_off + s] = 0.0;
+                    }
+                    for 0..dk |j| {
+                        var acc: f32 = 0.0;
+                        if use_lqkv {
+                            for 0..(t + 1) |s| {
+                                let vs_off = (b * seq_len + s) * d + h_off;
+                                acc = acc + a_soft[row_off + s] * (2.0 * v_s[vs_off + j] - 1.0);
+                            }
+                        } else {
+                            for 0..(t + 1) |s| {
+                                let vs_off = (b * seq_len + s) * d + h_off;
+                                acc = acc + a_soft[row_off + s] * v_s[vs_off + j];
+                            }
+                        }
+                        ctx_s[qt_off + j] = acc;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Attention output projection + residual 1 -> x_out
+    if use_lqkv {
+        for 0..(bt * d) |i| {
+            x_out[i] = x_in[i] + attn_out_scale * ctx_s[i];
+        }
+    } else {
+        linear_forward(&var blk.wo, ctx_s, bt, tmp_proj);
+        for 0..(bt * d) |i| {
+            x_out[i] = x_in[i] + tmp_proj[i];
+        }
+    }
+
+    // 4. Pre-LN2 + FFN + residual 2 -> x_out
+    let ln2_s = blk.buf_ln2.as_mut_slice();
+    let bin2_s = blk.buf_bin2.as_mut_slice();
+    let h1_s = blk.buf_ffn_h1.as_mut_slice();
+    let h2_s = blk.buf_ffn_h2.as_mut_slice();
+    let fgs_s = blk.buf_ffn_gs.as_mut_slice();
+
+    layernorm_forward(&var blk.ln2, x_out, bt, ln2_s);
+    if use_lffn {
+        binarize_forward_ste(ln2_s, bin2_s, bt * d);
+        lut_forward_mode(&var blk.ffn_lut1, bin2_s, bt, h1_s, mode, rng);
+        lut_forward_mode(&var blk.ffn_lut2, h1_s, bt, h2_s, mode, rng);
+        lut::groupsum_forward(&blk.ffn_gs, h2_s, bt, fgs_s);
+        let center: f32 = 0.5;
+        for 0..(bt * d) |i| {
+            x_out[i] = x_out[i] + ffn_out_scale * (fgs_s[i] - center);
+        }
+    } else {
+        linear_forward(&var blk.fc1, ln2_s, bt, h1_s);
+        gelu_forward(h1_s, h2_s, bt * blk.ffn_hidden);
+        linear_forward(&var blk.fc2, h2_s, bt, tmp_proj);
+        for 0..(bt * d) |i| {
+            x_out[i] = x_out[i] + tmp_proj[i];
+        }
+    }
+    return;
+}
+
+fn block_backward(
+    blk: &var LadderBlock,
+    grad_out: []f32,
+    batch: i64,
+    seq_len: i64,
+    grad_in: &var []f32,
+    g_tmp1: &var []f32,
+    g_tmp2: &var []f32,
+    g_tmp3: &var []f32,
+    g_q: &var []f32,
+    g_k: &var []f32,
+    g_v: &var []f32
+) -> void {
+    let bt = batch * seq_len;
+    let d = blk.d_model;
+    let n_heads = blk.n_heads;
+    let dk = d / n_heads;
+    let inv_sqrt_dk = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(dk)));
+    let use_lqkv = rung_uses_logic_qkv(blk.rung);
+    let use_xnor = rung_uses_xnor(blk.rung);
+    let use_mux = rung_uses_mux(blk.rung);
+    let use_lffn = rung_uses_logic_ffn(blk.rung);
+
+    let sc = blk.scalars.as_slice();
+    let score_scale = sc[0];
+    let attn_out_scale = sc[1];
+    let ffn_out_scale = sc[2];
+    let gsc = blk.g_scalars.as_mut_slice();
+
+    // 1. Backward through FFN + residual 2 (g_tmp3 accumulates grad w.r.t. residual-1 output)
+    let ln2_s = blk.buf_ln2.as_slice();
+    let h1_s = blk.buf_ffn_h1.as_slice();
+    let fgs_s = blk.buf_ffn_gs.as_slice();
+
+    if use_lffn {
+        let center: f32 = 0.5;
+        var g_scale2: f64 = 0.0;
+        for 0..(bt * d) |i| {
+            g_scale2 = g_scale2 + cast<f64>(grad_out[i] * (fgs_s[i] - center));
+            g_tmp1[i] = grad_out[i] * ffn_out_scale;
+        }
+        gsc[2] = gsc[2] + cast<f32>(g_scale2);
+        lut::groupsum_backward(&blk.ffn_gs, g_tmp1, bt, g_tmp2);
+        lut::lut_backward(&var blk.ffn_lut2, g_tmp2, g_tmp1, true);
+        lut::lut_backward(&var blk.ffn_lut1, g_tmp1, g_tmp2, true);
+        binarize_backward_ste(ln2_s, g_tmp2, g_tmp1, bt * d);
+        layernorm_backward(&var blk.ln2, g_tmp1, g_tmp3);
+    } else {
+        linear_backward(&var blk.fc2, grad_out, g_tmp2, true);
+        gelu_backward(h1_s, g_tmp2, g_tmp1, bt * blk.ffn_hidden);
+        linear_backward(&var blk.fc1, g_tmp1, g_tmp2, true);
+        layernorm_backward(&var blk.ln2, g_tmp2, g_tmp3);
+    }
+
+    // Residual 2 gradient: g_res1 = grad_out + g_ln2_in (stored in g_tmp3)
+    for 0..(bt * d) |i| {
+        g_tmp3[i] = grad_out[i] + g_tmp3[i];
+    }
+
+    // 2. Backward through Attention output projection
+    let ctx_s = blk.buf_ctx.as_slice();
+    if use_lqkv {
+        var g_scale1: f64 = 0.0;
+        for 0..(bt * d) |i| {
+            g_scale1 = g_scale1 + cast<f64>(g_tmp3[i] * ctx_s[i]);
+            g_tmp1[i] = g_tmp3[i] * attn_out_scale;
+        }
+        gsc[1] = gsc[1] + cast<f32>(g_scale1);
+    } else {
+        linear_backward(&var blk.wo, g_tmp3, g_tmp1, true);
+    }
+
+    // 3. Backward through Causal Multi-Head Attention -> g_q, g_k, g_v
+    for 0..(bt * d) |i| {
+        g_q[i] = 0.0;
+        g_k[i] = 0.0;
+        g_v[i] = 0.0;
+    }
+
+    let q_s = blk.buf_q.as_slice();
+    let k_s = blk.buf_k.as_slice();
+    let v_s = blk.buf_v.as_slice();
+    let a_soft = blk.buf_attn_soft.as_slice();
+    let a_hard = blk.buf_attn_hard.as_slice();
+
+    var grad_w = [256]f32{};
+    let gw_buf = grad_w.as_mut_slice();
+    let half_dk = cast<f32>(dk) * 0.5;
+    let inv_tau: f32 = if use_mux { cast<f32>(1.0) / blk.attn_tau } else { cast<f32>(1.0) };
+    var g_score_scale: f64 = 0.0;
+
+    for 0..batch |b| {
+        for 0..n_heads |h| {
+            let h_off = h * dk;
+            for 0..seq_len |t| {
+                let qt_off = (b * seq_len + t) * d + h_off;
+                let row_off = ((b * n_heads + h) * seq_len + t) * seq_len;
+
+                var dot_gw_w: f32 = 0.0;
+                for 0..(t + 1) |s| {
+                    let vs_off = (b * seq_len + s) * d + h_off;
+                    let w_fwd = a_hard[row_off + s];
+                    let w_sft = a_soft[row_off + s];
+                    var dw: f32 = 0.0;
+                    if use_lqkv {
+                        for 0..dk |j| {
+                            let gc = g_tmp1[qt_off + j];
+                            dw = dw + gc * (2.0 * v_s[vs_off + j] - 1.0);
+                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc * 2.0;
+                        }
+                    } else {
+                        for 0..dk |j| {
+                            let gc = g_tmp1[qt_off + j];
+                            dw = dw + gc * v_s[vs_off + j];
+                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc;
+                        }
+                    }
+                    gw_buf[s] = dw;
+                    dot_gw_w = dot_gw_w + dw * w_sft;
+                }
+
+                for 0..(t + 1) |s| {
+                    let w_sft = a_soft[row_off + s];
+                    let ds = w_sft * (gw_buf[s] - dot_gw_w) * inv_tau;
+                    let ks_off = (b * seq_len + s) * d + h_off;
+                    if !use_lqkv {
+                        let ds_scaled = ds * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * k_s[ks_off + j];
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * q_s[qt_off + j];
+                        }
+                    } else if !use_xnor {
+                        var raw_dot: f32 = 0.0;
+                        let ds_scaled = ds * score_scale * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            let qc = 2.0 * q_s[qt_off + j] - 1.0;
+                            let kc = 2.0 * k_s[ks_off + j] - 1.0;
+                            raw_dot = raw_dot + qc * kc;
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * kc * 2.0;
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * qc * 2.0;
+                        }
+                        g_score_scale = g_score_scale + cast<f64>(ds * raw_dot * inv_sqrt_dk);
+                    } else {
+                        var xnor_sum: f32 = 0.0;
+                        let ds_scaled = ds * score_scale * inv_sqrt_dk;
+                        for 0..dk |j| {
+                            let qv = q_s[qt_off + j];
+                            let kv = k_s[ks_off + j];
+                            xnor_sum = xnor_sum + (1.0 - qv - kv + 2.0 * qv * kv);
+                            g_q[qt_off + j] = g_q[qt_off + j] + ds_scaled * (2.0 * kv - 1.0);
+                            g_k[ks_off + j] = g_k[ks_off + j] + ds_scaled * (2.0 * qv - 1.0);
+                        }
+                        g_score_scale = g_score_scale + cast<f64>(ds * (xnor_sum - half_dk) * inv_sqrt_dk);
+                    }
+                }
+            }
+        }
+    }
+    if use_lqkv {
+        gsc[0] = gsc[0] + cast<f32>(g_score_scale);
+    }
+
+    // 4. Backward through Q/K/V projections + LN1 + residual 1 -> grad_in
+    let ln1_s = blk.buf_ln1.as_slice();
+    if use_lqkv {
+        lut::lut_backward(&var blk.lq, g_q, g_tmp1, true);
+        lut::lut_backward(&var blk.lk, g_k, g_tmp2, true);
+        for 0..(bt * d) |i| {
+            g_tmp1[i] = g_tmp1[i] + g_tmp2[i];
+        }
+        lut::lut_backward(&var blk.lv, g_v, g_tmp2, true);
+        for 0..(bt * d) |i| {
+            g_tmp1[i] = g_tmp1[i] + g_tmp2[i];
+        }
+        binarize_backward_ste(ln1_s, g_tmp1, g_tmp2, bt * d);
+        layernorm_backward(&var blk.ln1, g_tmp2, g_tmp1);
+    } else {
+        linear_backward(&var blk.wq, g_q, g_tmp1, true);
+        linear_backward(&var blk.wk, g_k, g_tmp2, true);
+        for 0..(bt * d) |i| {
+            g_tmp1[i] = g_tmp1[i] + g_tmp2[i];
+        }
+        linear_backward(&var blk.wv, g_v, g_tmp2, true);
+        for 0..(bt * d) |i| {
+            g_tmp1[i] = g_tmp1[i] + g_tmp2[i];
+        }
+        layernorm_backward(&var blk.ln1, g_tmp1, g_tmp2);
+        for 0..(bt * d) |i| {
+            g_tmp1[i] = g_tmp2[i];
+        }
+    }
+
+    for 0..(bt * d) |i| {
+        grad_in[i] = g_tmp3[i] + g_tmp1[i];
+    }
+    return;
+}
+
+pub struct LogicLadderGPT {
+    pub cfg: LadderConfig,
+    pub tok_emb: Embedding,
+    pub pos_emb: Embedding,
+    pub blocks: array::Array<LadderBlock>,
+    pub final_ln: LayerNorm,
+    pub lm_head: LinearLayer,
+
+    // Reusable forward/backward workspace
+    pub layer_xs: array::Array<f32>,
+    pub buf_ln_final: array::Array<f32>,
+    pub buf_tmp_proj: array::Array<f32>,
+    pub grad_cur: array::Array<f32>,
+    pub grad_prev: array::Array<f32>,
+    pub g_tmp1: array::Array<f32>,
+    pub g_tmp2: array::Array<f32>,
+    pub g_tmp3: array::Array<f32>,
+    pub g_q: array::Array<f32>,
+    pub g_k: array::Array<f32>,
+    pub g_v: array::Array<f32>,
+}
+
+pub fn (self: LogicLadderGPT) deinit(allocator: Allocator) -> void {
+    self.tok_emb.deinit(allocator);
+    self.pos_emb.deinit(allocator);
+    self.blocks.deinit(allocator);
+    self.final_ln.deinit(allocator);
+    self.lm_head.deinit(allocator);
+    self.layer_xs.deinit(allocator);
+    self.buf_ln_final.deinit(allocator);
+    self.buf_tmp_proj.deinit(allocator);
+    self.grad_cur.deinit(allocator);
+    self.grad_prev.deinit(allocator);
+    self.g_tmp1.deinit(allocator);
+    self.g_tmp2.deinit(allocator);
+    self.g_tmp3.deinit(allocator);
+    self.g_q.deinit(allocator);
+    self.g_k.deinit(allocator);
+    self.g_v.deinit(allocator);
+    return;
+}
+
+pub fn ladder_gpt_new(
+    allocator: Allocator,
+    cfg: LadderConfig,
+    rng: &var core::Rng
+) -> mem::Error!LogicLadderGPT {
+    let d = cfg.d_model;
+    let max_bt = cfg.max_batch * cfg.seq_len;
+    let ffn_out_bits = d * cfg.ffn_group_factor;
+    var tmp_dim = d;
+    if cfg.ffn_hidden > tmp_dim { tmp_dim = cfg.ffn_hidden; }
+    if cfg.ffn_gates > tmp_dim { tmp_dim = cfg.ffn_gates; }
+    if ffn_out_bits > tmp_dim { tmp_dim = ffn_out_bits; }
+
+    var tok_emb = try embedding_new(allocator, cfg.vocab_size, d, rng);
+    errdefer tok_emb.deinit(allocator);
+    var pos_emb = try embedding_new(allocator, cfg.seq_len, d, rng);
+    errdefer pos_emb.deinit(allocator);
+
+    var blocks = array::new<LadderBlock>(allocator);
+    errdefer blocks.deinit(allocator);
+    for 0..cfg.n_layers |_| {
+        var blk = try ladder_block_new(allocator, &cfg, rng);
+        try blocks.append(allocator, move blk);
+    }
+
+    var final_ln = try layernorm_new(allocator, d, max_bt);
+    errdefer final_ln.deinit(allocator);
+    var lm_head = try linear_new(allocator, d, cfg.vocab_size, max_bt, rng);
+    errdefer lm_head.deinit(allocator);
+
+    var layer_xs = try core::alloc_f32(allocator, (cfg.n_layers + 1) * max_bt * d);
+    errdefer layer_xs.deinit(allocator);
+    var buf_ln_final = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_ln_final.deinit(allocator);
+    var buf_tmp_proj = try core::alloc_f32(allocator, max_bt * d);
+    errdefer buf_tmp_proj.deinit(allocator);
+    var grad_cur = try core::alloc_f32(allocator, max_bt * d);
+    errdefer grad_cur.deinit(allocator);
+    var grad_prev = try core::alloc_f32(allocator, max_bt * d);
+    errdefer grad_prev.deinit(allocator);
+    var g_tmp1 = try core::alloc_f32(allocator, max_bt * tmp_dim);
+    errdefer g_tmp1.deinit(allocator);
+    var g_tmp2 = try core::alloc_f32(allocator, max_bt * tmp_dim);
+    errdefer g_tmp2.deinit(allocator);
+    var g_tmp3 = try core::alloc_f32(allocator, max_bt * d);
+    errdefer g_tmp3.deinit(allocator);
+    var g_q = try core::alloc_f32(allocator, max_bt * d);
+    errdefer g_q.deinit(allocator);
+    var g_k = try core::alloc_f32(allocator, max_bt * d);
+    errdefer g_k.deinit(allocator);
+    var g_v = try core::alloc_f32(allocator, max_bt * d);
+    errdefer g_v.deinit(allocator);
+
+    return LogicLadderGPT {
+        cfg: cfg,
+        tok_emb: move tok_emb,
+        pos_emb: move pos_emb,
+        blocks: move blocks,
+        final_ln: move final_ln,
+        lm_head: move lm_head,
+        layer_xs: move layer_xs,
+        buf_ln_final: move buf_ln_final,
+        buf_tmp_proj: move buf_tmp_proj,
+        grad_cur: move grad_cur,
+        grad_prev: move grad_prev,
+        g_tmp1: move g_tmp1,
+        g_tmp2: move g_tmp2,
+        g_tmp3: move g_tmp3,
+        g_q: move g_q,
+        g_k: move g_k,
+        g_v: move g_v,
+    };
+}
+
+pub fn ladder_zero_grad(model: &var LogicLadderGPT) -> void {
+    embedding_zero_grad(&var model.tok_emb);
+    embedding_zero_grad(&var model.pos_emb);
+    for 0..model.cfg.n_layers |l| {
+        if model.blocks.at_mut(l) |blk| {
+            block_zero_grad(blk);
+        }
+    }
+    layernorm_zero_grad(&var model.final_ln);
+    linear_zero_grad(&var model.lm_head);
+    return;
+}
+
+pub fn ladder_adamw_step(model: &var LogicLadderGPT, lr_fp: f32, lr_lut: f32, wd: f32, step: i64) -> void {
+    embedding_adamw_step(&var model.tok_emb, lr_fp, wd, step);
+    embedding_adamw_step(&var model.pos_emb, lr_fp, wd, step);
+    for 0..model.cfg.n_layers |l| {
+        if model.blocks.at_mut(l) |blk| {
+            block_adamw_step(blk, lr_fp, lr_lut, wd, step);
+        }
+    }
+    layernorm_adamw_step(&var model.final_ln, lr_fp, step);
+    linear_adamw_step(&var model.lm_head, lr_fp, wd, step);
+    return;
+}
+
+pub fn ladder_forward(
+    model: &var LogicLadderGPT,
+    tokens: []i32,
+    batch: i64,
+    seq_len: i64,
+    logits_out: &var []f32,
+    mode: EvalMode,
+    rng: &var core::Rng
+) -> void {
+    let d = model.cfg.d_model;
+    let bt = batch * seq_len;
+    let stride = model.cfg.max_batch * model.cfg.seq_len * d;
+
+    let tok_w = model.tok_emb.w.as_slice();
+    let pos_w = model.pos_emb.w.as_slice();
+    let xs = model.layer_xs.as_mut_slice();
+    let tmp_p = model.buf_tmp_proj.as_mut_slice();
+
+    // 1. Token + positional embedding -> layer_xs[0]
+    for 0..batch |b| {
+        for 0..seq_len |t| {
+            let tok = cast<i64>(tokens[b * seq_len + t]);
+            let dst = (b * seq_len + t) * d;
+            let t_off = tok * d;
+            let p_off = t * d;
+            for 0..d |i| {
+                xs[dst + i] = tok_w[t_off + i] + pos_w[p_off + i];
+            }
+        }
+    }
+
+    // 2. Transformer blocks
+    let x_in_buf = model.grad_cur.as_mut_slice();
+    let x_out_buf = model.grad_prev.as_mut_slice();
+    for 0..model.cfg.n_layers |l| {
+        let in_off = l * stride;
+        let out_off = (l + 1) * stride;
+        for 0..(bt * d) |i| {
+            x_in_buf[i] = xs[in_off + i];
+        }
+        if model.blocks.at_mut(l) |blk| {
+            block_forward(blk, x_in_buf, batch, seq_len, x_out_buf, tmp_p, mode, rng);
+        }
+        for 0..(bt * d) |i| {
+            xs[out_off + i] = x_out_buf[i];
+        }
+    }
+
+    // 3. Final LN + LM Head
+    let last_off = model.cfg.n_layers * stride;
+    for 0..(bt * d) |i| {
+        x_in_buf[i] = xs[last_off + i];
+    }
+    let lnf = model.buf_ln_final.as_mut_slice();
+    layernorm_forward(&var model.final_ln, x_in_buf, bt, lnf);
+    linear_forward(&var model.lm_head, lnf, bt, logits_out);
+    return;
+}
+
+pub fn ladder_backward(
+    model: &var LogicLadderGPT,
+    tokens: []i32,
+    batch: i64,
+    seq_len: i64,
+    grad_logits: []f32
+) -> void {
+    let d = model.cfg.d_model;
+    let bt = batch * seq_len;
+
+    let gc = model.grad_cur.as_mut_slice();
+    let gp = model.grad_prev.as_mut_slice();
+    let gt1 = model.g_tmp1.as_mut_slice();
+    let gt2 = model.g_tmp2.as_mut_slice();
+    let gt3 = model.g_tmp3.as_mut_slice();
+    let gq = model.g_q.as_mut_slice();
+    let gk = model.g_k.as_mut_slice();
+    let gv = model.g_v.as_mut_slice();
+
+    // 1. LM Head + Final LN backward
+    linear_backward(&var model.lm_head, grad_logits, gp, true);
+    layernorm_backward(&var model.final_ln, gp, gc);
+
+    // 2. Blocks backward in reverse
+    var l = model.cfg.n_layers - 1;
+    while l >= 0 {
+        if model.blocks.at_mut(l) |blk| {
+            block_backward(blk, gc, batch, seq_len, gp, gt1, gt2, gt3, gq, gk, gv);
+        }
+        for 0..(bt * d) |i| {
+            gc[i] = gp[i];
+        }
+        l = l - 1;
+    }
+
+    // 3. Embedding backward
+    let g_tok = model.tok_emb.gw.as_mut_slice();
+    let g_pos = model.pos_emb.gw.as_mut_slice();
+    for 0..batch |b| {
+        for 0..seq_len |t| {
+            let tok = cast<i64>(tokens[b * seq_len + t]);
+            let src = (b * seq_len + t) * d;
+            let t_off = tok * d;
+            let p_off = t * d;
+            for 0..d |i| {
+                let g = gc[src + i];
+                g_tok[t_off + i] = g_tok[t_off + i] + g;
+                g_pos[p_off + i] = g_pos[p_off + i] + g;
+            }
+        }
+    }
+    return;
+}
+
+pub fn ladder_count_logic_gates(model: &LogicLadderGPT) -> i64 {
+    var total: i64 = 0;
+    for 0..model.cfg.n_layers |l| {
+        if model.blocks.at(l) |blk| {
+            if rung_uses_logic_qkv(blk.rung) {
+                total = total + blk.lq.out_dim + blk.lk.out_dim + blk.lv.out_dim;
+            }
+            if rung_uses_logic_ffn(blk.rung) {
+                total = total + blk.ffn_lut1.out_dim + blk.ffn_lut2.out_dim;
+            }
+        }
+    }
+    return total;
+}
+
+pub fn ladder_eval_loss(
+    allocator: Allocator,
+    model: &var LogicLadderGPT,
+    corpus: &data::Corpus,
+    batch: i64,
+    num_batches: i64,
+    hard_mode: bool,
+    seed: u64
+) -> mem::Error!f64 {
+    let seq_len = model.cfg.seq_len;
+    let vocab = model.cfg.vocab_size;
+    let bt = batch * seq_len;
+    var rng = core::rng_new(seed);
+
+    var x = try core::alloc_i32(allocator, bt);
+    defer x.deinit(allocator);
+    var y = try core::alloc_i32(allocator, bt);
+    defer y.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, bt * vocab);
+    defer logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer g_logits.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ys = y.as_mut_slice();
+    let ls = logits.as_mut_slice();
+    let gls = g_logits.as_mut_slice();
+
+    var sum_loss: f64 = 0.0;
+    let mode = if hard_mode { EvalMode::EvalHard } else { EvalMode::EvalSoft };
+    for 0..num_batches |_| {
+        data::sample_batch(corpus, batch, seq_len, true, &var rng, xs, ys);
+        ladder_forward(model, xs, batch, seq_len, ls, mode, &var rng);
+        let loss = lut::cross_entropy_loss_grad(ls, ys, bt, vocab, gls);
+        sum_loss = sum_loss + cast<f64>(loss);
+    }
+    return sum_loss / cast<f64>(num_batches);
+}
+
+pub fn ladder_generate(
+    allocator: Allocator,
+    model: &var LogicLadderGPT,
+    vocab: &data::CharVocab,
+    prompt: []u8,
+    max_new: i64,
+    temp: f32,
+    hard_mode: bool,
+    seed: u64
+) -> mem::Error!string::String {
+    let seq_len = model.cfg.seq_len;
+    let v_size = model.cfg.vocab_size;
+    var rng = core::rng_new(seed);
+    let mode = if hard_mode { EvalMode::EvalHard } else { EvalMode::EvalSoft };
+
+    var ctx = array::new<i32>(allocator);
+    defer ctx.deinit(allocator);
+    let p_len = mem::len(prompt);
+    for 0..p_len |i| {
+        try ctx.append(allocator, data::vocab_encode_byte(vocab, prompt[i]));
+    }
+    if ctx.len() == 0 {
+        try ctx.append(allocator, 0);
+    }
+
+    var window = try core::alloc_i32(allocator, seq_len);
+    defer window.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, seq_len * v_size);
+    defer logits.deinit(allocator);
+    var probs = try core::alloc_f32(allocator, v_size);
+    defer probs.deinit(allocator);
+
+    let win_s = window.as_mut_slice();
+    let lg_s = logits.as_mut_slice();
+    let pr_s = probs.as_mut_slice();
+
+    for 0..max_new |_| {
+        let cur_len = ctx.len();
+        let use_len = if cur_len < seq_len { cur_len } else { seq_len };
+        let start = cur_len - use_len;
+        for 0..use_len |t| {
+            win_s[t] = ctx.get_or_panic(start + t);
+        }
+        ladder_forward(model, win_s, 1, use_len, lg_s, mode, &var rng);
+        let off = (use_len - 1) * v_size;
+
+        var next_id: i32 = 0;
+        if temp <= 0.01 {
+            var best_v = lg_s[off];
+            for 1..v_size |c| {
+                if lg_s[off + c] > best_v {
+                    best_v = lg_s[off + c];
+                    next_id = cast<i32>(c);
+                }
+            }
+        } else {
+            let inv_t = 1.0 / cast<f64>(temp);
+            var max_v = cast<f64>(lg_s[off]) * inv_t;
+            for 1..v_size |c| {
+                let v = cast<f64>(lg_s[off + c]) * inv_t;
+                if v > max_v { max_v = v; }
+            }
+            var sum_e: f64 = 0.0;
+            for 0..v_size |c| {
+                let e = math::exp<f64>(cast<f64>(lg_s[off + c]) * inv_t - max_v);
+                pr_s[c] = cast<f32>(e);
+                sum_e = sum_e + e;
+            }
+            let r = rng.next_f64() * sum_e;
+            var acc: f64 = 0.0;
+            var picked = v_size - 1;
+            for 0..v_size |c| {
+                acc = acc + cast<f64>(pr_s[c]);
+                if acc >= r {
+                    picked = c;
+                    break;
+                }
+            }
+            next_id = cast<i32>(picked);
+        }
+        try ctx.append(allocator, next_id);
+    }
+
+    let ctx_s = ctx.as_slice();
+    return data::decode_tokens_to_string(allocator, vocab, ctx_s, ctx.len());
+}

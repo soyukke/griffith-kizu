@@ -1,0 +1,43 @@
+import griffith::browser;
+import griffith::cli;
+import std::mem;
+import std::process;
+import std::testing;
+
+pub fn main() -> !void {
+    comptime if std::target::is_browser() {
+        browser::run_browser();
+    } else {
+        if process::arg_count() < 1 {
+            print("usage: griffith <stage1-run|stage1-bench|stage2-run>");
+            return;
+        }
+        let cmd = try process::arg(0);
+        if mem::equal_bytes(cmd, "stage1-run") {
+            try cli::run_stage1_pipeline();
+            return;
+        }
+        if mem::equal_bytes(cmd, "stage1-bench") {
+            try cli::run_stage1_bench();
+            return;
+        }
+        if mem::equal_bytes(cmd, "stage2-run") {
+            try cli::run_stage2_ladder();
+            return;
+        }
+        if mem::equal_bytes(cmd, "stage2-train-one") {
+            try cli::run_stage2_train_one();
+            return;
+        }
+        if mem::equal_bytes(cmd, "jpllm-train-one") {
+            try cli::run_jpllm_train_one();
+            return;
+        }
+        print("unknown command");
+    }
+    return;
+}
+
+test "phase 0 smoke" {
+    testing::expect(true);
+}

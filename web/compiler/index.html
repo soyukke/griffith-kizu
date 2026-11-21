@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>compiler/ — 論理合成＆VM vs AOT 速度ベンチ | griffith/</title>
+  <meta name="description" content="Kizu で学習・論理合成したパリティ・XOR・2-bit 加算器回路を、重みゼロ・乗算ゼロの AOT WASM とビットスライス VM で速度比較するデモ。">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="../fonts/martian-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Martian Mono';
+      font-style: normal;
+      font-display: swap;
+      font-weight: 100 800;
+      src: url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations'),
+           url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2');
+    }
+
+    :root {
+      color-scheme: light;
+      --paper: #f2f0e9;
+      --sheet: #faf9f3;
+      --ink: #141412;
+      --muted: #68665e;
+      --rule: #cfccc0;
+      --grid: #e3e0d6;
+      --tri: #e8e5db;
+      --accent: #ff4d00;
+      --accent-tint: #fff1ea;
+      --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --jp: 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--jp);
+      font-size: 13px;
+      line-height: 1.45;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .app {
+      height: 100dvh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow: hidden;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 18px;
+      border-bottom: 1px solid var(--ink);
+      background: var(--paper);
+      min-height: 48px;
+    }
+    .identity { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+    .mark {
+      font-family: var(--mono);
+      font-weight: 800;
+      font-stretch: 75%;
+      font-size: clamp(20px, 2vw, 25px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      white-space: nowrap;
+    }
+    .mark .slash { color: var(--accent); }
+    .mark:hover { color: var(--accent); }
+    h1 {
+      margin: 0;
+      font-size: clamp(13px, 1.2vw, 15px);
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tagline { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+
+    .bar__right { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+    .btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .btn:hover { border-color: var(--ink); background: var(--tri); }
+    .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn--go:hover { background: #e64500; border-color: #e64500; color: #fff; }
+
+    .desk {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) clamp(292px, 28vw, 344px);
+      gap: 16px;
+      padding: 12px 18px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--rule);
+      background-color: var(--sheet);
+      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
+      background-size: 20px 20px;
+      background-position: 9px 9px;
+    }
+    .stage::before, .stage::after {
+      content: '';
+      pointer-events: none;
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: solid var(--muted);
+      opacity: 0.45;
+      z-index: 2;
+    }
+    .stage::before { top: 9px; left: 9px; border-width: 1px 0 0 1px; }
+    .stage::after { right: 9px; bottom: 9px; border-width: 0 1px 1px 0; }
+
+    .stage-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 20px 6px;
+      z-index: 1;
+    }
+    .stage-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+    .stage-title strong { font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .stage-story { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stage-story b { color: var(--accent); font-weight: 700; }
+    .legend { display: flex; align-items: center; gap: 12px; font-family: var(--mono); font-size: 10px; color: var(--muted); flex-shrink: 0; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+    .dot--on { background: var(--accent); }
+    .dot--off { background: var(--sheet); border: 1.5px solid var(--rule); }
+
+    .canvas-wrap { position: relative; min-height: 0; min-width: 0; padding: 2px 14px; display: flex; align-items: center; justify-content: center; }
+    #circuit { width: 100%; height: 100%; display: block; user-select: none; -webkit-user-select: none; }
+    .svg-input-btn { cursor: pointer; }
+    .svg-input-btn:hover .pin-box { stroke: var(--accent); }
+    .svg-gate:hover .gate-box { stroke: var(--ink); stroke-width: 1.8; }
+
+    .stage-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 20px 11px;
+      font-size: 11px;
+      color: var(--muted);
+      z-index: 1;
+    }
+    #inspector { font-family: var(--mono), var(--jp); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #inspector b { color: var(--ink); }
+    #inspector .hi { color: var(--accent); font-weight: 700; }
+    .verify-pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10px; color: var(--ink); white-space: nowrap; }
+    .verify-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+
+    .panel { display: flex; flex-direction: column; justify-content: space-between; gap: 10px; min-height: 0; min-width: 0; overflow: hidden; }
+    .block { border-top: 1px solid var(--rule); padding-top: 9px; display: grid; gap: 7px; min-width: 0; }
+    .block:first-child { border-top: 0; padding-top: 0; }
+    .block-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; color: var(--ink); }
+    .kicker-note { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+    .task-seg { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--rule); background: var(--sheet); }
+    .task-seg button { padding: 8px 4px 7px; border-right: 1px solid var(--rule); display: grid; justify-items: center; gap: 2px; }
+    .task-seg button:last-child { border-right: 0; }
+    .task-seg button b { font-size: 12px; font-weight: 700; }
+    .task-seg button small { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .task-seg button:hover:not([aria-pressed="true"]) { background: var(--tri); }
+    .task-seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); box-shadow: inset 0 -3px 0 var(--accent); }
+    .task-seg button[aria-pressed="true"] small { color: #c7c4b8; }
+
+    .bits-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(56px, 1fr)); gap: 6px; }
+    .bit-btn {
+      height: 36px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--sheet);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+    .bit-btn:hover { border-color: var(--ink); }
+    .bit-btn .bit-name { font-weight: 500; font-size: 10px; color: var(--muted); }
+    .bit-btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .bit-btn[aria-pressed="true"] .bit-name { color: rgba(255, 255, 255, 0.85); }
+
+    .mini-btn { font-size: 11px; color: var(--muted); padding: 2px 7px; border: 1px solid var(--rule); border-radius: 999px; }
+    .mini-btn:hover { color: var(--ink); border-color: var(--ink); }
+
+    .eval-box {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+    }
+    .eval-formula { font-family: var(--mono), var(--jp); font-size: 12px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .eval-formula .out-hi { color: var(--accent); }
+    .eval-match { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 999px; background: var(--ink); color: var(--paper); white-space: nowrap; }
+
+    .synth-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .big-num { font-family: var(--mono); font-size: 20px; font-weight: 800; letter-spacing: -0.04em; line-height: 1.1; }
+    .big-num .arrow { color: var(--muted); font-weight: 400; margin: 0 3px; }
+    .big-num .after { color: var(--accent); }
+    .pct-badge { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent); }
+    .bar-stack { display: grid; gap: 5px; }
+    .bar-line { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-family: var(--mono); font-size: 10px; }
+    .bar-line .lbl { color: var(--muted); }
+    .bar-line .val { text-align: right; color: var(--ink); font-weight: 700; min-width: 56px; }
+    .track { height: 7px; background: var(--tri); overflow: hidden; border-radius: 2px; }
+    .fill { height: 100%; background: var(--ink); transition: width 220ms ease; }
+    .fill--accent { background: var(--accent); }
+    .fill--muted { background: #a8a496; }
+
+    .speedup-tag { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent); }
+    .meta-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--rule); background: var(--sheet); }
+    .meta-cell { padding: 6px 8px; border-right: 1px solid var(--rule); display: grid; gap: 1px; }
+    .meta-cell:last-child { border-right: 0; }
+    .meta-cell span { font-size: 10px; color: var(--muted); }
+    .meta-cell strong { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+    .meta-cell strong.accent { color: var(--accent); }
+
+    .link-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .link-btn {
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--sheet);
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .link-btn:hover { border-color: var(--ink); background: var(--tri); }
+    .link-btn span { font-family: var(--mono); color: var(--accent); }
+
+    .foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 18px;
+      border-top: 1px solid var(--rule);
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--paper);
+      min-height: 30px;
+    }
+    .foot-mono { font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+    .foot-mono a:hover { color: var(--accent); }
+    .foot-mid { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .sheet { position: fixed; inset: 0; background: rgba(20, 20, 18, 0.28); z-index: 20; }
+    .sheet__body {
+      position: absolute;
+      top: 56px;
+      right: 18px;
+      width: min(520px, calc(100vw - 24px));
+      max-height: calc(100dvh - 76px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: 12px;
+      box-shadow: 0 16px 42px rgba(20, 20, 18, 0.18);
+      overflow: hidden;
+    }
+    .sheet__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--rule); background: var(--sheet); }
+    .sheet__tabs { display: flex; gap: 4px; }
+    .sheet__tabs button { min-height: 28px; padding: 0 11px; border-radius: 999px; font-size: 12px; font-weight: 700; color: var(--muted); }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+    .sheet__close { width: 28px; height: 28px; border-radius: 999px; border: 1px solid var(--rule); font-family: var(--mono); font-size: 15px; display: grid; place-items: center; }
+    .sheet__content { padding: 14px 16px; overflow-y: auto; min-height: 0; }
+    table.tt { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11px; }
+    table.tt th, table.tt td { padding: 6px 8px; border-bottom: 1px solid var(--rule); text-align: left; }
+    table.tt th { color: var(--muted); }
+    table.tt tbody tr { cursor: pointer; }
+    table.tt tbody tr:hover { background: var(--tri); }
+    table.tt tbody tr.active-row { background: var(--accent-tint); }
+    table.tt td.ok { color: var(--accent); font-weight: 700; }
+    pre.code { margin: 0; padding: 12px; background: var(--sheet); border: 1px solid var(--rule); font-family: var(--mono); font-size: 11px; line-height: 1.55; overflow-x: auto; white-space: pre; }
+    .code-note { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+
+    @media (max-width: 860px) {
+      .tagline, .foot-mid { display: none; }
+      .desk { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; gap: 10px; padding: 10px 12px; }
+      .panel { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; align-items: start; }
+      .block { padding-top: 6px; gap: 5px; }
+      .block--full { grid-column: 1 / -1; border-top: 0; padding-top: 0; }
+      .block--hide-sm { display: none; }
+    }
+    @media (max-width: 560px) {
+      h1 { display: none; }
+      .panel { grid-template-columns: 1fr; gap: 6px; }
+      .block--bench-sm { display: none; }
+      .sheet__body { top: auto; right: 0; left: 0; bottom: 0; width: auto; max-height: 76dvh; border-radius: 14px 14px 0 0; border-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="identity">
+        <a class="mark" href="../" aria-label="griffith/ デモ一覧へ戻る">griffith<span class="slash">/</span></a>
+        <h1>論理合成＆VM vs AOT 速度ベンチ</h1>
+        <span class="tagline">compiler/ · Stage 1 ゼロ重みコンパイラ実測</span>
+      </div>
+      <div class="bar__right">
+        <button type="button" class="btn" id="btn-inspect" aria-expanded="false">真理値表・コード</button>
+        <button type="button" class="btn btn--go" id="btn-bench">速度計測</button>
+      </div>
+    </header>
+
+    <main class="desk">
+      <section class="stage-col" aria-label="学習済み論理回路のライブ配線図">
+        <div class="stage">
+          <div class="stage-head">
+            <div class="stage-title">
+              <strong id="stage-name">4-bit パリティ</strong>
+              <span class="stage-story" id="stage-story">学習 65 LUT → 論理合成 <b>3 ゲート (-95.4%)</b></span>
+            </div>
+            <div class="legend" aria-hidden="true">
+              <span class="legend-item"><i class="dot dot--on"></i>1 (発火)</span>
+              <span class="legend-item"><i class="dot dot--off"></i>0</span>
+            </div>
+          </div>
+          <div class="canvas-wrap">
+            <svg id="circuit" viewBox="0 0 820 440" preserveAspectRatio="xMidYMid meet" role="img" aria-label="論理回路図"></svg>
+          </div>
+          <div class="stage-foot">
+            <span id="inspector">左の入力ピンをクリックして <b>0 / 1</b> を切り替え（キー <b>1〜4</b> 対応）</span>
+            <span class="verify-pill"><i class="verify-dot"></i><span id="stage-verify">VM == AOT 検証中</span></span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel" aria-label="操作と計測">
+        <div class="block block--full">
+          <div class="block-head">
+            <span class="kicker">ベンチマーク回路</span>
+            <span class="kicker-note" id="task-algo">N=2 WARP + Gumbel-ST</span>
+          </div>
+          <div class="task-seg" id="task-seg" role="group" aria-label="回路の種類"></div>
+        </div>
+
+        <div class="block block--full">
+          <div class="block-head">
+            <span class="kicker">入力ビット</span>
+            <button type="button" class="mini-btn" id="btn-rand">ランダム</button>
+          </div>
+          <div class="bits-row" id="bit-controls"></div>
+          <div class="eval-box">
+            <span class="eval-formula" id="eval-formula">WASM 読込中…</span>
+            <span class="eval-match" id="eval-match">…</span>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="kicker">論理合成の圧縮</span>
+            <span class="pct-badge" id="m-reduction">-</span>
+          </div>
+          <div class="synth-row">
+            <div class="big-num" id="m-gates">-</div>
+            <span class="kicker-note" id="m-depth">深さ -</span>
+          </div>
+          <div class="bar-stack">
+            <div class="bar-line"><span class="lbl">学習直後</span><div class="track"><div class="fill fill--muted" style="width:100%"></div></div><span class="val" id="b-raw-val">-</span></div>
+            <div class="bar-line"><span class="lbl">合成後</span><div class="track"><div class="fill fill--accent" id="b-opt-bar" style="width:10%"></div></div><span class="val" id="b-opt-val">-</span></div>
+          </div>
+        </div>
+
+        <div class="block block--bench-sm">
+          <div class="block-head">
+            <span class="kicker">64件並列 WASM 推論</span>
+            <span class="speedup-tag" id="m-speedup">-</span>
+          </div>
+          <div class="bar-stack">
+            <div class="bar-line"><span class="lbl">VM 表引</span><div class="track"><div class="fill" id="bar-vm" style="width:0%"></div></div><span class="val" id="m-vm-ns">-</span></div>
+            <div class="bar-line"><span class="lbl">AOT 焼込</span><div class="track"><div class="fill fill--accent" id="bar-aot" style="width:0%"></div></div><span class="val" id="m-aot-ns">-</span></div>
+          </div>
+          <span class="kicker-note" id="bench-note">640万回をブラウザ内で実測</span>
+        </div>
+
+        <div class="block block--hide-sm">
+          <div class="meta-strip">
+            <div class="meta-cell"><span>浮動小数乗算</span><strong class="accent" id="m-muls">0 回</strong></div>
+            <div class="meta-cell"><span>重みファイル</span><strong>0 B</strong></div>
+            <div class="meta-cell"><span>WASM 本体</span><strong id="m-wasm">-</strong></div>
+          </div>
+          <div class="link-row">
+            <button type="button" class="link-btn" id="open-tt">全パターン真理値表 <span>→</span></button>
+            <button type="button" class="link-btn" id="open-code">AOT 生成コード <span>→</span></button>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
+      <span class="foot-mid">Stage 1 学習済み回路の論理合成（DCE/CSE）と VM vs AOT 焼き込み推論の 0-mismatch 検証</span>
+      <span class="foot-mono" id="foot-stat">kizu wasm32-browser</span>
+    </footer>
+
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="回路の詳細">
+        <div class="sheet__head">
+          <div class="sheet__tabs" role="tablist">
+            <button type="button" role="tab" data-tab="tt" aria-selected="true">真理値表</button>
+            <button type="button" role="tab" data-tab="code" aria-selected="false">生成 AOT コード</button>
+          </div>
+          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+        </div>
+        <div class="sheet__content">
+          <div id="tab-tt">
+            <p class="code-note">全入力パターンをブラウザ上の WASM（VM と AOT の両方）で検証しています。行をクリックすると回路図へ反映されます。</p>
+            <table class="tt">
+              <thead><tr><th>入力</th><th>正解</th><th>VM (u64)</th><th>AOT (焼込)</th><th>判定</th></tr></thead>
+              <tbody id="tt-body"></tbody>
+            </table>
+          </div>
+          <div id="tab-code" hidden>
+            <p class="code-note" id="code-note"></p>
+            <pre class="code" id="code-pre"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { instantiate } from "../dist/app.mjs";
+
+    const TASKS = [
+      {
+        id: 0, short: "XOR", name: "XOR（排他的論理和）", algo: "N=2 Softmax + GroupSum",
+        bits: ["x0", "x1"], patterns: 4, rawGates: 32, optGates: 11, inWidth: 2, groupSumK: 2,
+        gates: [
+          { id: 2, arity: 2, pins: [0, 1], tt: 0x6 }, { id: 3, arity: 2, pins: [0, 1], tt: 0x7 },
+          { id: 4, arity: 2, pins: [0, 1], tt: 0x2 }, { id: 5, arity: 2, pins: [0, 1], tt: 0x1 },
+          { id: 6, arity: 2, pins: [0, 1], tt: 0xb }, { id: 7, arity: 2, pins: [2, 4], tt: 0x1 },
+          { id: 8, arity: 2, pins: [2, 3], tt: 0x7 }, { id: 9, arity: 2, pins: [2, 5], tt: 0xd },
+          { id: 10, arity: 2, pins: [3, 5], tt: 0x2 }, { id: 11, arity: 2, pins: [4, 6], tt: 0xb },
+          { id: 12, arity: 1, pins: [2], tt: 0x1 },
+        ],
+        outWires: [12, 7, 12, 12, 12, 8, 12, 9, 10, 2, 2, 11, 2, 2, 2, 2],
+        outLabels: ["class 0/1"],
+        formatIn: (p) => `${p & 1} ^ ${(p >> 1) & 1}`,
+        expected: (p) => (p & 1) ^ ((p >> 1) & 1),
+        formatOut: (v) => String(v),
+        formatFormula: (p, v) => `x0=${p & 1} XOR x1=${(p >> 1) & 1} → ${v}`,
+        aotCode: `// 学習 32 LUT → 論理合成 11 ゲート (-65.6%) / 乗算 0 回
+pub fn aot_xor_64(in_bits: []u64, out_bits: &var []u64) -> void {
+    let w0: u64 = in_bits[0] ^ in_bits[1];
+    let w1: u64 = ~(in_bits[0] & in_bits[1]);
+    let w2: u64 = in_bits[0] & (~in_bits[1]);
+    let w3: u64 = (~in_bits[0]) & (~in_bits[1]);
+    let w4: u64 = in_bits[0] | (~in_bits[1]);
+    let w5: u64 = (~w0) & (~w2);
+    let w6: u64 = ~(w0 & w1);
+    let w7: u64 = (~w0) | w3;
+    let w8: u64 = w1 & (~w3);
+    let w9: u64 = w2 | (~w4);
+    let w10: u64 = ~w0;
+    // 16本の出力を GroupSum（8本ずつ投票）して 0 / 1 を判定
+}`,
+      },
+      {
+        id: 1, short: "パリティ", name: "4-bit パリティ", algo: "N=2 WARP + Gumbel-ST",
+        bits: ["b0", "b1", "b2", "b3"], patterns: 16, rawGates: 65, optGates: 3, inWidth: 4, groupSumK: 0,
+        gates: [
+          { id: 4, arity: 2, pins: [0, 2], tt: 0x9 },
+          { id: 5, arity: 2, pins: [1, 3], tt: 0x6 },
+          { id: 6, arity: 2, pins: [4, 5], tt: 0x9 },
+        ],
+        outWires: [6], outLabels: ["parity"],
+        formatIn: (p) => [0, 1, 2, 3].map((i) => (p >> i) & 1).join(""),
+        expected: (p) => (p & 1) ^ ((p >> 1) & 1) ^ ((p >> 2) & 1) ^ ((p >> 3) & 1),
+        formatOut: (v) => String(v),
+        formatFormula: (p, v) => `${[0, 1, 2, 3].map((i) => (p >> i) & 1).join("")} → ${v}（${v ? "奇数" : "偶数"}）`,
+        aotCode: `// 学習 65 LUT → 論理合成 3 ゲート (-95.4%・理論最小の木)
+pub fn aot_parity4_64(in_bits: []u64, out_bits: &var []u64) -> void {
+    let w0: u64 = ~(in_bits[0] ^ in_bits[2]);   // XNOR(b0, b2)
+    let w1: u64 = in_bits[1] ^ in_bits[3];      // XOR(b1, b3)
+    let w2: u64 = ~(w0 ^ w1);                   // XNOR(w0, w1)
+    out_bits[0] = w2;
+    return;
+}`,
+      },
+      {
+        id: 2, short: "2-bit加算", name: "2-bit 加算器", algo: "N=4 WARP + Gumbel-ST",
+        bits: ["a0", "a1", "b0", "b1"], patterns: 16, rawGates: 51, optGates: 37, inWidth: 4, groupSumK: 0,
+        gates: [
+          { id: 4, arity: 4, pins: [0, 1, 2, 3], tt: 0x2171 }, { id: 5, arity: 4, pins: [0, 1, 2, 3], tt: 0xa6e0 },
+          { id: 6, arity: 4, pins: [0, 1, 2, 3], tt: 0x4c2c }, { id: 7, arity: 4, pins: [0, 1, 2, 3], tt: 0x024c },
+          { id: 8, arity: 4, pins: [0, 1, 2, 3], tt: 0xb7e3 }, { id: 9, arity: 4, pins: [0, 1, 2, 3], tt: 0xab6f },
+          { id: 10, arity: 4, pins: [0, 1, 2, 3], tt: 0x7dfc }, { id: 11, arity: 4, pins: [0, 1, 2, 3], tt: 0xf484 },
+          { id: 12, arity: 4, pins: [0, 1, 2, 3], tt: 0x0349 }, { id: 13, arity: 4, pins: [0, 1, 2, 3], tt: 0x92a2 },
+          { id: 14, arity: 4, pins: [0, 1, 2, 3], tt: 0x3ff6 }, { id: 15, arity: 4, pins: [0, 1, 2, 3], tt: 0x1bfe },
+          { id: 16, arity: 4, pins: [0, 1, 2, 3], tt: 0x777f }, { id: 17, arity: 4, pins: [0, 1, 2, 3], tt: 0xd361 },
+          { id: 18, arity: 4, pins: [0, 1, 2, 3], tt: 0x9139 }, { id: 19, arity: 4, pins: [0, 1, 2, 3], tt: 0xe480 },
+          { id: 20, arity: 4, pins: [0, 1, 2, 3], tt: 0xa5bd }, { id: 21, arity: 4, pins: [0, 1, 2, 3], tt: 0xdf8e },
+          { id: 22, arity: 4, pins: [0, 1, 2, 3], tt: 0x4005 }, { id: 23, arity: 4, pins: [0, 1, 2, 3], tt: 0x640c },
+          { id: 24, arity: 4, pins: [0, 1, 2, 3], tt: 0xd7c0 }, { id: 25, arity: 4, pins: [0, 1, 2, 3], tt: 0x377d },
+          { id: 26, arity: 4, pins: [9, 11, 17, 18], tt: 0xac8d }, { id: 27, arity: 3, pins: [7, 8, 12], tt: 0xb1 },
+          { id: 28, arity: 4, pins: [6, 18, 23, 24], tt: 0x671f }, { id: 29, arity: 4, pins: [4, 5, 7, 20], tt: 0x4ff5 },
+          { id: 30, arity: 4, pins: [6, 9, 19, 24], tt: 0x3ab4 }, { id: 31, arity: 4, pins: [12, 13, 15, 23], tt: 0xfaef },
+          { id: 32, arity: 4, pins: [4, 16, 21, 25], tt: 0x04b8 }, { id: 33, arity: 4, pins: [5, 6, 20, 24], tt: 0x7bdb },
+          { id: 34, arity: 2, pins: [9, 10], tt: 0x1 }, { id: 35, arity: 4, pins: [12, 14, 17, 22], tt: 0x3726 },
+          { id: 36, arity: 4, pins: [7, 11, 15, 19], tt: 0x3af9 }, { id: 37, arity: 3, pins: [8, 13, 23], tt: 0x3b },
+          { id: 38, arity: 4, pins: [26, 27, 34, 37], tt: 0x4db0 }, { id: 39, arity: 4, pins: [28, 29, 30, 35], tt: 0x635f },
+          { id: 40, arity: 4, pins: [31, 32, 33, 36], tt: 0x8e95 },
+        ],
+        outWires: [38, 39, 40], outLabels: ["s0", "s1", "s2"],
+        formatIn: (p) => `a=${p & 3} + b=${(p >> 2) & 3}`,
+        expected: (p) => (p & 3) + ((p >> 2) & 3),
+        formatOut: (v) => `${v} (${v.toString(2).padStart(3, "0")})`,
+        formatFormula: (p, v) => `a=${p & 3} + b=${(p >> 2) & 3} → ${v} (${v.toString(2).padStart(3, "0")})`,
+        aotCode: `// 学習 51 LUT → 論理合成 37 ゲート (-27.5%) / 3層 4入力LUT回路
+pub fn aot_adder2_64(in_bits: []u64, out_bits: &var []u64) -> void {
+    // 37 個の LUT を純粋な &, |, ^, ~ へシャノン展開して重み 0 B 化
+    out_bits[0] = w34;  // s0
+    out_bits[1] = w35;  // s1
+    out_bits[2] = w36;  // s2 (桁上がり)
+}`,
+      },
+    ];
+
+    const GATE_NAMES_2 = {
+      0x0: "0", 0x1: "NOR", 0x2: "A&~B", 0x3: "~B", 0x4: "~A&B", 0x5: "~A", 0x6: "XOR", 0x7: "NAND",
+      0x8: "AND", 0x9: "XNOR", 0xa: "A", 0xb: "A|~B", 0xc: "B", 0xd: "~A|B", 0xe: "OR", 0xf: "1",
+    };
+    const gateLabel = (g) => g.arity === 1 ? (g.tt === 1 ? "NOT" : "BUF") : (g.arity === 2 ? (GATE_NAMES_2[g.tt & 15] || `0x${g.tt.toString(16)}`) : `LUT${g.arity}`);
+    const wireName = (task, wid) => wid < task.inWidth ? task.bits[wid] : `w${wid - task.inWidth}`;
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svgEl = (tag, attrs = {}, text = null) => {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+      if (text !== null) el.textContent = text;
+      return el;
+    };
+
+    function evalCircuitWires(task, mask) {
+      const wires = new Map();
+      for (let i = 0; i < task.inWidth; i++) wires.set(i, (mask >> i) & 1);
+      for (const g of task.gates) {
+        let idx = 0;
+        for (let k = 0; k < g.arity; k++) idx |= (wires.get(g.pins[k]) || 0) << k;
+        wires.set(g.id, (g.tt >> idx) & 1);
+      }
+      return wires;
+    }
+
+    function computeLayers(task) {
+      const depth = new Map();
+      for (let i = 0; i < task.inWidth; i++) depth.set(i, 0);
+      let maxD = 0;
+      for (const g of task.gates) {
+        let d = 0;
+        for (const p of g.pins) d = Math.max(d, depth.get(p) || 0);
+        depth.set(g.id, d + 1);
+        maxD = Math.max(maxD, d + 1);
+      }
+      const cols = Array.from({ length: maxD }, () => []);
+      for (const g of task.gates) cols[depth.get(g.id) - 1].push(g);
+      return { cols, maxD };
+    }
+
+    let ex = null, activeTask = 1, inputMask = 5;
+
+    async function boot() {
+      const wasmResp = await fetch("../dist/app.wasm");
+      const wasmLen = (await wasmResp.arrayBuffer()).byteLength;
+      const program = await instantiate({
+        write() { return true; },
+        host: { read_input() { return 0; }, give_bytes() {} },
+      });
+      program.start();
+      ex = program.exports;
+      document.getElementById("m-muls").textContent = `${ex.lab_float_muls()} 回`;
+      const kb = `${(wasmLen / 1024).toFixed(0)} KB`;
+      document.getElementById("m-wasm").textContent = kb;
+      document.getElementById("foot-stat").textContent = `${kb} .wasm · mul 0`;
+      renderTaskSeg();
+      selectTask(activeTask);
+    }
+
+    function renderTaskSeg() {
+      const box = document.getElementById("task-seg");
+      box.innerHTML = "";
+      for (const t of TASKS) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.setAttribute("aria-pressed", String(t.id === activeTask));
+        btn.innerHTML = `<b>${t.short}</b><small>${ex.lab_raw_gates(t.id)}→${ex.lab_opt_gates(t.id)}</small>`;
+        btn.onclick = () => selectTask(t.id);
+        box.appendChild(btn);
+      }
+    }
+
+    function selectTask(id) {
+      activeTask = id;
+      const t = TASKS[id];
+      inputMask = inputMask & ((1 << t.bits.length) - 1);
+      renderTaskSeg();
+      const rawG = ex.lab_raw_gates(id), optG = ex.lab_opt_gates(id);
+      const rawD = ex.lab_raw_depth(id), optD = ex.lab_opt_depth(id);
+      const pct = (((rawG - optG) / Math.max(rawG, 1)) * 100).toFixed(1);
+      document.getElementById("stage-name").textContent = t.name;
+      document.getElementById("stage-story").innerHTML = `学習 ${rawG} LUT → 論理合成 <b>${optG} ゲート (-${pct}%)</b>`;
+      document.getElementById("task-algo").textContent = t.algo;
+      document.getElementById("m-gates").innerHTML = `${rawG}<span class="arrow">→</span><span class="after">${optG}</span>`;
+      document.getElementById("m-reduction").textContent = `-${pct}%`;
+      document.getElementById("m-depth").textContent = `深さ ${rawD} → ${optD}`;
+      document.getElementById("b-raw-val").textContent = `${rawG} 個`;
+      document.getElementById("b-opt-val").textContent = `${optG} 個`;
+      document.getElementById("b-opt-bar").style.width = `${Math.max(4, (optG / Math.max(rawG, 1)) * 100)}%`;
+      document.getElementById("code-note").textContent = `${t.name} の論理合成後に生成された重みゼロ Kizu コードです。`;
+      document.getElementById("code-pre").textContent = t.aotCode;
+      resetInspector();
+      renderBitControls();
+      renderEvalAndCircuit();
+      renderTruthTable();
+      runBench();
+    }
+
+    function resetInspector() {
+      const t = TASKS[activeTask];
+      document.getElementById("inspector").innerHTML = `左の入力ピンをクリックして <b>0 / 1</b> を切り替え（キー <b>1〜${t.bits.length}</b> 対応）`;
+    }
+
+    function renderBitControls() {
+      const t = TASKS[activeTask];
+      const box = document.getElementById("bit-controls");
+      box.innerHTML = "";
+      t.bits.forEach((name, idx) => {
+        const on = ((inputMask >> idx) & 1) !== 0;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "bit-btn";
+        btn.setAttribute("aria-pressed", String(on));
+        btn.innerHTML = `<span class="bit-name">${name}</span>${on ? 1 : 0}`;
+        btn.onclick = () => toggleBit(idx);
+        box.appendChild(btn);
+      });
+    }
+
+    function toggleBit(idx) {
+      inputMask ^= (1 << idx);
+      renderBitControls();
+      renderEvalAndCircuit();
+      highlightActiveTruthRow();
+    }
+
+    function renderEvalAndCircuit() {
+      const t = TASKS[activeTask];
+      const vmOut = ex.lab_eval(t.id, 0, inputMask);
+      const aotOut = ex.lab_eval(t.id, 1, inputMask);
+      const exp = t.expected(inputMask);
+      const parts = t.formatFormula(inputMask, aotOut).split("→");
+      document.getElementById("eval-formula").innerHTML = `${parts[0]}→ <span class="out-hi">${parts[1].trim()}</span>`;
+      document.getElementById("eval-match").textContent = (vmOut === exp && aotOut === exp) ? "VM=AOT 一致" : "不一致";
+      renderCircuitSVG(t, inputMask, aotOut);
+    }
+
+    function renderCircuitSVG(task, mask, aotOut) {
+      const svg = document.getElementById("circuit");
+      svg.innerHTML = "";
+      const H = 440;
+      const wires = evalCircuitWires(task, mask);
+      const { cols, maxD } = computeLayers(task);
+      const isDense = task.gates.length > 15;
+      const pos = new Map();
+      const inX = 68, outX = task.groupSumK > 0 ? 732 : 736, leftPad = 178, rightPad = task.groupSumK > 0 ? 585 : 620;
+      const inSpan = task.inWidth <= 2 ? 170 : 270, inTop = (H - inSpan) / 2;
+      for (let i = 0; i < task.inWidth; i++) pos.set(i, { x: inX, y: inTop + (inSpan * i) / (task.inWidth - 1), w: 66, h: 36 });
+      const gateW = isDense ? 54 : (task.gates.length <= 4 ? 112 : 74);
+      const gateH = isDense ? 15 : (task.gates.length <= 4 ? 46 : 30);
+      for (let c = 0; c < maxD; c++) {
+        const col = cols[c];
+        const x = maxD === 1 ? (leftPad + rightPad) / 2 : leftPad + ((rightPad - leftPad) * c) / (maxD - 1);
+        const usableH = isDense ? H - 36 : Math.min(H - 80, Math.max(120, (col.length - 1) * (gateH + 26)));
+        const topY = (H - usableH) / 2;
+        col.forEach((g, idx) => pos.set(g.id, { x, y: col.length === 1 ? H / 2 : topY + (usableH * idx) / (col.length - 1), w: gateW, h: gateH }));
+      }
+      const outNodes = [];
+      if (task.groupSumK > 0) outNodes.push({ x: outX, y: H / 2, w: 112, h: 96 });
+      else {
+        const nOut = task.outWires.length, outSpan = nOut === 1 ? 0 : 190, outTop = (H - outSpan) / 2;
+        for (let i = 0; i < nOut; i++) outNodes.push({ x: outX, y: nOut === 1 ? H / 2 : outTop + (outSpan * i) / (nOut - 1), w: 94, h: nOut === 1 ? 56 : 42, wireId: task.outWires[i], label: task.outLabels[i] });
+      }
+      const gOff = svgEl("g"), gOn = svgEl("g");
+      svg.appendChild(gOff); svg.appendChild(gOn);
+      const addWire = (x1, y1, x2, y2, val) => {
+        const dx = Math.max(24, (x2 - x1) * 0.45);
+        (val ? gOn : gOff).appendChild(svgEl("path", {
+          d: `M ${x1.toFixed(1)} ${y1.toFixed(1)} C ${(x1 + dx).toFixed(1)} ${y1.toFixed(1)}, ${(x2 - dx).toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`,
+          fill: "none", stroke: val ? "#ff4d00" : "#cfccc0",
+          "stroke-width": val ? (isDense ? 1.55 : 2.4) : (isDense ? 0.85 : 1.3),
+          "stroke-opacity": val ? (isDense ? 0.72 : 0.92) : (isDense ? 0.55 : 0.9),
+        }));
+      };
+      for (const g of task.gates) {
+        const dst = pos.get(g.id);
+        g.pins.forEach((pId, k) => {
+          const src = pos.get(pId);
+          const off = g.pins.length === 1 ? 0 : ((k / (g.pins.length - 1)) - 0.5) * (dst.h * 0.62);
+          addWire(src.x + src.w / 2, src.y, dst.x - dst.w / 2, dst.y + off, wires.get(pId) || 0);
+        });
+      }
+      if (task.groupSumK > 0) {
+        const dst = outNodes[0], half = task.outWires.length / 2, seen = new Set();
+        task.outWires.forEach((wId, idx) => {
+          const grp = idx < half ? 0 : 1, key = `${wId}:${grp}`;
+          if (seen.has(key)) return; seen.add(key);
+          const src = pos.get(wId);
+          addWire(src.x + src.w / 2, src.y, dst.x - dst.w / 2, dst.y + (grp === 0 ? -18 : 18), wires.get(wId) || 0);
+        });
+      } else {
+        for (const out of outNodes) {
+          const src = pos.get(out.wireId);
+          addWire(src.x + src.w / 2, src.y, out.x - out.w / 2, out.y, wires.get(out.wireId) || 0);
+        }
+      }
+      const gNodes = svgEl("g"); svg.appendChild(gNodes);
+      for (let i = 0; i < task.inWidth; i++) {
+        const p = pos.get(i), val = wires.get(i) || 0;
+        const g = svgEl("g", { class: "svg-input-btn", role: "button", tabindex: "0" });
+        g.appendChild(svgEl("rect", { class: "pin-box", x: p.x - p.w / 2, y: p.y - p.h / 2, width: p.w, height: p.h, rx: 6, fill: val ? "#ff4d00" : "#faf9f3", stroke: val ? "#ff4d00" : "#141412", "stroke-width": 1.6 }));
+        g.appendChild(svgEl("text", { x: p.x - 10, y: p.y + 4, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 11, fill: val ? "rgba(255,255,255,0.88)" : "#68665e" }, task.bits[i]));
+        g.appendChild(svgEl("text", { x: p.x + 17, y: p.y + 5, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 15, "font-weight": 800, fill: val ? "#ffffff" : "#141412" }, String(val)));
+        g.addEventListener("click", () => toggleBit(i));
+        gNodes.appendChild(g);
+      }
+      for (const gate of task.gates) {
+        const p = pos.get(gate.id), val = wires.get(gate.id) || 0, lbl = gateLabel(gate);
+        const g = svgEl("g", { class: "svg-gate" });
+        g.appendChild(svgEl("rect", { class: "gate-box", x: p.x - p.w / 2, y: p.y - p.h / 2, width: p.w, height: p.h, rx: isDense ? 3 : 6, fill: val ? "#fff1ea" : "#faf9f3", stroke: val ? "#ff4d00" : "#141412", "stroke-width": val ? (isDense ? 1.4 : 2) : (isDense ? 0.95 : 1.25) }));
+        if (task.gates.length <= 4) {
+          g.appendChild(svgEl("text", { x: p.x - 10, y: p.y - 3, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 13, "font-weight": 800, fill: "#141412" }, lbl));
+          g.appendChild(svgEl("text", { x: p.x - 10, y: p.y + 13, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e" }, `${wireName(task, gate.id)} · tt=0x${gate.tt.toString(16)}`));
+          g.appendChild(svgEl("rect", { x: p.x + p.w / 2 - 26, y: p.y - 12, width: 20, height: 24, rx: 4, fill: val ? "#ff4d00" : "#e8e5db" }));
+          g.appendChild(svgEl("text", { x: p.x + p.w / 2 - 16, y: p.y + 4, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 12, "font-weight": 800, fill: val ? "#ffffff" : "#68665e" }, String(val)));
+        } else {
+          g.appendChild(svgEl("text", { x: p.x - 7, y: p.y + 3.2, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": isDense ? 8.2 : 10, "font-weight": 700, fill: val ? "#141412" : "#68665e" }, lbl));
+          g.appendChild(svgEl("text", { x: p.x + p.w / 2 - 10, y: p.y + 3.2, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": isDense ? 8.5 : 10.5, "font-weight": 800, fill: val ? "#ff4d00" : "#8b887d" }, String(val)));
+        }
+        g.addEventListener("mouseenter", () => {
+          document.getElementById("inspector").innerHTML = `<b>${wireName(task, gate.id)}</b> = ${lbl}(${gate.pins.map((id) => wireName(task, id)).join(", ")}) · tt=0x${gate.tt.toString(16)} → <span class="${val ? "hi" : ""}">${val}</span>`;
+        });
+        g.addEventListener("mouseleave", resetInspector);
+        gNodes.appendChild(g);
+      }
+      if (task.groupSumK > 0) {
+        const out = outNodes[0]; let v0 = 0, v1 = 0; const half = task.outWires.length / 2;
+        task.outWires.forEach((wId, idx) => { const v = wires.get(wId) || 0; if (idx < half) v0 += v; else v1 += v; });
+        const g = svgEl("g");
+        g.appendChild(svgEl("rect", { x: out.x - out.w / 2, y: out.y - out.h / 2, width: out.w, height: out.h, rx: 8, fill: "#141412" }));
+        g.appendChild(svgEl("text", { x: out.x, y: out.y - 24, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 9.5, fill: "#a8a496" }, "GroupSum"));
+        g.appendChild(svgEl("text", { x: out.x, y: out.y - 4, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 10.5, fill: aotOut === 0 ? "#ff4d00" : "#f2f0e9" }, `c0: ${v0}/8`));
+        g.appendChild(svgEl("text", { x: out.x, y: out.y + 12, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 10.5, fill: aotOut === 1 ? "#ff4d00" : "#f2f0e9" }, `c1: ${v1}/8`));
+        g.appendChild(svgEl("text", { x: out.x, y: out.y + 34, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 16, "font-weight": 800, fill: "#ff4d00" }, `OUT = ${aotOut}`));
+        gNodes.appendChild(g);
+      } else {
+        for (const out of outNodes) {
+          const val = wires.get(out.wireId) || 0;
+          const g = svgEl("g");
+          g.appendChild(svgEl("rect", { x: out.x - out.w / 2, y: out.y - out.h / 2, width: out.w, height: out.h, rx: 7, fill: val ? "#141412" : "#faf9f3", stroke: val ? "#ff4d00" : "#141412", "stroke-width": val ? 2 : 1.5 }));
+          g.appendChild(svgEl("text", { x: out.x - 14, y: out.y + 4, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 11, fill: val ? "#c7c4b8" : "#68665e" }, out.label));
+          g.appendChild(svgEl("text", { x: out.x + 22, y: out.y + 6, "text-anchor": "middle", "font-family": "var(--mono)", "font-size": 18, "font-weight": 800, fill: val ? "#ff4d00" : "#141412" }, String(val)));
+          gNodes.appendChild(g);
+        }
+      }
+    }
+
+    function renderTruthTable() {
+      const t = TASKS[activeTask], tbody = document.getElementById("tt-body");
+      tbody.innerHTML = "";
+      let mm = 0;
+      for (let p = 0; p < t.patterns; p++) {
+        const exp = t.expected(p), vm = ex.lab_eval(t.id, 0, p), aot = ex.lab_eval(t.id, 1, p), ok = vm === exp && aot === exp;
+        if (!ok) mm++;
+        const tr = document.createElement("tr");
+        tr.dataset.pattern = String(p);
+        if (p === inputMask) tr.className = "active-row";
+        tr.innerHTML = `<td>${t.formatIn(p)}</td><td>${t.formatOut(exp)}</td><td>${t.formatOut(vm)}</td><td>${t.formatOut(aot)}</td><td class="${ok ? "ok" : ""}">${ok ? "OK" : "NG"}</td>`;
+        tr.onclick = () => { inputMask = p; renderBitControls(); renderEvalAndCircuit(); highlightActiveTruthRow(); };
+        tbody.appendChild(tr);
+      }
+      document.getElementById("stage-verify").textContent = mm === 0 ? `全 ${t.patterns} パターン VM == AOT 一致` : `${mm} mismatch`;
+    }
+
+    function highlightActiveTruthRow() {
+      for (const tr of document.querySelectorAll("#tt-body tr")) tr.classList.toggle("active-row", Number(tr.dataset.pattern) === inputMask);
+    }
+
+    function runBench() {
+      if (!ex) return;
+      const iters = 100000, totalInf = iters * 64;
+      ex.lab_bench_64way(activeTask, 0, 2000); ex.lab_bench_64way(activeTask, 1, 2000);
+      const t0 = performance.now(); ex.lab_bench_64way(activeTask, 0, iters);
+      const t1 = performance.now(); ex.lab_bench_64way(activeTask, 1, iters);
+      const t2 = performance.now();
+      const vmNs = ((t1 - t0) * 1e6) / totalInf, aotNs = ((t2 - t1) * 1e6) / totalInf, maxNs = Math.max(vmNs, aotNs, 0.01);
+      document.getElementById("m-vm-ns").textContent = `${vmNs.toFixed(2)} ns`;
+      document.getElementById("m-aot-ns").textContent = `${aotNs.toFixed(2)} ns`;
+      document.getElementById("m-speedup").textContent = `AOT ${(vmNs / Math.max(aotNs, 0.001)).toFixed(1)}× 高速`;
+      document.getElementById("bar-vm").style.width = `${Math.min(100, (vmNs / maxNs) * 100)}%`;
+      document.getElementById("bar-aot").style.width = `${Math.max(3, Math.min(100, (aotNs / maxNs) * 100))}%`;
+      document.getElementById("bench-note").textContent = `実測: 640万推論を VM ${(t1 - t0).toFixed(1)} ms / AOT ${(t2 - t1).toFixed(1)} ms`;
+    }
+
+    const sheet = document.getElementById("sheet"), btnInspect = document.getElementById("btn-inspect");
+    function openSheet(tab) {
+      sheet.hidden = false; btnInspect.setAttribute("aria-expanded", "true");
+      for (const b of document.querySelectorAll(".sheet__tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+      document.getElementById("tab-tt").hidden = tab !== "tt";
+      document.getElementById("tab-code").hidden = tab !== "code";
+    }
+    function closeSheet() { sheet.hidden = true; btnInspect.setAttribute("aria-expanded", "false"); }
+    btnInspect.onclick = () => sheet.hidden ? openSheet("tt") : closeSheet();
+    document.getElementById("open-tt").onclick = () => openSheet("tt");
+    document.getElementById("open-code").onclick = () => openSheet("code");
+    document.getElementById("sheet-close").onclick = closeSheet;
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    for (const b of document.querySelectorAll(".sheet__tabs button")) b.onclick = () => openSheet(b.dataset.tab);
+    document.getElementById("btn-bench").onclick = runBench;
+    document.getElementById("btn-rand").onclick = () => {
+      const t = TASKS[activeTask]; let next = inputMask;
+      for (let i = 0; i < 6 && next === inputMask; i++) next = Math.floor(Math.random() * t.patterns);
+      inputMask = next; renderBitControls(); renderEvalAndCircuit(); highlightActiveTruthRow();
+    };
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !sheet.hidden) { closeSheet(); return; }
+      if (!sheet.hidden) return;
+      const n = Number(e.key);
+      if (n >= 1 && n <= TASKS[activeTask].bits.length) toggleBit(n - 1);
+    });
+    boot();
+  </script>
+</body>
+</html>

@@ -1,0 +1,941 @@
+import griffith::core;
+import griffith::data;
+import griffith::lut;
+import griffith::model;
+import griffith::synth;
+import std::array;
+import std::mem;
+import std::string;
+
+// Host callbacks implemented by the JavaScript adapter.
+// read_input slots: 0=glgpt binary bytes, 1=UTF-8 text bytes (prompt or Japanese sentence).
+extern "browser" fn read_input(slot: i32, offset: i32, destination: []u8) -> usize
+// give_bytes kinds: 0=generated Kizu AOT code, 1=Griffith IR JSON.
+extern "browser" fn give_bytes(kind: i32, data: []u8) -> void
+
+fn read_host_slot(allocator: Allocator, slot: i32, total_len: i64) -> mem::Error!string::String {
+    var out = string::new(allocator);
+    errdefer out.deinit(allocator);
+    if total_len <= 0 {
+        return move out;
+    }
+    var chunk = [8192]u8{};
+    let writable = chunk.as_mut_bytes();
+    var offset: i64 = 0;
+    while offset < total_len {
+        // SAFETY: read_input writes at most 8192 bytes into writable during this synchronous call.
+        let got = cast<i64>(unsafe read_input(slot, cast<i32>(offset), writable));
+        if got <= 0 {
+            break;
+        }
+        try out.append_bytes(allocator, writable[0..got]);
+        offset = offset + got;
+    }
+    return move out;
+}
+
+// =========================================================================
+// LAB-01 (draw/): Live 5x5 Differentiable LUT Trainer -> Logic Synthesis
+// =========================================================================
+
+fn param_mode_from_i32(v: i32) -> lut::ParamMode {
+    if v == 1 {
+        return lut::ParamMode::Softmax;
+    }
+    return lut::ParamMode::Warp;
+}
+
+export "browser" fn live_create(seed: u32, param_mode: i32) -> usize {
+    let allocator = mem::page_allocator();
+    if trainer_new(allocator, cast<u64>(seed), param_mode_from_i32(param_mode)) |trainer| {
+        let words = (cast<i64>(mem::size_of<LiveTrainer>()) + 7) / 8;
+        var backing = array::new<u64>(allocator);
+        for 0..words |_| {
+            if backing.append(allocator, cast<u64>(0)) {} else |_| {
+                trainer.deinit(allocator);
+                backing.deinit(allocator);
+                return 0;
+            }
+        }
+        let slots = backing.as_mut_slice();
+        // SAFETY: backing has 8-byte alignment and at least size_of<LiveTrainer>() bytes.
+        let p = unsafe cast<ptr<LiveTrainer>>(mut_ptr_of(slots));
+        // SAFETY: p points to valid storage in backing, leaked below for the lifetime of this session.
+        unsafe ptr_write(p, move trainer);
+        // SAFETY: opaque handle returned to JS and passed back only to live_* exports.
+        let addr = unsafe int_from_ptr<usize>(p);
+        mem::leak<array::Array<u64>>(move backing);
+        return addr;
+    } else |_| {
+        return 0;
+    }
+}
+
+export "browser" fn live_reseed(handle: usize, seed: u32) -> i32 {
+    if handle == 0 { return 1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    trainer_reseed(t, cast<u64>(seed));
+    return 0;
+}
+
+export "browser" fn live_clear_samples(handle: usize) -> i32 {
+    if handle == 0 { return 1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    trainer_clear_samples(t);
+    return 0;
+}
+
+export "browser" fn live_add_sample(handle: usize, bits: u32, label: i32) -> i32 {
+    if handle == 0 { return -1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    return cast<i32>(trainer_add_sample(t, bits, label));
+}
+
+export "browser" fn live_eval_metrics(handle: usize) -> i32 {
+    if handle == 0 { return 1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    trainer_eval_metrics(t);
+    return 0;
+}
+
+export "browser" fn live_train_steps(handle: usize, steps: i32, lr_milli: i32) -> i32 {
+    if handle == 0 { return -1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    let lr = cast<f32>(lr_milli) * 0.001;
+    return cast<i32>(trainer_train_steps(t, cast<i64>(steps), lr));
+}
+
+export "browser" fn live_step(handle: usize) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    return cast<i32>(t.step);
+}
+
+export "browser" fn live_metric_milli(handle: usize, which: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    if which == 0 { return cast<i32>(t.last_soft_loss * 1000.0 + 0.5); }
+    if which == 1 { return cast<i32>(t.last_soft_acc * 1000.0 + 0.5); }
+    if which == 2 { return cast<i32>(t.last_hard_acc * 1000.0 + 0.5); }
+    if which == 3 { return cast<i32>(t.last_sharpness * 1000.0 + 0.5); }
+    return 0;
+}
+
+export "browser" fn live_gate_count(handle: usize) -> i32 {
+    if handle == 0 { return 0; }
+    return cast<i32>(live_total_gates());
+}
+
+export "browser" fn live_gate_packed(handle: usize, gid: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    return trainer_gate_packed(t, cast<i64>(gid));
+}
+
+export "browser" fn live_synthesize(handle: usize) -> i32 {
+    if handle == 0 { return -1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    let opt_g = trainer_synthesize(allocator, t) catch -1;
+    return cast<i32>(opt_g);
+}
+
+export "browser" fn live_synth_stat(handle: usize, which: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    if which == 0 { return cast<i32>(t.opt_stats.raw_gates); }
+    if which == 1 { return cast<i32>(t.opt_stats.opt_gates); }
+    if which == 2 { return cast<i32>(t.opt_stats.raw_depth); }
+    if which == 3 { return cast<i32>(t.opt_stats.opt_depth); }
+    if which == 4 { return cast<i32>(t.opt_stats.const_folded); }
+    if which == 5 { return cast<i32>(t.opt_stats.passthrough_removed); }
+    if which == 6 { return cast<i32>(t.opt_stats.inverted_absorbed); }
+    if which == 7 { return cast<i32>(t.opt_stats.cse_merged); }
+    if which == 8 { return cast<i32>(t.opt_stats.dce_removed); }
+    return 0;
+}
+
+fn emit_artifacts_inner(allocator: Allocator, t: &LiveTrainer) -> mem::Error!void {
+    var code = string::new(allocator);
+    defer code.deinit(allocator);
+    try trainer_emit_aot_code(allocator, t, &var code);
+    let code_bytes = code.as_bytes();
+    // SAFETY: give_bytes synchronously copies code_bytes inside JS host.
+    unsafe give_bytes(0, code_bytes);
+
+    var ir = string::new(allocator);
+    defer ir.deinit(allocator);
+    try trainer_emit_ir_json(allocator, t, &var ir);
+    let ir_bytes = ir.as_bytes();
+    // SAFETY: give_bytes synchronously copies ir_bytes inside JS host.
+    unsafe give_bytes(1, ir_bytes);
+    return;
+}
+
+export "browser" fn live_emit_artifacts(handle: usize) -> i32 {
+    if handle == 0 { return 1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    if !t.has_synth { return 2; }
+    if emit_artifacts_inner(allocator, t) {} else |_| {
+        return 3;
+    }
+    return 0;
+}
+
+export "browser" fn live_infer(handle: usize, bits: u32, use_hard: i32) -> i32 {
+    if handle == 0 { return -1; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    return trainer_infer(t, bits, use_hard != 0);
+}
+
+export "browser" fn live_vote(handle: usize, cls: i32, use_hard: i32) -> i32 {
+    if handle == 0 or cls < 0 or cls >= 3 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    if use_hard != 0 {
+        return t.test_hard_votes[cast<i64>(cls)];
+    }
+    return cast<i32>(t.test_soft_probs[cast<i64>(cls)] * 1000.0 + 0.5);
+}
+
+export "browser" fn live_wire_milli(handle: usize, is_opt: i32, wire_id: i32) -> i32 {
+    if handle == 0 or wire_id < 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm read access.
+    let t = unsafe &p.*;
+    let wi = cast<i64>(wire_id);
+    if is_opt != 0 {
+        if wi >= t.test_opt_wires.len() { return 0; }
+        let ow = t.test_opt_wires.as_slice();
+        return if ow[wi] != 0 { cast<i32>(1000) } else { cast<i32>(0) };
+    }
+    if wi >= t.test_raw_wires.len() { return 0; }
+    let rw = t.test_raw_wires.as_slice();
+    return cast<i32>(rw[wi] * 1000.0 + 0.5);
+}
+
+export "browser" fn live_bench_synth_64way(handle: usize, iters: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from live_create and stays valid for this Wasm instance.
+    let p = unsafe ptr_from_int<ptr<LiveTrainer>>(handle);
+    // SAFETY: single-threaded browser Wasm exclusive access.
+    let t = unsafe &var p.*;
+    let ck = trainer_bench_synth_64way(t, cast<i64>(iters));
+    return cast<i32>(ck & cast<u64>(0x7fffffff));
+}
+
+// =========================================================================
+// LAB-02 (ladder/): LogicLadderGPT L0 -> L3-C Browser Inference + Attention Map
+// =========================================================================
+
+fn load_ladder_inner(allocator: Allocator, byte_len: i64) -> mem::Error!model::LadderRuntime {
+    var blob = try read_host_slot(allocator, 0, byte_len);
+    defer blob.deinit(allocator);
+    let bytes = blob.as_bytes();
+    return try model::ladder_runtime_from_bytes(allocator, bytes);
+}
+
+export "browser" fn ladder_load(byte_len: i32) -> usize {
+    let allocator = mem::page_allocator();
+    if load_ladder_inner(allocator, cast<i64>(byte_len)) |rt| {
+        let words = (cast<i64>(mem::size_of<model::LadderRuntime>()) + 7) / 8;
+        var backing = array::new<u64>(allocator);
+        for 0..words |_| {
+            if backing.append(allocator, cast<u64>(0)) {} else |_| {
+                rt.deinit(allocator);
+                backing.deinit(allocator);
+                return 0;
+            }
+        }
+        let slots = backing.as_mut_slice();
+        // SAFETY: backing has 8-byte alignment and enough storage for LadderRuntime.
+        let p = unsafe cast<ptr<model::LadderRuntime>>(mut_ptr_of(slots));
+        // SAFETY: p points to uninitialized storage leaked below for this session.
+        unsafe ptr_write(p, move rt);
+        // SAFETY: opaque handle returned to JS.
+        let addr = unsafe int_from_ptr<usize>(p);
+        mem::leak<array::Array<u64>>(move backing);
+        return addr;
+    } else |_| {
+        return 0;
+    }
+}
+
+export "browser" fn ladder_meta(handle: usize, which: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let rt = unsafe &p.*;
+    if which == 0 { return model::rung_to_i32(rt.rung); }
+    if which == 1 { return cast<i32>(rt.vocab_size); }
+    if which == 2 { return cast<i32>(rt.seq_len); }
+    if which == 3 { return cast<i32>(rt.d_model); }
+    if which == 4 { return cast<i32>(rt.n_heads); }
+    if which == 5 { return cast<i32>(rt.n_layers); }
+    if which == 6 { return rt.soft_ppl_x100; }
+    if which == 7 { return rt.hard_ppl_x100; }
+    if which == 8 { return rt.train_steps; }
+    if which == 9 { return cast<i32>(model::ladder_runtime_logic_gates(rt)); }
+    return 0;
+}
+
+export "browser" fn ladder_block_muls(handle: usize, seq_pos: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let rt = unsafe &p.*;
+    return cast<i32>(model::ladder_runtime_block_muls_per_tok(rt, cast<i64>(seq_pos)));
+}
+
+fn eval_ladder_bytes_inner(allocator: Allocator, rt: &var model::LadderRuntime, byte_len: i64) -> mem::Error!i32 {
+    var text = try read_host_slot(allocator, 1, byte_len);
+    defer text.deinit(allocator);
+    let bytes = text.as_bytes();
+    let max_t = rt.seq_len;
+
+    if rt.is_bpe {
+        var enc = array::new<i32>(allocator);
+        defer enc.deinit(allocator);
+        try data::bpe_encode(allocator, &rt.bpe, bytes, &var enc);
+        let total = enc.len();
+        let use_len = if total > max_t { max_t } else { total };
+        if use_len <= 0 { return 0; }
+        let start = total - use_len;
+        let enc_s = enc.as_slice();
+        let sub = enc_s[start..total];
+        model::ladder_runtime_forward(rt, sub, use_len);
+
+        // Emit NUL-separated UTF-8 token pieces for the active window (kind=3)
+        var joined = string::new(allocator);
+        defer joined.deinit(allocator);
+        for 0..use_len |i| {
+            if i > 0 { try joined.append_byte(allocator, cast<u8>(0)); }
+            let piece = data::bpe_token_bytes(&rt.bpe, sub[i]);
+            try joined.append_bytes(allocator, piece);
+        }
+        let jb = joined.as_bytes();
+        // SAFETY: give_bytes synchronously copies bytes inside JS host.
+        unsafe give_bytes(3, jb);
+        return cast<i32>(use_len);
+    }
+
+    let n = mem::len(bytes);
+    let use_len = if n > max_t { max_t } else { n };
+    if use_len <= 0 {
+        return 0;
+    }
+    let start = n - use_len;
+    var toks = [128]i32{};
+    let ts = toks.as_mut_slice();
+    let b2i = rt.byte_to_id.as_slice();
+    for 0..use_len |i| {
+        ts[i] = b2i[cast<i64>(bytes[start + i])];
+    }
+    let tok_s = toks.as_slice();
+    model::ladder_runtime_forward(rt, tok_s, use_len);
+    return cast<i32>(use_len);
+}
+
+export "browser" fn ladder_eval_bytes(handle: usize, byte_len: i32) -> i32 {
+    if handle == 0 { return 0; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let rt = unsafe &var p.*;
+    return eval_ladder_bytes_inner(allocator, rt, cast<i64>(byte_len)) catch 0;
+}
+
+export "browser" fn ladder_sample_byte(handle: usize, temp_milli: i32, reseed: u32) -> i32 {
+    if handle == 0 { return 32; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let rt = unsafe &var p.*;
+    if reseed != 0 {
+        rt.rng = core::rng_new(cast<u64>(reseed));
+    }
+    let tid = model::ladder_runtime_sample_next(rt, cast<f32>(temp_milli) * 0.001);
+    let i2b = rt.id_to_byte.as_bytes();
+    let idx = cast<i64>(tid);
+    if idx < 0 or idx >= rt.vocab_size { return 32; }
+    return cast<i32>(i2b[idx]);
+}
+
+/// Samples next token for BPE models: emits exact UTF-8 token bytes via give_bytes(kind=2) and returns token id.
+export "browser" fn ladder_sample_bpe(handle: usize, temp_milli: i32, reseed: u32) -> i32 {
+    if handle == 0 { return -1; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let rt = unsafe &var p.*;
+    if reseed != 0 {
+        rt.rng = core::rng_new(cast<u64>(reseed));
+    }
+    let tid = model::ladder_runtime_sample_next(rt, cast<f32>(temp_milli) * 0.001);
+    let piece = data::bpe_token_bytes(&rt.bpe, tid);
+    // SAFETY: give_bytes synchronously copies UTF-8 bytes inside JS host.
+    unsafe give_bytes(2, piece);
+    return tid;
+}
+
+/// Emits the `rank`-th highest probability BPE token's UTF-8 bytes via give_bytes(kind=2) and returns prob_milli.
+export "browser" fn ladder_top_bpe(handle: usize, rank: i32) -> i32 {
+    if handle == 0 or rank < 0 or rank >= 8 { return 0; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let rt = unsafe &p.*;
+    let v = rt.vocab_size;
+    let pr = rt.last_probs.as_slice();
+    var used = [2048]i32{};
+    let us = used.as_mut_slice();
+    var best_id: i64 = 0;
+    var best_p: f32 = -1.0;
+    let target_r = cast<i64>(rank) + 1;
+    for 0..target_r |_| {
+        best_id = 0;
+        best_p = -1.0;
+        for 0..v |c| {
+            if us[c] == 0 and pr[c] > best_p {
+                best_p = pr[c];
+                best_id = c;
+            }
+        }
+        us[best_id] = 1;
+    }
+    let piece = data::bpe_token_bytes(&rt.bpe, cast<i32>(best_id));
+    // SAFETY: give_bytes synchronously copies UTF-8 bytes inside JS host.
+    unsafe give_bytes(2, piece);
+    return cast<i32>(best_p * 1000.0 + 0.5);
+}
+
+export "browser" fn ladder_attn_milli(handle: usize, layer: i32, head: i32, q: i32, k: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let rt = unsafe &p.*;
+    let l = cast<i64>(layer);
+    let h = cast<i64>(head);
+    let qi = cast<i64>(q);
+    let ki = cast<i64>(k);
+    if l < 0 or l >= rt.n_layers or h < 0 or h >= rt.n_heads or qi < 0 or qi >= rt.seq_len or ki < 0 or ki >= rt.seq_len {
+        return 0;
+    }
+    let idx = ((l * rt.n_heads + h) * rt.seq_len + qi) * rt.seq_len + ki;
+    let am = rt.attn_maps.as_slice();
+    return cast<i32>(am[idx] * 1000.0 + 0.5);
+}
+
+/// Returns packed `(prob_milli << 8) | ascii_byte` for the `rank`-th highest probability next token (0..4).
+export "browser" fn ladder_top_token(handle: usize, rank: i32) -> i32 {
+    if handle == 0 or rank < 0 or rank >= 8 { return 0; }
+    // SAFETY: handle came from ladder_load.
+    let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let rt = unsafe &p.*;
+    let v = rt.vocab_size;
+    let pr = rt.last_probs.as_slice();
+    let i2b = rt.id_to_byte.as_bytes();
+    var used = [128]i32{};
+    let us = used.as_mut_slice();
+    var best_id: i64 = 0;
+    var best_p: f32 = -1.0;
+    let target_r = cast<i64>(rank) + 1;
+    for 0..target_r |_| {
+        best_id = 0;
+        best_p = -1.0;
+        for 0..v |c| {
+            if us[c] == 0 and pr[c] > best_p {
+                best_p = pr[c];
+                best_id = c;
+            }
+        }
+        us[best_id] = 1;
+    }
+    let pm = cast<i32>(best_p * 1000.0 + 0.5);
+    let b = cast<i32>(i2b[best_id]);
+    return (pm << 8) | (b & 255);
+}
+
+// =========================================================================
+// LAB-03 (distill/): Japanese Real-Time Router Distillation + Logic Synthesis
+// =========================================================================
+
+export "browser" fn distill_create(seed: u32) -> usize {
+    let allocator = mem::page_allocator();
+    if dl_lab_new(allocator, cast<u64>(seed)) |lab| {
+        let words = (cast<i64>(mem::size_of<DistillLab>()) + 7) / 8;
+        var backing = array::new<u64>(allocator);
+        for 0..words |_| {
+            if backing.append(allocator, cast<u64>(0)) {} else |_| {
+                lab.deinit(allocator);
+                backing.deinit(allocator);
+                return 0;
+            }
+        }
+        let slots = backing.as_mut_slice();
+        // SAFETY: backing has 8-byte alignment and enough storage for DistillLab.
+        let p = unsafe cast<ptr<DistillLab>>(mut_ptr_of(slots));
+        // SAFETY: p points to storage leaked below for this session.
+        unsafe ptr_write(p, move lab);
+        // SAFETY: opaque handle returned to JS.
+        let addr = unsafe int_from_ptr<usize>(p);
+        mem::leak<array::Array<u64>>(move backing);
+        return addr;
+    } else |_| {
+        return 0;
+    }
+}
+
+export "browser" fn distill_clear(handle: usize) -> i32 {
+    if handle == 0 { return 1; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    dl_lab_clear(lab);
+    return 0;
+}
+
+fn distill_add_slot_inner(allocator: Allocator, lab: &var DistillLab, byte_len: i64, label: i32, split: i32) -> mem::Error!i32 {
+    var text = try read_host_slot(allocator, 1, byte_len);
+    defer text.deinit(allocator);
+    let bytes = text.as_bytes();
+    return cast<i32>(dl_lab_add_text(lab, bytes, label, split));
+}
+
+export "browser" fn distill_add_text(handle: usize, byte_len: i32, label: i32, split: i32) -> i32 {
+    if handle == 0 { return -1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    return distill_add_slot_inner(allocator, lab, cast<i64>(byte_len), label, split) catch -1;
+}
+
+export "browser" fn distill_train_teacher(handle: usize, steps: i32, lr_milli: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    let loss = dl_lab_train_teacher(lab, cast<i64>(steps), cast<f32>(lr_milli) * 0.001);
+    return cast<i32>(loss * 1000.0 + 0.5);
+}
+
+export "browser" fn distill_train_students(handle: usize, steps: i32, lr_milli: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    return cast<i32>(dl_lab_train_students(lab, cast<i64>(steps), cast<f32>(lr_milli) * 0.001));
+}
+
+export "browser" fn distill_metric_milli(handle: usize, which: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let lab = unsafe &p.*;
+    if which == 0 { return cast<i32>(lab.teacher_train_acc * 1000.0 + 0.5); }
+    if which == 1 { return cast<i32>(lab.teacher_val_acc * 1000.0 + 0.5); }
+    if which == 2 { return cast<i32>(lab.scratch_loss * 1000.0 + 0.5); }
+    if which == 3 { return cast<i32>(lab.scratch_train_acc * 1000.0 + 0.5); }
+    if which == 4 { return cast<i32>(lab.scratch_val_acc * 1000.0 + 0.5); }
+    if which == 5 { return cast<i32>(lab.kd_loss * 1000.0 + 0.5); }
+    if which == 6 { return cast<i32>(lab.kd_train_acc * 1000.0 + 0.5); }
+    if which == 7 { return cast<i32>(lab.kd_val_acc * 1000.0 + 0.5); }
+    if which == 8 { return cast<i32>(lab.kd_teacher_agree * 1000.0 + 0.5); }
+    if which == 9 { return cast<i32>(lab.student_step); }
+    return 0;
+}
+
+export "browser" fn distill_synthesize(handle: usize) -> i32 {
+    if handle == 0 { return -1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    let opt_g = dl_lab_synthesize(allocator, lab) catch -1;
+    return cast<i32>(opt_g);
+}
+
+export "browser" fn distill_synth_stat(handle: usize, which: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let lab = unsafe &p.*;
+    if which == 0 { return cast<i32>(lab.opt_stats.raw_gates); }
+    if which == 1 { return cast<i32>(lab.opt_stats.opt_gates); }
+    if which == 2 { return cast<i32>(lab.opt_stats.raw_depth); }
+    if which == 3 { return cast<i32>(lab.opt_stats.opt_depth); }
+    if which == 4 { return cast<i32>(lab.opt_stats.const_folded); }
+    if which == 5 { return cast<i32>(lab.opt_stats.passthrough_removed); }
+    if which == 6 { return cast<i32>(lab.opt_stats.inverted_absorbed); }
+    if which == 7 { return cast<i32>(lab.opt_stats.cse_merged); }
+    if which == 8 { return cast<i32>(lab.opt_stats.dce_removed); }
+    return 0;
+}
+
+fn emit_distill_code_inner(allocator: Allocator, lab: &DistillLab) -> mem::Error!void {
+    var code = string::new(allocator);
+    defer code.deinit(allocator);
+    try dl_lab_emit_code(allocator, lab, &var code);
+    let bytes = code.as_bytes();
+    // SAFETY: give_bytes synchronously copies bytes inside JS host.
+    unsafe give_bytes(0, bytes);
+    return;
+}
+
+export "browser" fn distill_emit_code(handle: usize) -> i32 {
+    if handle == 0 { return 1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let lab = unsafe &p.*;
+    if !lab.has_synth { return 2; }
+    if emit_distill_code_inner(allocator, lab) {} else |_| { return 3; }
+    return 0;
+}
+
+fn distill_infer_slot_inner(allocator: Allocator, lab: &var DistillLab, byte_len: i64) -> mem::Error!i32 {
+    var text = try read_host_slot(allocator, 1, byte_len);
+    defer text.deinit(allocator);
+    let bytes = text.as_bytes();
+    return dl_lab_infer_utf8(lab, bytes);
+}
+
+export "browser" fn distill_infer(handle: usize, byte_len: i32) -> i32 {
+    if handle == 0 { return -1; }
+    let allocator = mem::page_allocator();
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    return distill_infer_slot_inner(allocator, lab, cast<i64>(byte_len)) catch -1;
+}
+
+export "browser" fn distill_result(handle: usize, which: i32, cls: i32) -> i32 {
+    if handle == 0 or cls < 0 or cls >= 4 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let lab = unsafe &p.*;
+    let c = cast<i64>(cls);
+    if which == 0 { return cast<i32>(lab.last_teacher_probs[c] * 1000.0 + 0.5); }
+    if which == 1 { return lab.last_scratch_votes[c]; }
+    if which == 2 { return lab.last_kd_votes[c]; }
+    if which == 3 {
+        if cls == 0 { return lab.last_teacher_pred; }
+        if cls == 1 { return lab.last_scratch_pred; }
+        if cls == 2 { return lab.last_kd_pred; }
+        return cast<i32>(core::popcount_u64(lab.last_fp));
+    }
+    return 0;
+}
+
+export "browser" fn distill_fp_bit(handle: usize, bit_idx: i32) -> i32 {
+    if handle == 0 or bit_idx < 0 or bit_idx >= 64 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm read access.
+    let lab = unsafe &p.*;
+    let b = (lab.last_fp >> cast<u64>(bit_idx)) & cast<u64>(1);
+    return if b != 0 { cast<i32>(1) } else { cast<i32>(0) };
+}
+
+export "browser" fn distill_bench(handle: usize, is_vm: i32, iters: i32) -> i32 {
+    if handle == 0 { return 0; }
+    // SAFETY: handle came from distill_create.
+    let p = unsafe ptr_from_int<ptr<DistillLab>>(handle);
+    // SAFETY: single-threaded Wasm exclusive access.
+    let lab = unsafe &var p.*;
+    return dl_lab_bench(lab, is_vm != 0, cast<i64>(iters));
+}
+
+// =========================================================================
+// LAB-01b (compiler/): Stage 1 pre-compiled AOT vs VM verification exports
+// =========================================================================
+
+export "browser" fn lab_version() -> i32 {
+    return 3;
+}
+
+export "browser" fn lab_float_muls() -> i32 {
+    return 0;
+}
+
+export "browser" fn lab_raw_gates(task_id: i32) -> i32 {
+    if task_id == 0 { return cast<i32>(xor_raw_gates()); }
+    if task_id == 1 { return cast<i32>(parity4_raw_gates()); }
+    if task_id == 2 { return cast<i32>(adder2_raw_gates()); }
+    return 0;
+}
+
+export "browser" fn lab_opt_gates(task_id: i32) -> i32 {
+    if task_id == 0 { return cast<i32>(xor_opt_gates()); }
+    if task_id == 1 { return cast<i32>(parity4_opt_gates()); }
+    if task_id == 2 { return cast<i32>(adder2_opt_gates()); }
+    return 0;
+}
+
+export "browser" fn lab_raw_depth(task_id: i32) -> i32 {
+    if task_id == 0 { return cast<i32>(xor_raw_depth()); }
+    if task_id == 1 { return cast<i32>(parity4_raw_depth()); }
+    if task_id == 2 { return cast<i32>(adder2_raw_depth()); }
+    return 0;
+}
+
+export "browser" fn lab_opt_depth(task_id: i32) -> i32 {
+    if task_id == 0 { return cast<i32>(xor_opt_depth()); }
+    if task_id == 1 { return cast<i32>(parity4_opt_depth()); }
+    if task_id == 2 { return cast<i32>(adder2_opt_depth()); }
+    return 0;
+}
+
+fn eval_single_aot(task_id: i32, input_mask: i32) -> i32 {
+    let m = cast<u64>(input_mask);
+    if task_id == 0 {
+        var in_bits = [2]u64{
+            if (m & 1) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+            if (m & 2) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        };
+        var out_bits = [32]u64{};
+        let ib = in_bits.as_slice();
+        let ob = out_bits.as_mut_slice();
+        aot_xor_64(ib, ob);
+        return cast<i32>(synth::groupsum_argmax_lane(ob, xor_out_count(), 2, 0));
+    }
+    var in_bits4 = [4]u64{
+        if (m & 1) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 2) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 4) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 8) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+    };
+    let ib4 = in_bits4.as_slice();
+    if task_id == 1 {
+        var pout = [1]u64{};
+        let po = pout.as_mut_slice();
+        aot_parity4_64(ib4, po);
+        return cast<i32>(po[0] & cast<u64>(1));
+    }
+    var aout = [3]u64{};
+    let ao = aout.as_mut_slice();
+    aot_adder2_64(ib4, ao);
+    let b0 = ao[0] & cast<u64>(1);
+    let b1 = ao[1] & cast<u64>(1);
+    let b2 = ao[2] & cast<u64>(1);
+    return cast<i32>(b0 | (b1 << 1) | (b2 << 2));
+}
+
+fn eval_single_vm_inner(task_id: i32, input_mask: i32) -> mem::Error!i32 {
+    let allocator = mem::page_allocator();
+    let m = cast<u64>(input_mask);
+    if task_id == 0 {
+        var c = try build_vm_xor(allocator);
+        defer c.deinit(allocator);
+        var scratch = try core::alloc_u64(allocator, 2 + c.gate_count + 1);
+        defer scratch.deinit(allocator);
+        var out_bits = try core::alloc_u64(allocator, c.out_wires.len());
+        defer out_bits.deinit(allocator);
+        var in_bits = [2]u64{
+            if (m & 1) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+            if (m & 2) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        };
+        let ib = in_bits.as_slice();
+        let sc = scratch.as_mut_slice();
+        let ob = out_bits.as_mut_slice();
+        synth::eval_circuit_vm_u64(&c, ib, sc, ob);
+        return cast<i32>(synth::groupsum_argmax_lane(ob, c.out_wires.len(), 2, 0));
+    }
+    var in_bits4 = [4]u64{
+        if (m & 1) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 2) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 4) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+        if (m & 8) != 0 { cast<u64>(1) } else { cast<u64>(0) },
+    };
+    let ib4 = in_bits4.as_slice();
+    if task_id == 1 {
+        var c = try build_vm_parity4(allocator);
+        defer c.deinit(allocator);
+        var scratch = try core::alloc_u64(allocator, 4 + c.gate_count + 1);
+        defer scratch.deinit(allocator);
+        var pout = [1]u64{};
+        let sc = scratch.as_mut_slice();
+        let po = pout.as_mut_slice();
+        synth::eval_circuit_vm_u64(&c, ib4, sc, po);
+        return cast<i32>(po[0] & cast<u64>(1));
+    }
+    var c = try build_vm_adder2(allocator);
+    defer c.deinit(allocator);
+    var scratch = try core::alloc_u64(allocator, 4 + c.gate_count + 1);
+    defer scratch.deinit(allocator);
+    var aout = [3]u64{};
+    let sc = scratch.as_mut_slice();
+    let ao = aout.as_mut_slice();
+    synth::eval_circuit_vm_u64(&c, ib4, sc, ao);
+    let b0 = ao[0] & cast<u64>(1);
+    let b1 = ao[1] & cast<u64>(1);
+    let b2 = ao[2] & cast<u64>(1);
+    return cast<i32>(b0 | (b1 << 1) | (b2 << 2));
+}
+
+export "browser" fn lab_eval(task_id: i32, mode: i32, input_mask: i32) -> i32 {
+    if mode == 1 {
+        return eval_single_aot(task_id, input_mask);
+    }
+    return eval_single_vm_inner(task_id, input_mask) catch -1;
+}
+
+fn bench_vm_inner(task_id: i32, iters: i32) -> mem::Error!u64 {
+    let allocator = mem::page_allocator();
+    let count = cast<i64>(iters);
+    var sink: u64 = 0;
+    if task_id == 0 {
+        var c = try build_vm_xor(allocator);
+        defer c.deinit(allocator);
+        var scratch = try core::alloc_u64(allocator, 2 + c.gate_count + 1);
+        defer scratch.deinit(allocator);
+        var out_bits = try core::alloc_u64(allocator, c.out_wires.len());
+        defer out_bits.deinit(allocator);
+        var in_bits = [2]u64{ 0b1010, 0b1100 };
+        let ib = in_bits.as_mut_slice();
+        let sc = scratch.as_mut_slice();
+        let ob = out_bits.as_mut_slice();
+        for 0..count |i| {
+            ib[0] = cast<u64>(i);
+            synth::eval_circuit_vm_u64(&c, ib, sc, ob);
+            sink = sink ^ ob[0];
+        }
+        return sink;
+    }
+    if task_id == 1 {
+        var c = try build_vm_parity4(allocator);
+        defer c.deinit(allocator);
+        var scratch = try core::alloc_u64(allocator, 4 + c.gate_count + 1);
+        defer scratch.deinit(allocator);
+        var out_bits = [1]u64{};
+        var in_bits = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
+        let ib = in_bits.as_mut_slice();
+        let sc = scratch.as_mut_slice();
+        let ob = out_bits.as_mut_slice();
+        for 0..count |i| {
+            ib[0] = cast<u64>(i);
+            synth::eval_circuit_vm_u64(&c, ib, sc, ob);
+            sink = sink ^ ob[0];
+        }
+        return sink;
+    }
+    var c = try build_vm_adder2(allocator);
+    defer c.deinit(allocator);
+    var scratch = try core::alloc_u64(allocator, 4 + c.gate_count + 1);
+    defer scratch.deinit(allocator);
+    var out_bits = [3]u64{};
+    var in_bits = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
+    let ib = in_bits.as_mut_slice();
+    let sc = scratch.as_mut_slice();
+    let ob = out_bits.as_mut_slice();
+    for 0..count |i| {
+        ib[0] = cast<u64>(i);
+        synth::eval_circuit_vm_u64(&c, ib, sc, ob);
+        sink = sink ^ ob[0] ^ ob[1] ^ ob[2];
+    }
+    return sink;
+}
+
+export "browser" fn lab_bench_64way(task_id: i32, mode: i32, iters: i32) -> i32 {
+    if mode == 0 {
+        let s = bench_vm_inner(task_id, iters) catch cast<u64>(0);
+        return cast<i32>(s & cast<u64>(0x7fffffff));
+    }
+    let count = cast<i64>(iters);
+    var sink: u64 = 0;
+    if task_id == 0 {
+        var in_bits = [2]u64{ 0b1010, 0b1100 };
+        var out_bits = [32]u64{};
+        let ib = in_bits.as_mut_slice();
+        let ob = out_bits.as_mut_slice();
+        for 0..count |i| {
+            ib[0] = cast<u64>(i);
+            aot_xor_64(ib, ob);
+            sink = sink ^ ob[0];
+        }
+        return cast<i32>(sink & cast<u64>(0x7fffffff));
+    }
+    if task_id == 1 {
+        var in_bits = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
+        var out_bits = [1]u64{};
+        let ib = in_bits.as_mut_slice();
+        let ob = out_bits.as_mut_slice();
+        for 0..count |i| {
+            ib[0] = cast<u64>(i);
+            aot_parity4_64(ib, ob);
+            sink = sink ^ ob[0];
+        }
+        return cast<i32>(sink & cast<u64>(0x7fffffff));
+    }
+    var in_bits = [4]u64{ 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
+    var out_bits = [3]u64{};
+    let ib = in_bits.as_mut_slice();
+    let ob = out_bits.as_mut_slice();
+    for 0..count |i| {
+        ib[0] = cast<u64>(i);
+        aot_adder2_64(ib, ob);
+        sink = sink ^ ob[0] ^ ob[1] ^ ob[2];
+    }
+    return cast<i32>(sink & cast<u64>(0x7fffffff));
+}
+
+pub fn run_browser() -> void {
+    print("griffith-kizu unified lab wasm ready (draw / compiler / ladder / distill)");
+    return;
+}

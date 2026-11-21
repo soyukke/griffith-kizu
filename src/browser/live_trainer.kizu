@@ -1,0 +1,894 @@
+import griffith::codegen;
+import griffith::core;
+import griffith::lut;
+import griffith::synth;
+import std::array;
+import std::math;
+import std::mem;
+import std::string;
+import std::testing;
+
+pub fn live_in_dim() -> i64 { return 25; }
+pub fn live_h1() -> i64 { return 48; }
+pub fn live_h2() -> i64 { return 48; }
+pub fn live_h3() -> i64 { return 24; }
+pub fn live_num_classes() -> i64 { return 3; }
+pub fn live_max_samples() -> i64 { return 64; }
+pub fn live_total_gates() -> i64 { return 48 + 48 + 24; }
+pub fn live_opt_cap() -> i64 { return 256; }
+
+pub struct LiveTrainer {
+    pub param_mode: lut::ParamMode,
+    pub rng: core::Rng,
+    pub step: i64,
+    pub sample_count: i64,
+    pub sample_bits: array::Array<i32>,
+    pub sample_labels: array::Array<i32>,
+    pub l1: lut::LutLayer,
+    pub l2: lut::LutLayer,
+    pub l3: lut::LutLayer,
+    pub gs: lut::GroupSum,
+    // Preallocated training/eval scratch buffers
+    pub x_buf: array::Array<f32>,
+    pub a1: array::Array<f32>,
+    pub a2: array::Array<f32>,
+    pub a3: array::Array<f32>,
+    pub logits: array::Array<f32>,
+    pub g_logits: array::Array<f32>,
+    pub ga3: array::Array<f32>,
+    pub ga2: array::Array<f32>,
+    pub ga1: array::Array<f32>,
+    pub gx: array::Array<f32>,
+    // Latest training telemetry
+    pub last_soft_loss: f32,
+    pub last_soft_acc: f32,
+    pub last_hard_acc: f32,
+    pub last_sharpness: f32,
+    // Synthesized minimal circuit state (preallocated fixed-capacity backing)
+    pub has_synth: bool,
+    pub opt_circuit: synth::Circuit,
+    pub opt_stats: synth::OptStats,
+    // Live single-drawing inference readout cache
+    pub test_soft_probs: [3]f32,
+    pub test_hard_votes: [3]i32,
+    pub test_raw_wires: array::Array<f32>,
+    pub test_opt_wires: array::Array<i32>,
+    pub test_vm_scratch: array::Array<u64>,
+    pub test_vm_out: array::Array<u64>,
+}
+
+pub fn (self: LiveTrainer) deinit(allocator: Allocator) -> void {
+    self.sample_bits.deinit(allocator);
+    self.sample_labels.deinit(allocator);
+    self.l1.deinit(allocator);
+    self.l2.deinit(allocator);
+    self.l3.deinit(allocator);
+    self.x_buf.deinit(allocator);
+    self.a1.deinit(allocator);
+    self.a2.deinit(allocator);
+    self.a3.deinit(allocator);
+    self.logits.deinit(allocator);
+    self.g_logits.deinit(allocator);
+    self.ga3.deinit(allocator);
+    self.ga2.deinit(allocator);
+    self.ga1.deinit(allocator);
+    self.gx.deinit(allocator);
+    self.opt_circuit.deinit(allocator);
+    self.test_raw_wires.deinit(allocator);
+    self.test_opt_wires.deinit(allocator);
+    self.test_vm_scratch.deinit(allocator);
+    self.test_vm_out.deinit(allocator);
+    return;
+}
+
+fn prealloc_opt_circuit(allocator: Allocator) -> mem::Error!synth::Circuit {
+    let cap = live_opt_cap();
+    let oc = live_h3();
+    var ga = try core::alloc_i32(allocator, cap);
+    errdefer ga.deinit(allocator);
+    var gp = try core::alloc_i32(allocator, cap * 6);
+    errdefer gp.deinit(allocator);
+    var gt = try core::alloc_u64(allocator, cap);
+    errdefer gt.deinit(allocator);
+    var ow = try core::alloc_i32(allocator, oc);
+    errdefer ow.deinit(allocator);
+    return synth::Circuit {
+        input_width: live_in_dim(),
+        gate_count: 0,
+        gate_arity: move ga,
+        gate_pins: move gp,
+        gate_tt: move gt,
+        out_wires: move ow,
+        group_sum_k: live_num_classes(),
+        group_sum_tau: 1.5,
+    };
+}
+
+fn zero_opt_stats() -> synth::OptStats {
+    return synth::OptStats {
+        raw_gates: live_total_gates(),
+        opt_gates: live_total_gates(),
+        const_folded: 0,
+        passthrough_removed: 0,
+        inverted_absorbed: 0,
+        cse_merged: 0,
+        dce_removed: 0,
+        raw_depth: 3,
+        opt_depth: 3,
+    };
+}
+
+fn select_mode_for(pm: lut::ParamMode) -> lut::SelectMode {
+    match pm {
+        Warp => {
+            return lut::SelectMode::GumbelSt;
+        },
+        Softmax => {
+            return lut::SelectMode::Soft;
+        },
+    }
+}
+
+pub fn trainer_new(
+    allocator: Allocator,
+    seed: u64,
+    param_mode: lut::ParamMode
+) -> mem::Error!LiveTrainer {
+    var rng = core::rng_new(seed);
+    let sm = select_mode_for(param_mode);
+    let max_b = live_max_samples();
+    let in_d = live_in_dim();
+    let h1 = live_h1();
+    let h2 = live_h2();
+    let h3 = live_h3();
+    let k = live_num_classes();
+
+    var sample_bits = try core::alloc_i32(allocator, max_b);
+    errdefer sample_bits.deinit(allocator);
+    var sample_labels = try core::alloc_i32(allocator, max_b);
+    errdefer sample_labels.deinit(allocator);
+
+    var l1 = try lut::lut_layer_new(allocator, in_d, h1, 2, param_mode, sm, 1.0, 0.35, max_b, &var rng);
+    errdefer l1.deinit(allocator);
+    var l2 = try lut::lut_layer_new(allocator, h1, h2, 2, param_mode, sm, 1.0, 0.35, max_b, &var rng);
+    errdefer l2.deinit(allocator);
+    var l3 = try lut::lut_layer_new(allocator, h2, h3, 2, param_mode, sm, 1.0, 0.35, max_b, &var rng);
+    errdefer l3.deinit(allocator);
+
+    var x_buf = try core::alloc_f32(allocator, max_b * in_d);
+    errdefer x_buf.deinit(allocator);
+    var a1 = try core::alloc_f32(allocator, max_b * h1);
+    errdefer a1.deinit(allocator);
+    var a2 = try core::alloc_f32(allocator, max_b * h2);
+    errdefer a2.deinit(allocator);
+    var a3 = try core::alloc_f32(allocator, max_b * h3);
+    errdefer a3.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, max_b * k);
+    errdefer logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, max_b * k);
+    errdefer g_logits.deinit(allocator);
+    var ga3 = try core::alloc_f32(allocator, max_b * h3);
+    errdefer ga3.deinit(allocator);
+    var ga2 = try core::alloc_f32(allocator, max_b * h2);
+    errdefer ga2.deinit(allocator);
+    var ga1 = try core::alloc_f32(allocator, max_b * h1);
+    errdefer ga1.deinit(allocator);
+    var gx = try core::alloc_f32(allocator, max_b * in_d);
+    errdefer gx.deinit(allocator);
+
+    var opt_c = try prealloc_opt_circuit(allocator);
+    errdefer opt_c.deinit(allocator);
+
+    let total_raw_wires = in_d + live_total_gates();
+    let max_opt_wires = in_d + live_opt_cap();
+    var test_raw_wires = try core::alloc_f32(allocator, total_raw_wires);
+    errdefer test_raw_wires.deinit(allocator);
+    var test_opt_wires = try core::alloc_i32(allocator, max_opt_wires);
+    errdefer test_opt_wires.deinit(allocator);
+    var test_vm_scratch = try core::alloc_u64(allocator, max_opt_wires);
+    errdefer test_vm_scratch.deinit(allocator);
+    var test_vm_out = try core::alloc_u64(allocator, h3);
+    errdefer test_vm_out.deinit(allocator);
+
+    return LiveTrainer {
+        param_mode: param_mode,
+        rng: rng,
+        step: 0,
+        sample_count: 0,
+        sample_bits: move sample_bits,
+        sample_labels: move sample_labels,
+        l1: move l1,
+        l2: move l2,
+        l3: move l3,
+        gs: lut::groupsum_new(h3, k, 1.5),
+        x_buf: move x_buf,
+        a1: move a1,
+        a2: move a2,
+        a3: move a3,
+        logits: move logits,
+        g_logits: move g_logits,
+        ga3: move ga3,
+        ga2: move ga2,
+        ga1: move ga1,
+        gx: move gx,
+        last_soft_loss: 1.0986,
+        last_soft_acc: 0.333,
+        last_hard_acc: 0.333,
+        last_sharpness: 0.25,
+        has_synth: false,
+        opt_circuit: move opt_c,
+        opt_stats: zero_opt_stats(),
+        test_soft_probs: [3]f32{ 0.333, 0.333, 0.333 },
+        test_hard_votes: [3]i32{ 0, 0, 0 },
+        test_raw_wires: move test_raw_wires,
+        test_opt_wires: move test_opt_wires,
+        test_vm_scratch: move test_vm_scratch,
+        test_vm_out: move test_vm_out,
+    };
+}
+
+fn reseed_layer_in_place(layer: &var lut::LutLayer, rng: &var core::Rng) -> void {
+    let w_total = layer.out_dim * layer.w_cols;
+    let scale: f32 = 0.35;
+    let w_s = layer.weights.as_mut_slice();
+    let gw = layer.grad_w.as_mut_slice();
+    let am = layer.adam_m.as_mut_slice();
+    let av = layer.adam_v.as_mut_slice();
+    for 0..w_total |i| {
+        w_s[i] = rng.next_normal_f32() * scale;
+        gw[i] = 0.0;
+        am[i] = 0.0;
+        av[i] = 0.0;
+    }
+    layer.tau = 1.0;
+    layer.gumbel_scale = 0.35;
+    return;
+}
+
+pub fn trainer_reseed(t: &var LiveTrainer, seed: u64) -> void {
+    t.rng = core::rng_new(seed);
+    t.step = 0;
+    t.has_synth = false;
+    t.opt_stats = zero_opt_stats();
+    reseed_layer_in_place(&var t.l1, &var t.rng);
+    reseed_layer_in_place(&var t.l2, &var t.rng);
+    reseed_layer_in_place(&var t.l3, &var t.rng);
+    trainer_eval_metrics(t);
+    return;
+}
+
+pub fn trainer_clear_samples(t: &var LiveTrainer) -> void {
+    t.sample_count = 0;
+    return;
+}
+
+pub fn trainer_add_sample(t: &var LiveTrainer, bits: u32, label: i32) -> i64 {
+    if t.sample_count >= live_max_samples() {
+        return t.sample_count;
+    }
+    let idx = t.sample_count;
+    let sb = t.sample_bits.as_mut_slice();
+    let sl = t.sample_labels.as_mut_slice();
+    sb[idx] = cast<i32>(bits & cast<u32>(0x01ffffff));
+    sl[idx] = label;
+    t.sample_count = idx + 1;
+    return t.sample_count;
+}
+
+fn fill_x_from_samples(t: &var LiveTrainer) -> void {
+    let n = t.sample_count;
+    let in_d = live_in_dim();
+    let sb = t.sample_bits.as_slice();
+    let xb = t.x_buf.as_mut_slice();
+    for 0..n |b| {
+        let mask = cast<u32>(sb[b]);
+        let off = b * in_d;
+        for 0..in_d |i| {
+            let bit = (mask >> cast<u32>(i)) & cast<u32>(1);
+            xb[off + i] = if bit != 0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        }
+    }
+    return;
+}
+
+fn layer_gate_tt_and_sharp(layer: &lut::LutLayer, o: i64, out_tt: &var i32) -> f32 {
+    let w_s = layer.weights.as_slice();
+    let w_off = o * layer.w_cols;
+    match layer.param_mode {
+        Warp => {
+            var tr = [4]f32{};
+            var lg = [4]f32{};
+            let tr_s = tr.as_mut_slice();
+            let lg_s = lg.as_mut_slice();
+            for 0..4 |i| {
+                tr_s[i] = w_s[w_off + i];
+            }
+            lut::wh_theta_to_logits(tr_s, 2, lg_s);
+            var tt: i32 = 0;
+            var sharp_sum: f64 = 0.0;
+            let tau = if layer.tau > 0.15 { layer.tau } else { cast<f32>(0.15) };
+            for 0..4 |e| {
+                if lg_s[e] > 0.0 {
+                    tt = tt | cast<i32>(cast<u32>(1) << cast<u32>(e));
+                }
+                let p = core::sigmoid_f32(lg_s[e] / tau);
+                let dist = math::abs<f64>(2.0 * cast<f64>(p) - 1.0);
+                sharp_sum = sharp_sum + dist;
+            }
+            out_tt.* = tt;
+            return cast<f32>(sharp_sum * 0.25);
+        },
+        Softmax => {
+            var max_v = w_s[w_off];
+            var best: i64 = 0;
+            for 1..16 |c| {
+                let v = w_s[w_off + c];
+                if v > max_v {
+                    max_v = v;
+                    best = c;
+                }
+            }
+            var sum: f64 = 0.0;
+            for 0..16 |c| {
+                sum = sum + math::exp<f64>(cast<f64>(w_s[w_off + c] - max_v));
+            }
+            let max_p = 1.0 / sum;
+            out_tt.* = cast<i32>(lut::gate_table_n2_mask(best));
+            let norm = (max_p - 0.0625) / 0.9375;
+            if norm < 0.0 {
+                return 0.0;
+            }
+            if norm > 1.0 {
+                return 1.0;
+            }
+            return cast<f32>(norm);
+        },
+    }
+}
+
+fn compute_mean_sharpness(t: &LiveTrainer) -> f32 {
+    var acc: f64 = 0.0;
+    var dummy_tt: i32 = 0;
+    for 0..t.l1.out_dim |o| {
+        acc = acc + cast<f64>(layer_gate_tt_and_sharp(&t.l1, o, &var dummy_tt));
+    }
+    for 0..t.l2.out_dim |o| {
+        acc = acc + cast<f64>(layer_gate_tt_and_sharp(&t.l2, o, &var dummy_tt));
+    }
+    for 0..t.l3.out_dim |o| {
+        acc = acc + cast<f64>(layer_gate_tt_and_sharp(&t.l3, o, &var dummy_tt));
+    }
+    let total = cast<f64>(t.l1.out_dim + t.l2.out_dim + t.l3.out_dim);
+    return cast<f32>(acc / total);
+}
+
+fn eval_batch_acc(logits: []f32, labels: []i32, n: i64, k: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    var correct: i64 = 0;
+    for 0..n |b| {
+        let off = b * k;
+        var best_c: i64 = 0;
+        var best_v = logits[off];
+        for 1..k |c| {
+            let v = logits[off + c];
+            if v > best_v {
+                best_v = v;
+                best_c = c;
+            }
+        }
+        if best_c == cast<i64>(labels[b]) {
+            correct = correct + 1;
+        }
+    }
+    return cast<f32>(cast<f64>(correct) / cast<f64>(n));
+}
+
+fn step_l1_fwd(t: &var LiveTrainer, n: i64, training: bool) -> void {
+    let x_s = t.x_buf.as_slice();
+    let a1_m = t.a1.as_mut_slice();
+    lut::lut_forward(&var t.l1, x_s, n, a1_m, training, &var t.rng);
+    return;
+}
+
+fn step_l2_fwd(t: &var LiveTrainer, n: i64, training: bool) -> void {
+    let a1_s = t.a1.as_slice();
+    let a2_m = t.a2.as_mut_slice();
+    lut::lut_forward(&var t.l2, a1_s, n, a2_m, training, &var t.rng);
+    return;
+}
+
+fn step_l3_fwd(t: &var LiveTrainer, n: i64, training: bool) -> void {
+    let a2_s = t.a2.as_slice();
+    let a3_m = t.a3.as_mut_slice();
+    lut::lut_forward(&var t.l3, a2_s, n, a3_m, training, &var t.rng);
+    return;
+}
+
+fn step_gs_fwd(t: &var LiveTrainer, n: i64) -> void {
+    let a3_s = t.a3.as_slice();
+    let lg_m = t.logits.as_mut_slice();
+    lut::groupsum_forward(&t.gs, a3_s, n, lg_m);
+    return;
+}
+
+fn step_ce_loss_grad(t: &var LiveTrainer, n: i64) -> f32 {
+    let lg_s = t.logits.as_slice();
+    let sl_s = t.sample_labels.as_slice();
+    let gl_m = t.g_logits.as_mut_slice();
+    return lut::cross_entropy_loss_grad(lg_s, sl_s, n, live_num_classes(), gl_m);
+}
+
+fn step_logits_acc(t: &LiveTrainer, n: i64) -> f32 {
+    let lg_s = t.logits.as_slice();
+    let sl_s = t.sample_labels.as_slice();
+    return eval_batch_acc(lg_s, sl_s, n, live_num_classes());
+}
+
+fn step_gs_bwd(t: &var LiveTrainer, n: i64) -> void {
+    let gl_s = t.g_logits.as_slice();
+    let ga3_m = t.ga3.as_mut_slice();
+    lut::groupsum_backward(&t.gs, gl_s, n, ga3_m);
+    return;
+}
+
+fn step_l3_bwd(t: &var LiveTrainer) -> void {
+    let ga3_s = t.ga3.as_slice();
+    let ga2_m = t.ga2.as_mut_slice();
+    lut::lut_backward(&var t.l3, ga3_s, ga2_m, true);
+    return;
+}
+
+fn step_l2_bwd(t: &var LiveTrainer) -> void {
+    let ga2_s = t.ga2.as_slice();
+    let ga1_m = t.ga1.as_mut_slice();
+    lut::lut_backward(&var t.l2, ga2_s, ga1_m, true);
+    return;
+}
+
+fn step_l1_bwd(t: &var LiveTrainer) -> void {
+    let ga1_s = t.ga1.as_slice();
+    let gx_m = t.gx.as_mut_slice();
+    lut::lut_backward(&var t.l1, ga1_s, gx_m, false);
+    return;
+}
+
+fn copy_raw_activations(t: &var LiveTrainer) -> void {
+    let in_d = live_in_dim();
+    let h1 = live_h1();
+    let h2 = live_h2();
+    let h3 = live_h3();
+    let a1_s = t.a1.as_slice();
+    let a2_s = t.a2.as_slice();
+    let a3_s = t.a3.as_slice();
+    let rw = t.test_raw_wires.as_mut_slice();
+    for 0..h1 |i| { rw[in_d + i] = a1_s[i]; }
+    for 0..h2 |i| { rw[in_d + h1 + i] = a2_s[i]; }
+    for 0..h3 |i| { rw[in_d + h1 + h2 + i] = a3_s[i]; }
+    return;
+}
+
+fn run_opt_vm_single(t: &var LiveTrainer, bits: u32) -> void {
+    let in_d = live_in_dim();
+    var in_bits = [25]u64{};
+    let ib = in_bits.as_mut_slice();
+    for 0..in_d |i| {
+        let bit = (bits >> cast<u32>(i)) & cast<u32>(1);
+        ib[i] = if bit != 0 { cast<u64>(1) } else { cast<u64>(0) };
+    }
+    let ib_s = in_bits.as_slice();
+    let sc = t.test_vm_scratch.as_mut_slice();
+    let ob = t.test_vm_out.as_mut_slice();
+    synth::eval_circuit_vm_u64(&t.opt_circuit, ib_s, sc, ob);
+    return;
+}
+
+fn read_opt_vm_outputs(t: &var LiveTrainer) -> i32 {
+    let in_d = live_in_dim();
+    let h3 = live_h3();
+    let k = live_num_classes();
+    let opt_w = t.test_opt_wires.as_mut_slice();
+    let sc_s = t.test_vm_scratch.as_slice();
+    let n_opt_wires = in_d + t.opt_circuit.gate_count;
+    for 0..n_opt_wires |w| {
+        opt_w[w] = cast<i32>(sc_s[w] & cast<u64>(1));
+    }
+    let ob_s = t.test_vm_out.as_slice();
+    let group_size = h3 / k;
+    var best_hard: i32 = 0;
+    var best_votes: i32 = -1;
+    for 0..k |c| {
+        var votes: i32 = 0;
+        let start = c * group_size;
+        for 0..group_size |j| {
+            if (ob_s[start + j] & cast<u64>(1)) != 0 {
+                votes = votes + 1;
+            }
+        }
+        t.test_hard_votes[c] = votes;
+        if votes > best_votes {
+            best_votes = votes;
+            best_hard = cast<i32>(c);
+        }
+    }
+    return best_hard;
+}
+
+fn read_hard_a3_votes(t: &var LiveTrainer) -> i32 {
+    let h3 = live_h3();
+    let k = live_num_classes();
+    let a3_h = t.a3.as_slice();
+    let group_size = h3 / k;
+    var best_hard: i32 = 0;
+    var best_votes: i32 = -1;
+    for 0..k |c| {
+        var votes: i32 = 0;
+        let start = c * group_size;
+        for 0..group_size |j| {
+            if a3_h[start + j] >= 0.5 {
+                votes = votes + 1;
+            }
+        }
+        t.test_hard_votes[c] = votes;
+        if votes > best_votes {
+            best_votes = votes;
+            best_hard = cast<i32>(c);
+        }
+    }
+    return best_hard;
+}
+
+pub fn trainer_eval_metrics(t: &var LiveTrainer) -> void {
+    let n = t.sample_count;
+    t.last_sharpness = compute_mean_sharpness(t);
+    if n <= 0 {
+        t.last_soft_loss = 1.0986;
+        t.last_soft_acc = 0.0;
+        t.last_hard_acc = 0.0;
+        return;
+    }
+    fill_x_from_samples(t);
+
+    let saved_sm1 = t.l1.select_mode;
+    let saved_sm2 = t.l2.select_mode;
+    let saved_sm3 = t.l3.select_mode;
+    t.l1.select_mode = lut::SelectMode::Soft;
+    t.l2.select_mode = lut::SelectMode::Soft;
+    t.l3.select_mode = lut::SelectMode::Soft;
+
+    step_l1_fwd(t, n, true);
+    step_l2_fwd(t, n, true);
+    step_l3_fwd(t, n, true);
+    step_gs_fwd(t, n);
+    t.last_soft_loss = step_ce_loss_grad(t, n);
+    t.last_soft_acc = step_logits_acc(t, n);
+
+    t.l1.select_mode = saved_sm1;
+    t.l2.select_mode = saved_sm2;
+    t.l3.select_mode = saved_sm3;
+
+    step_l1_fwd(t, n, false);
+    step_l2_fwd(t, n, false);
+    step_l3_fwd(t, n, false);
+    step_gs_fwd(t, n);
+    t.last_hard_acc = step_logits_acc(t, n);
+    return;
+}
+
+pub fn trainer_train_steps(t: &var LiveTrainer, steps: i64, lr: f32) -> i64 {
+    let n = t.sample_count;
+    if n <= 0 or steps <= 0 {
+        trainer_eval_metrics(t);
+        return t.step;
+    }
+    fill_x_from_samples(t);
+
+    for 0..steps |_| {
+        t.step = t.step + 1;
+        var progress = cast<f64>(t.step) / 300.0;
+        if progress > 1.0 {
+            progress = 1.0;
+        }
+        let tau = cast<f32>(1.0 - 0.65 * progress);
+        let gs_noise = cast<f32>(0.35 * (1.0 - 0.85 * progress));
+        t.l1.tau = tau;
+        t.l2.tau = tau;
+        t.l3.tau = tau;
+        t.l1.gumbel_scale = gs_noise;
+        t.l2.gumbel_scale = gs_noise;
+        t.l3.gumbel_scale = gs_noise;
+
+        lut::lut_zero_grad(&var t.l1);
+        lut::lut_zero_grad(&var t.l2);
+        lut::lut_zero_grad(&var t.l3);
+
+        step_l1_fwd(t, n, true);
+        step_l2_fwd(t, n, true);
+        step_l3_fwd(t, n, true);
+        step_gs_fwd(t, n);
+
+        let _ = step_ce_loss_grad(t, n);
+        step_gs_bwd(t, n);
+        step_l3_bwd(t);
+        step_l2_bwd(t);
+        step_l1_bwd(t);
+
+        lut::lut_adamw_step(&var t.l1, lr, 0.9, 0.999, 1e-8, 0.0, t.step);
+        lut::lut_adamw_step(&var t.l2, lr, 0.9, 0.999, 1e-8, 0.0, t.step);
+        lut::lut_adamw_step(&var t.l3, lr, 0.9, 0.999, 1e-8, 0.0, t.step);
+    }
+
+    t.has_synth = false;
+    trainer_eval_metrics(t);
+    return t.step;
+}
+
+/// Packs gate `gid` (0..119) into a non-negative i32:
+/// bits 28..29: layer (0..2)
+/// bits 24..27: dominant truth table (0..15)
+/// bits 16..23: sharpness byte (0..255)
+/// bits  8..15: pin0 local index (0..47)
+/// bits  0..7 : pin1 local index (0..47)
+pub fn trainer_gate_packed(t: &LiveTrainer, gid: i64) -> i32 {
+    let h1 = live_h1();
+    let h2 = live_h2();
+    var layer_id: i32 = 0;
+    var tt: i32 = 0;
+    var sharp: f32 = 0.0;
+    var p0: i32 = 0;
+    var p1: i32 = 0;
+    if gid < h1 {
+        layer_id = 0;
+        sharp = layer_gate_tt_and_sharp(&t.l1, gid, &var tt);
+        let idx = t.l1.conn.indices.as_slice();
+        p0 = idx[gid * 2];
+        p1 = idx[gid * 2 + 1];
+    } else if gid < h1 + h2 {
+        layer_id = 1;
+        let o = gid - h1;
+        sharp = layer_gate_tt_and_sharp(&t.l2, o, &var tt);
+        let idx = t.l2.conn.indices.as_slice();
+        p0 = idx[o * 2];
+        p1 = idx[o * 2 + 1];
+    } else {
+        layer_id = 2;
+        let o = gid - h1 - h2;
+        sharp = layer_gate_tt_and_sharp(&t.l3, o, &var tt);
+        let idx = t.l3.conn.indices.as_slice();
+        p0 = idx[o * 2];
+        p1 = idx[o * 2 + 1];
+    }
+    var sb = cast<i32>(sharp * 255.0 + 0.5);
+    if sb < 0 { sb = 0; }
+    if sb > 255 { sb = 255; }
+    return (layer_id << 28) | ((tt & 15) << 24) | ((sb & 255) << 16) | ((p0 & 255) << 8) | (p1 & 255);
+}
+
+fn copy_circuit_into(dst: &var synth::Circuit, src: &synth::Circuit) -> void {
+    let g = src.gate_count;
+    let oc = src.out_wires.len();
+    let ga_d = dst.gate_arity.as_mut_slice();
+    let gp_d = dst.gate_pins.as_mut_slice();
+    let gt_d = dst.gate_tt.as_mut_slice();
+    let ow_d = dst.out_wires.as_mut_slice();
+
+    let ga_s = src.gate_arity.as_slice();
+    let gp_s = src.gate_pins.as_slice();
+    let gt_s = src.gate_tt.as_slice();
+    let ow_s = src.out_wires.as_slice();
+
+    for 0..g |i| {
+        ga_d[i] = ga_s[i];
+        gt_d[i] = gt_s[i];
+        for 0..6 |p| {
+            gp_d[i * 6 + p] = gp_s[i * 6 + p];
+        }
+    }
+    for 0..oc |i| {
+        ow_d[i] = ow_s[i];
+    }
+    dst.input_width = src.input_width;
+    dst.gate_count = g;
+    dst.group_sum_k = src.group_sum_k;
+    dst.group_sum_tau = src.group_sum_tau;
+    return;
+}
+
+pub fn trainer_synthesize(allocator: Allocator, t: &var LiveTrainer) -> mem::Error!i64 {
+    var d1 = try lut::lut_discretize(allocator, &t.l1);
+    defer d1.deinit(allocator);
+    var d2 = try lut::lut_discretize(allocator, &t.l2);
+    defer d2.deinit(allocator);
+    var d3 = try lut::lut_discretize(allocator, &t.l3);
+    defer d3.deinit(allocator);
+
+    var raw_c = try synth::circuit_from_discrete_triple(allocator, &d1, &d2, &d3, live_num_classes(), 1.5);
+    defer raw_c.deinit(allocator);
+
+    var opt = try synth::circuit_optimize(allocator, &raw_c);
+    defer opt.deinit(allocator);
+
+    copy_circuit_into(&var t.opt_circuit, &opt.circuit);
+    t.opt_stats = opt.stats;
+    t.has_synth = true;
+    return opt.stats.opt_gates;
+}
+
+pub fn trainer_emit_aot_code(allocator: Allocator, t: &LiveTrainer, out: &var string::String) -> mem::Error!void {
+    try codegen::emit_aot_kizu_fn(allocator, &t.opt_circuit, "aot_custom_5x5_64", out);
+    return;
+}
+
+pub fn trainer_emit_ir_json(allocator: Allocator, t: &LiveTrainer, out: &var string::String) -> mem::Error!void {
+    try codegen::emit_griffith_ir_json(allocator, &t.opt_circuit, "custom_5x5", out);
+    return;
+}
+
+fn fill_single_input(t: &var LiveTrainer, bits: u32) -> void {
+    let in_d = live_in_dim();
+    let xb = t.x_buf.as_mut_slice();
+    let rw = t.test_raw_wires.as_mut_slice();
+    for 0..in_d |i| {
+        let bit = (bits >> cast<u32>(i)) & cast<u32>(1);
+        let v = if bit != 0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        xb[i] = v;
+        rw[i] = v;
+    }
+    return;
+}
+
+fn read_soft_probs(t: &var LiveTrainer) -> i32 {
+    let k = live_num_classes();
+    let lg_s = t.logits.as_slice();
+    var max_l = cast<f64>(lg_s[0]);
+    for 1..k |c| {
+        let v = cast<f64>(lg_s[c]);
+        if v > max_l { max_l = v; }
+    }
+    var sum_e: f64 = 0.0;
+    var exps = [3]f64{};
+    for 0..k |c| {
+        let e = math::exp<f64>(cast<f64>(lg_s[c]) - max_l);
+        exps[c] = e;
+        sum_e = sum_e + e;
+    }
+    var best_soft: i32 = 0;
+    var best_soft_p: f32 = -1.0;
+    for 0..k |c| {
+        let p = cast<f32>(exps[c] / sum_e);
+        t.test_soft_probs[c] = p;
+        if p > best_soft_p {
+            best_soft_p = p;
+            best_soft = cast<i32>(c);
+        }
+    }
+    return best_soft;
+}
+
+pub fn trainer_infer(t: &var LiveTrainer, bits: u32, use_hard: bool) -> i32 {
+    fill_single_input(t, bits);
+
+    let saved_sm1 = t.l1.select_mode;
+    let saved_sm2 = t.l2.select_mode;
+    let saved_sm3 = t.l3.select_mode;
+    t.l1.select_mode = lut::SelectMode::Soft;
+    t.l2.select_mode = lut::SelectMode::Soft;
+    t.l3.select_mode = lut::SelectMode::Soft;
+
+    step_l1_fwd(t, 1, true);
+    step_l2_fwd(t, 1, true);
+    step_l3_fwd(t, 1, true);
+    step_gs_fwd(t, 1);
+
+    t.l1.select_mode = saved_sm1;
+    t.l2.select_mode = saved_sm2;
+    t.l3.select_mode = saved_sm3;
+
+    let best_soft = read_soft_probs(t);
+    copy_raw_activations(t);
+
+    var best_hard: i32 = 0;
+    if use_hard {
+        step_l1_fwd(t, 1, false);
+        step_l2_fwd(t, 1, false);
+        step_l3_fwd(t, 1, false);
+        copy_raw_activations(t);
+    }
+    if t.has_synth {
+        run_opt_vm_single(t, bits);
+        best_hard = read_opt_vm_outputs(t);
+    } else {
+        if !use_hard {
+            step_l1_fwd(t, 1, false);
+            step_l2_fwd(t, 1, false);
+            step_l3_fwd(t, 1, false);
+        }
+        best_hard = read_hard_a3_votes(t);
+    }
+
+    if use_hard {
+        return best_hard;
+    }
+    return best_soft;
+}
+
+pub fn trainer_bench_synth_64way(t: &var LiveTrainer, iters: i64) -> u64 {
+    if !t.has_synth {
+        return 0;
+    }
+    var in_bits = [25]u64{};
+    let ib = in_bits.as_mut_slice();
+    for 0..25 |i| {
+        ib[i] = cast<u64>(0x55555555) ^ (cast<u64>(i) << 1);
+    }
+    let sc = t.test_vm_scratch.as_mut_slice();
+    let ob = t.test_vm_out.as_mut_slice();
+    var sink: u64 = 0;
+    for 0..iters |step| {
+        ib[0] = cast<u64>(step);
+        synth::eval_circuit_vm_u64(&t.opt_circuit, ib, sc, ob);
+        sink = sink ^ ob[0] ^ ob[8] ^ ob[16];
+    }
+    return sink;
+}
+
+fn pack_rows(r0: u32, r1: u32, r2: u32, r3: u32, r4: u32) -> u32 {
+    return r0 | (r1 << 5) | (r2 << 10) | (r3 << 15) | (r4 << 20);
+}
+
+test "live trainer 5x5 shapes converges and synthesizes with 0 VM mismatch" {
+    let allocator = mem::page_allocator();
+    var t = try trainer_new(allocator, 42, lut::ParamMode::Warp);
+    defer t.deinit(allocator);
+
+    let _ = trainer_add_sample(&var t, pack_rows(0b01110, 0b10001, 0b10001, 0b10001, 0b01110), 0);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00100, 0b01010, 0b01010, 0b01010, 0b00100), 0);
+    let _ = trainer_add_sample(&var t, pack_rows(0b01110, 0b10001, 0b10001, 0b01110, 0b00000), 0);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00000, 0b01110, 0b10001, 0b10001, 0b01110), 0);
+
+    let _ = trainer_add_sample(&var t, pack_rows(0b10001, 0b01010, 0b00100, 0b01010, 0b10001), 1);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00000, 0b01010, 0b00100, 0b01010, 0b00000), 1);
+    let _ = trainer_add_sample(&var t, pack_rows(0b10001, 0b11011, 0b00100, 0b11011, 0b10001), 1);
+    let _ = trainer_add_sample(&var t, pack_rows(0b10010, 0b01100, 0b00100, 0b01100, 0b10010), 1);
+
+    let _ = trainer_add_sample(&var t, pack_rows(0b00100, 0b01010, 0b01010, 0b10001, 0b11111), 2);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00100, 0b01110, 0b10001, 0b11111, 0b00000), 2);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00000, 0b00100, 0b01010, 0b11111, 0b00000), 2);
+    let _ = trainer_add_sample(&var t, pack_rows(0b00100, 0b01010, 0b10001, 0b10001, 0b11111), 2);
+
+    trainer_eval_metrics(&var t);
+    let init_loss = t.last_soft_loss;
+    let init_sharp = t.last_sharpness;
+
+    let _ = trainer_train_steps(&var t, 260, 0.08);
+    testing::expect(t.last_soft_loss < init_loss * 0.35);
+    testing::expect(t.last_hard_acc >= 0.99);
+    testing::expect(t.last_sharpness > init_sharp + 0.15);
+
+    var pre_preds = [12]i32{};
+    for 0..12 |i| {
+        let bits_i = cast<u32>(t.sample_bits.get_or_panic(i));
+        pre_preds[i] = trainer_infer(&var t, bits_i, true);
+    }
+
+    let opt_g = try trainer_synthesize(allocator, &var t);
+    testing::expect(opt_g < live_total_gates());
+
+    for 0..12 |i| {
+        let bits_i = cast<u32>(t.sample_bits.get_or_panic(i));
+        let vm_pred = trainer_infer(&var t, bits_i, true);
+        testing::expect(vm_pred == pre_preds[i]);
+        testing::expect(vm_pred == t.sample_labels.get_or_panic(i));
+    }
+
+    var code = string::new(allocator);
+    defer code.deinit(allocator);
+    try trainer_emit_aot_code(allocator, &t, &var code);
+    testing::expect(code.len() > 80);
+
+    var ir = string::new(allocator);
+    defer ir.deinit(allocator);
+    try trainer_emit_ir_json(allocator, &t, &var ir);
+    testing::expect(ir.len() > 80);
+}

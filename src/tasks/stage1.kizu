@@ -1,0 +1,493 @@
+import griffith::core;
+import griffith::lut;
+import griffith::synth;
+import std::mem;
+
+pub struct Stage1TaskResult {
+    pub raw_circuit: synth::Circuit,
+    pub opt_result: synth::OptResult,
+    pub soft_acc: f64,
+    pub hard_acc: f64,
+    pub steps: i64,
+}
+
+pub fn (self: Stage1TaskResult) deinit(allocator: Allocator) -> void {
+    self.raw_circuit.deinit(allocator);
+    self.opt_result.deinit(allocator);
+    return;
+}
+
+/// Trains 2-input XOR: LutLayer(2->16, N=2, Softmax) -> LutLayer(16->16, N=2, Softmax) -> GroupSum(k=2).
+pub fn train_xor(allocator: Allocator) -> mem::Error!Stage1TaskResult {
+    let batch: i64 = 4;
+    var rng = core::rng_new(42);
+    var l1 = try lut::lut_layer_new(allocator, 2, 16, 2, lut::ParamMode::Softmax, lut::SelectMode::Soft, 1.0, 0.0, batch, &var rng);
+    defer l1.deinit(allocator);
+    var l2 = try lut::lut_layer_new(allocator, 16, 16, 2, lut::ParamMode::Softmax, lut::SelectMode::Soft, 1.0, 0.0, batch, &var rng);
+    defer l2.deinit(allocator);
+    let gs = lut::groupsum_new(16, 2, 2.0);
+
+    var x = try core::alloc_f32(allocator, batch * 2);
+    defer x.deinit(allocator);
+    var targets = try core::alloc_i32(allocator, batch);
+    defer targets.deinit(allocator);
+    var h1 = try core::alloc_f32(allocator, batch * 16);
+    defer h1.deinit(allocator);
+    var h2 = try core::alloc_f32(allocator, batch * 16);
+    defer h2.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, batch * 2);
+    defer logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, batch * 2);
+    defer g_logits.deinit(allocator);
+    var g_h2 = try core::alloc_f32(allocator, batch * 16);
+    defer g_h2.deinit(allocator);
+    var g_h1 = try core::alloc_f32(allocator, batch * 16);
+    defer g_h1.deinit(allocator);
+    var g_x = try core::alloc_f32(allocator, batch * 2);
+    defer g_x.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ts = targets.as_mut_slice();
+    for 0..4 |p| {
+        let a = p & 1;
+        let b = (p >> 1) & 1;
+        xs[p * 2] = cast<f32>(a);
+        xs[p * 2 + 1] = cast<f32>(b);
+        ts[p] = cast<i32>(a ^ b);
+    }
+
+    let h1_s = h1.as_mut_slice();
+    let h2_s = h2.as_mut_slice();
+    let lg_s = logits.as_mut_slice();
+    let gl_s = g_logits.as_mut_slice();
+    let gh2_s = g_h2.as_mut_slice();
+    let gh1_s = g_h1.as_mut_slice();
+    let gx_s = g_x.as_mut_slice();
+
+    let max_steps: i64 = 500;
+    var used_steps: i64 = 0;
+    for 1..(max_steps + 1) |step| {
+        used_steps = step;
+        lut::lut_zero_grad(&var l1);
+        lut::lut_zero_grad(&var l2);
+        lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+        lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+        lut::groupsum_forward(&gs, h2_s, batch, lg_s);
+        let _ = lut::cross_entropy_loss_grad(lg_s, ts, batch, 2, gl_s);
+        lut::groupsum_backward(&gs, gl_s, batch, gh2_s);
+        lut::lut_backward(&var l2, gh2_s, gh1_s, true);
+        lut::lut_backward(&var l1, gh1_s, gx_s, false);
+        lut::lut_adamw_step(&var l1, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var l2, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+    }
+
+    // Soft accuracy
+    lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+    lut::groupsum_forward(&gs, h2_s, batch, lg_s);
+    var soft_ok: i64 = 0;
+    for 0..batch |p| {
+        let pred: i32 = if lg_s[p * 2 + 1] > lg_s[p * 2] { cast<i32>(1) } else { cast<i32>(0) };
+        if pred == ts[p] {
+            soft_ok = soft_ok + 1;
+        }
+    }
+
+    // Hard accuracy
+    lut::lut_forward(&var l1, xs, batch, h1_s, false, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, false, &var rng);
+    lut::groupsum_forward(&gs, h2_s, batch, lg_s);
+    var hard_ok: i64 = 0;
+    for 0..batch |p| {
+        let pred: i32 = if lg_s[p * 2 + 1] > lg_s[p * 2] { cast<i32>(1) } else { cast<i32>(0) };
+        if pred == ts[p] {
+            hard_ok = hard_ok + 1;
+        }
+    }
+
+    var d1 = try lut::lut_discretize(allocator, &l1);
+    defer d1.deinit(allocator);
+    var d2 = try lut::lut_discretize(allocator, &l2);
+    defer d2.deinit(allocator);
+    var raw = try synth::circuit_from_discrete_pair(allocator, &d1, &d2, 2, 2.0);
+    errdefer raw.deinit(allocator);
+    var opt = try synth::circuit_optimize(allocator, &raw);
+    errdefer opt.deinit(allocator);
+
+    return Stage1TaskResult {
+        raw_circuit: move raw,
+        opt_result: move opt,
+        soft_acc: cast<f64>(soft_ok) / cast<f64>(batch),
+        hard_acc: cast<f64>(hard_ok) / cast<f64>(batch),
+        steps: used_steps,
+    };
+}
+
+/// Trains 4-bit Parity: 4 -> 32 -> 32 -> 1 (N=2, WARP + Gumbel-ST -> pure 1-bit Boolean circuit).
+pub fn train_parity4(allocator: Allocator) -> mem::Error!Stage1TaskResult {
+    let batch: i64 = 16;
+    var rng = core::rng_new(777);
+    var l1 = try lut::lut_layer_new(allocator, 4, 32, 2, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.25, batch, &var rng);
+    defer l1.deinit(allocator);
+    var l2 = try lut::lut_layer_new(allocator, 32, 32, 2, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.25, batch, &var rng);
+    defer l2.deinit(allocator);
+    var l3 = try lut::lut_layer_new(allocator, 32, 1, 2, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.25, batch, &var rng);
+    defer l3.deinit(allocator);
+
+    var x = try core::alloc_f32(allocator, batch * 4);
+    defer x.deinit(allocator);
+    var targets = try core::alloc_f32(allocator, batch);
+    defer targets.deinit(allocator);
+    var h1 = try core::alloc_f32(allocator, batch * 32);
+    defer h1.deinit(allocator);
+    var h2 = try core::alloc_f32(allocator, batch * 32);
+    defer h2.deinit(allocator);
+    var out = try core::alloc_f32(allocator, batch);
+    defer out.deinit(allocator);
+    var g_out = try core::alloc_f32(allocator, batch);
+    defer g_out.deinit(allocator);
+    var g_h2 = try core::alloc_f32(allocator, batch * 32);
+    defer g_h2.deinit(allocator);
+    var g_h1 = try core::alloc_f32(allocator, batch * 32);
+    defer g_h1.deinit(allocator);
+    var g_x = try core::alloc_f32(allocator, batch * 4);
+    defer g_x.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ts = targets.as_mut_slice();
+    for 0..16 |p| {
+        let b0 = p & 1;
+        let b1 = (p >> 1) & 1;
+        let b2 = (p >> 2) & 1;
+        let b3 = (p >> 3) & 1;
+        xs[p * 4] = cast<f32>(b0);
+        xs[p * 4 + 1] = cast<f32>(b1);
+        xs[p * 4 + 2] = cast<f32>(b2);
+        xs[p * 4 + 3] = cast<f32>(b3);
+        ts[p] = cast<f32>(b0 ^ b1 ^ b2 ^ b3);
+    }
+
+    let h1_s = h1.as_mut_slice();
+    let h2_s = h2.as_mut_slice();
+    let out_s = out.as_mut_slice();
+    let go_s = g_out.as_mut_slice();
+    let gh2_s = g_h2.as_mut_slice();
+    let gh1_s = g_h1.as_mut_slice();
+    let gx_s = g_x.as_mut_slice();
+
+    let max_steps: i64 = 1200;
+    var used_steps: i64 = 0;
+    for 1..(max_steps + 1) |step| {
+        used_steps = step;
+        // Anneal into GumbelSt for the second half to eliminate discretization gap.
+        if step == 400 {
+            l1.select_mode = lut::SelectMode::GumbelSt;
+            l2.select_mode = lut::SelectMode::GumbelSt;
+            l3.select_mode = lut::SelectMode::GumbelSt;
+            l1.gumbel_scale = 0.2;
+            l2.gumbel_scale = 0.2;
+            l3.gumbel_scale = 0.2;
+        }
+        if step == 800 {
+            l1.select_mode = lut::SelectMode::HardSt;
+            l2.select_mode = lut::SelectMode::HardSt;
+            l3.select_mode = lut::SelectMode::HardSt;
+        }
+        lut::lut_zero_grad(&var l1);
+        lut::lut_zero_grad(&var l2);
+        lut::lut_zero_grad(&var l3);
+        lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+        lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+        lut::lut_forward(&var l3, h2_s, batch, out_s, true, &var rng);
+        // Use smooth MSE / BCE gradient depending on selection mode
+        if step < 400 {
+            let _ = lut::bce_loss_grad(out_s, ts, batch, go_s);
+        } else {
+            for 0..batch |i| {
+                go_s[i] = 2.0 * (out_s[i] - ts[i]) / cast<f32>(batch);
+            }
+        }
+        lut::lut_backward(&var l3, go_s, gh2_s, true);
+        lut::lut_backward(&var l2, gh2_s, gh1_s, true);
+        lut::lut_backward(&var l1, gh1_s, gx_s, false);
+        lut::lut_adamw_step(&var l1, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var l2, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var l3, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+
+        if step >= 200 and step % 50 == 0 {
+            lut::lut_forward(&var l1, xs, batch, h1_s, false, &var rng);
+            lut::lut_forward(&var l2, h1_s, batch, h2_s, false, &var rng);
+            lut::lut_forward(&var l3, h2_s, batch, out_s, false, &var rng);
+            var ok: i64 = 0;
+            for 0..batch |p| {
+                let pred = if out_s[p] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                if pred == ts[p] {
+                    ok = ok + 1;
+                }
+            }
+            if ok == batch {
+                break;
+            }
+        }
+    }
+
+    l1.select_mode = lut::SelectMode::Soft;
+    l2.select_mode = lut::SelectMode::Soft;
+    l3.select_mode = lut::SelectMode::Soft;
+    lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+    lut::lut_forward(&var l3, h2_s, batch, out_s, true, &var rng);
+    var soft_ok: i64 = 0;
+    for 0..batch |p| {
+        let pred = if out_s[p] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        if pred == ts[p] {
+            soft_ok = soft_ok + 1;
+        }
+    }
+
+    lut::lut_forward(&var l1, xs, batch, h1_s, false, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, false, &var rng);
+    lut::lut_forward(&var l3, h2_s, batch, out_s, false, &var rng);
+    var hard_ok: i64 = 0;
+    for 0..batch |p| {
+        let pred = if out_s[p] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+        if pred == ts[p] {
+            hard_ok = hard_ok + 1;
+        }
+    }
+
+    var d1 = try lut::lut_discretize(allocator, &l1);
+    defer d1.deinit(allocator);
+    var d2 = try lut::lut_discretize(allocator, &l2);
+    defer d2.deinit(allocator);
+    var d3 = try lut::lut_discretize(allocator, &l3);
+    defer d3.deinit(allocator);
+    var raw = try synth::circuit_from_discrete_triple(allocator, &d1, &d2, &d3, 0, 1.0);
+    errdefer raw.deinit(allocator);
+    var opt = try synth::circuit_optimize(allocator, &raw);
+    errdefer opt.deinit(allocator);
+
+    return Stage1TaskResult {
+        raw_circuit: move raw,
+        opt_result: move opt,
+        soft_acc: cast<f64>(soft_ok) / cast<f64>(batch),
+        hard_acc: cast<f64>(hard_ok) / cast<f64>(batch),
+        steps: used_steps,
+    };
+}
+
+/// Trains 2-bit Adder: (a0, a1, b0, b1) -> (sum0, sum1, carry_out) using N=4 WARP + Gumbel-ST.
+pub fn train_adder2(allocator: Allocator) -> mem::Error!Stage1TaskResult {
+    let batch: i64 = 16;
+    var rng = core::rng_new(2026);
+    var l1 = try lut::lut_layer_new(allocator, 4, 24, 4, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.2, batch, &var rng);
+    defer l1.deinit(allocator);
+    var l2 = try lut::lut_layer_new(allocator, 24, 24, 4, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.2, batch, &var rng);
+    defer l2.deinit(allocator);
+    var l3 = try lut::lut_layer_new(allocator, 24, 3, 4, lut::ParamMode::Warp, lut::SelectMode::Soft, 1.0, 0.2, batch, &var rng);
+    defer l3.deinit(allocator);
+
+    var x = try core::alloc_f32(allocator, batch * 4);
+    defer x.deinit(allocator);
+    var targets = try core::alloc_f32(allocator, batch * 3);
+    defer targets.deinit(allocator);
+    var h1 = try core::alloc_f32(allocator, batch * 24);
+    defer h1.deinit(allocator);
+    var h2 = try core::alloc_f32(allocator, batch * 24);
+    defer h2.deinit(allocator);
+    var out = try core::alloc_f32(allocator, batch * 3);
+    defer out.deinit(allocator);
+    var g_out = try core::alloc_f32(allocator, batch * 3);
+    defer g_out.deinit(allocator);
+    var g_h2 = try core::alloc_f32(allocator, batch * 24);
+    defer g_h2.deinit(allocator);
+    var g_h1 = try core::alloc_f32(allocator, batch * 24);
+    defer g_h1.deinit(allocator);
+    var g_x = try core::alloc_f32(allocator, batch * 4);
+    defer g_x.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ts = targets.as_mut_slice();
+    for 0..16 |p| {
+        let a = p & 3;
+        let b = (p >> 2) & 3;
+        let sum = a + b;
+        xs[p * 4] = cast<f32>(a & 1);
+        xs[p * 4 + 1] = cast<f32>((a >> 1) & 1);
+        xs[p * 4 + 2] = cast<f32>(b & 1);
+        xs[p * 4 + 3] = cast<f32>((b >> 1) & 1);
+        ts[p * 3] = cast<f32>(sum & 1);
+        ts[p * 3 + 1] = cast<f32>((sum >> 1) & 1);
+        ts[p * 3 + 2] = cast<f32>((sum >> 2) & 1);
+    }
+
+    let h1_s = h1.as_mut_slice();
+    let h2_s = h2.as_mut_slice();
+    let out_s = out.as_mut_slice();
+    let go_s = g_out.as_mut_slice();
+    let gh2_s = g_h2.as_mut_slice();
+    let gh1_s = g_h1.as_mut_slice();
+    let gx_s = g_x.as_mut_slice();
+
+    let max_steps: i64 = 800;
+    var used_steps: i64 = 0;
+    for 1..(max_steps + 1) |step| {
+        used_steps = step;
+        if step == 250 {
+            l1.select_mode = lut::SelectMode::GumbelSt;
+            l2.select_mode = lut::SelectMode::GumbelSt;
+            l3.select_mode = lut::SelectMode::GumbelSt;
+        }
+        if step == 500 {
+            l1.select_mode = lut::SelectMode::HardSt;
+            l2.select_mode = lut::SelectMode::HardSt;
+            l3.select_mode = lut::SelectMode::HardSt;
+        }
+        lut::lut_zero_grad(&var l1);
+        lut::lut_zero_grad(&var l2);
+        lut::lut_zero_grad(&var l3);
+        lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+        lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+        lut::lut_forward(&var l3, h2_s, batch, out_s, true, &var rng);
+        if step < 250 {
+            let _ = lut::bce_loss_grad(out_s, ts, batch * 3, go_s);
+        } else {
+            for 0..(batch * 3) |i| {
+                go_s[i] = 2.0 * (out_s[i] - ts[i]) / cast<f32>(batch * 3);
+            }
+        }
+        lut::lut_backward(&var l3, go_s, gh2_s, true);
+        lut::lut_backward(&var l2, gh2_s, gh1_s, true);
+        lut::lut_backward(&var l1, gh1_s, gx_s, false);
+        lut::lut_adamw_step(&var l1, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var l2, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+        lut::lut_adamw_step(&var l3, 0.08, 0.9, 0.999, 1e-8, 0.0, step);
+
+        if step >= 100 and step % 25 == 0 {
+            lut::lut_forward(&var l1, xs, batch, h1_s, false, &var rng);
+            lut::lut_forward(&var l2, h1_s, batch, h2_s, false, &var rng);
+            lut::lut_forward(&var l3, h2_s, batch, out_s, false, &var rng);
+            var ok: i64 = 0;
+            for 0..batch |p| {
+                var all_match = true;
+                for 0..3 |b| {
+                    let pred = if out_s[p * 3 + b] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                    if pred != ts[p * 3 + b] {
+                        all_match = false;
+                    }
+                }
+                if all_match {
+                    ok = ok + 1;
+                }
+            }
+            if ok == batch {
+                break;
+            }
+        }
+    }
+
+    l1.select_mode = lut::SelectMode::Soft;
+    l2.select_mode = lut::SelectMode::Soft;
+    l3.select_mode = lut::SelectMode::Soft;
+    lut::lut_forward(&var l1, xs, batch, h1_s, true, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, true, &var rng);
+    lut::lut_forward(&var l3, h2_s, batch, out_s, true, &var rng);
+    var soft_ok: i64 = 0;
+    for 0..batch |p| {
+        var all_match = true;
+        for 0..3 |b| {
+            let pred = if out_s[p * 3 + b] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+            if pred != ts[p * 3 + b] {
+                all_match = false;
+            }
+        }
+        if all_match {
+            soft_ok = soft_ok + 1;
+        }
+    }
+
+    lut::lut_forward(&var l1, xs, batch, h1_s, false, &var rng);
+    lut::lut_forward(&var l2, h1_s, batch, h2_s, false, &var rng);
+    lut::lut_forward(&var l3, h2_s, batch, out_s, false, &var rng);
+    var hard_ok: i64 = 0;
+    for 0..batch |p| {
+        var all_match = true;
+        for 0..3 |b| {
+            let pred = if out_s[p * 3 + b] >= 0.5 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+            if pred != ts[p * 3 + b] {
+                all_match = false;
+            }
+        }
+        if all_match {
+            hard_ok = hard_ok + 1;
+        }
+    }
+
+    var d1 = try lut::lut_discretize(allocator, &l1);
+    defer d1.deinit(allocator);
+    var d2 = try lut::lut_discretize(allocator, &l2);
+    defer d2.deinit(allocator);
+    var d3 = try lut::lut_discretize(allocator, &l3);
+    defer d3.deinit(allocator);
+    var raw = try synth::circuit_from_discrete_triple(allocator, &d1, &d2, &d3, 0, 1.0);
+    errdefer raw.deinit(allocator);
+    var opt = try synth::circuit_optimize(allocator, &raw);
+    errdefer opt.deinit(allocator);
+
+    return Stage1TaskResult {
+        raw_circuit: move raw,
+        opt_result: move opt,
+        soft_acc: cast<f64>(soft_ok) / cast<f64>(batch),
+        hard_acc: cast<f64>(hard_ok) / cast<f64>(batch),
+        steps: used_steps,
+    };
+}
+
+/// Checks bit-exact equivalence between `raw` and `opt` circuits on all 2^input_width input patterns.
+pub fn verify_raw_vs_opt_exhaustive(
+    allocator: Allocator,
+    raw: &synth::Circuit,
+    opt: &synth::Circuit
+) -> mem::Error!i64 {
+    let in_w = raw.input_width;
+    let patterns = lut::pow2(in_w);
+    let out_count = raw.out_wires.len();
+
+    var in_bits = try core::alloc_u64(allocator, in_w);
+    defer in_bits.deinit(allocator);
+    var raw_scratch = try core::alloc_u64(allocator, in_w + raw.gate_count + 1);
+    defer raw_scratch.deinit(allocator);
+    var opt_scratch = try core::alloc_u64(allocator, in_w + opt.gate_count + 1);
+    defer opt_scratch.deinit(allocator);
+    var raw_out = try core::alloc_u64(allocator, out_count);
+    defer raw_out.deinit(allocator);
+    var opt_out = try core::alloc_u64(allocator, out_count);
+    defer opt_out.deinit(allocator);
+
+    let ib = in_bits.as_mut_slice();
+    for 0..in_w |bit| {
+        var mask: u64 = 0;
+        for 0..patterns |p| {
+            if ((p >> cast<i64>(bit)) & 1) != 0 {
+                mask = mask | (cast<u64>(1) << cast<u64>(p));
+            }
+        }
+        ib[bit] = mask;
+    }
+
+    let rs = raw_scratch.as_mut_slice();
+    let os = opt_scratch.as_mut_slice();
+    let ro = raw_out.as_mut_slice();
+    let oo = opt_out.as_mut_slice();
+
+    synth::eval_circuit_vm_u64(raw, ib, rs, ro);
+    synth::eval_circuit_vm_u64(opt, ib, os, oo);
+
+    let pat_mask = if patterns >= 64 { ~cast<u64>(0) } else { (cast<u64>(1) << cast<u64>(patterns)) - cast<u64>(1) };
+    var mismatches: i64 = 0;
+    for 0..out_count |o| {
+        let diff = (ro[o] ^ oo[o]) & pat_mask;
+        mismatches = mismatches + core::popcount_u64(diff);
+    }
+    return mismatches;
+}

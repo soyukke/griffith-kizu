@@ -1,0 +1,1166 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>ladder/ — LogicLadderGPT（論理ゲート LLM）| griffith/</title>
+  <meta name="description" content="通常の Transformer（L0）から FFN・QKV・XNOR・ハードウェア MUX（L3-C）まで段階的に論理ゲート化した 5 つのモデルをブラウザ WASM 上でリアルタイム比較。">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="../fonts/martian-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face {
+      font-family: 'Martian Mono';
+      font-style: normal;
+      font-display: swap;
+      font-weight: 100 800;
+      src: url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations'),
+           url('../fonts/martian-mono-latin-wght-normal.woff2') format('woff2');
+    }
+
+    :root {
+      color-scheme: light;
+      --paper: #f2f0e9;
+      --sheet: #faf9f3;
+      --ink: #141412;
+      --muted: #68665e;
+      --rule: #cfccc0;
+      --grid: #e3e0d6;
+      --tri: #e8e5db;
+      --accent: #ff4d00;
+      --accent-tint: #fff0e8;
+      --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --jp: 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--jp);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .app {
+      height: 100dvh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow: hidden;
+    }
+
+    /* 上の帯 */
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--ink);
+      background: var(--paper);
+      min-height: 48px;
+    }
+    .identity { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+    .mark {
+      font-family: var(--mono);
+      font-weight: 800;
+      font-stretch: 75%;
+      font-size: clamp(20px, 2vw, 25px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      white-space: nowrap;
+    }
+    .mark .slash { color: var(--accent); }
+    .mark:hover { color: var(--accent); }
+    h1 { margin: 0; font-size: clamp(13px, 1.2vw, 15px); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .rung-bar {
+      display: inline-flex;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .rung-bar button {
+      padding: 5px 10px;
+      border-right: 1px solid var(--rule);
+      display: inline-flex;
+      align-items: baseline;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .rung-bar button:last-child { border-right: 0; }
+    .rung-bar button small { font-family: var(--jp); font-size: 9.5px; font-weight: 500; }
+    .rung-bar button:hover:not([aria-pressed="true"]) { background: var(--tri); color: var(--ink); }
+    .rung-bar button[aria-pressed="true"] {
+      background: var(--ink);
+      color: var(--paper);
+      box-shadow: inset 0 -2.5px 0 var(--accent);
+    }
+    .rung-bar button[aria-pressed="true"] small { color: #ff8e5c; }
+
+    .bar__right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+    .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; min-width: 84px; }
+    .btn--go:hover:not(:disabled) { background: #e54400; border-color: #e54400; color: #fff; }
+
+    /* 中央 3 カラム（スクロールなし） */
+    .desk {
+      display: grid;
+      grid-template-columns: clamp(248px, 24vw, 296px) minmax(0, 1fr) clamp(254px, 23vw, 298px);
+      gap: 14px;
+      padding: 11px 16px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .block-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; color: var(--ink); white-space: nowrap; }
+    .kicker-mono { font-family: var(--mono), var(--jp); font-size: 10px; color: var(--muted); white-space: nowrap; }
+
+    /* 左カラム：プロンプト & ライブ生成テキスト */
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .prompt-input {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid var(--ink);
+      background: var(--sheet);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip {
+      padding: 2px 7px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .chip:hover { border-color: var(--ink); color: var(--ink); }
+
+    .gen-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .temp-wrap {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      flex: 1;
+    }
+    .temp-wrap input { flex: 1; min-width: 50px; accent-color: var(--accent); }
+    .mini-btn {
+      min-height: 26px;
+      padding: 0 8px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      font-size: 10.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .mini-btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
+
+    .out-box {
+      flex: 1;
+      min-height: 92px;
+      padding: 10px 11px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.55;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .out-box .tok { border-radius: 2px; padding: 0 0.5px; }
+    .out-box .tok--prompt { color: var(--muted); }
+    .out-box .tok--q { background: var(--ink); color: var(--paper); font-weight: 800; }
+    .out-box .tok--k { background: var(--accent); color: #fff; font-weight: 800; }
+
+    /* Top-5 次文字確率 */
+    .top5-wrap {
+      border-top: 1px solid var(--rule);
+      padding-top: 7px;
+      display: grid;
+      gap: 4px;
+    }
+    .prob-row {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr) 40px;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+    .prob-ch {
+      text-align: center;
+      padding: 1px 0;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      font-weight: 700;
+    }
+    .prob-val { text-align: right; color: var(--muted); font-size: 10px; }
+    .track { height: 7px; background: var(--tri); border-radius: 2px; overflow: hidden; }
+    .fill { height: 100%; background: var(--ink); transition: width 120ms; }
+    .fill--acc { background: var(--accent); }
+
+    /* 中央ステージ：ライブ Attention マップ（Softmax vs ハードウェア MUX） */
+    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--rule);
+      background-color: var(--sheet);
+      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
+      background-size: 20px 20px;
+      background-position: 9px 9px;
+    }
+    .stage::before, .stage::after {
+      content: '';
+      pointer-events: none;
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: solid var(--muted);
+      opacity: 0.45;
+      z-index: 2;
+    }
+    .stage::before { top: 8px; left: 8px; border-width: 1px 0 0 1px; }
+    .stage::after { right: 8px; bottom: 8px; border-width: 0 1px 1px 0; }
+
+    .stage-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 9px 15px 4px;
+      z-index: 1;
+    }
+    .mux-badge {
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-family: var(--mono), var(--jp);
+      font-size: 10.5px;
+      font-weight: 700;
+      background: var(--paper);
+      border: 1px solid var(--rule);
+      color: var(--ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .mux-badge.is-mux {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .head-ctrls { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+    .pill-group {
+      display: inline-flex;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      padding: 2px;
+      background: var(--paper);
+    }
+    .pill-group button {
+      min-height: 22px;
+      padding: 0 7px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .pill-group button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+
+    .canvas-wrap {
+      position: relative;
+      min-height: 0;
+      min-width: 0;
+      padding: 2px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #attn-svg { width: 100%; height: 100%; display: block; user-select: none; }
+    .attn-cell { cursor: crosshair; }
+
+    .stage-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 4px 15px 9px;
+      font-size: 11px;
+      color: var(--muted);
+      z-index: 1;
+    }
+    #inspector { font-family: var(--mono), var(--jp); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #inspector b { color: var(--ink); }
+    #inspector .hi { color: var(--accent); font-weight: 700; }
+
+    /* 右カラム：ブロック回路図 & PPL 梯子 & 計器 */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 9px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .rblock {
+      border-top: 1px solid var(--rule);
+      padding-top: 8px;
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .rblock:first-child { border-top: 0; padding-top: 0; }
+
+    .pipe {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 5px;
+    }
+    .pipe-node {
+      padding: 6px 8px;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      display: grid;
+      gap: 1px;
+    }
+    .pipe-node span { font-size: 9.5px; color: var(--muted); }
+    .pipe-node strong { font-family: var(--mono), var(--jp); font-size: 11px; font-weight: 800; }
+    .pipe-node.logic {
+      border-color: var(--accent);
+      background: var(--accent-tint);
+    }
+    .pipe-node.logic strong { color: var(--accent); }
+
+    .ppl-bars { display: grid; gap: 4px; }
+    .ppl-row {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) 40px;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 10px;
+      cursor: pointer;
+      padding: 1px 0;
+    }
+    .ppl-row:hover .ppl-k { color: var(--accent); }
+    .ppl-k { font-weight: 700; color: var(--muted); }
+    .ppl-row.active .ppl-k, .ppl-row.active .ppl-v { color: var(--accent); font-weight: 800; }
+    .ppl-v { text-align: right; color: var(--ink); }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+    }
+    .meta-cell {
+      padding: 6px 8px;
+      border-right: 1px solid var(--rule);
+      border-bottom: 1px solid var(--rule);
+      display: grid;
+      gap: 1px;
+    }
+    .meta-cell:nth-child(2n) { border-right: 0; }
+    .meta-cell:nth-last-child(-n+2) { border-bottom: 0; }
+    .meta-cell span { font-size: 9.5px; color: var(--muted); }
+    .meta-cell strong { font-family: var(--mono); font-size: 12px; font-weight: 800; }
+    .meta-cell strong.accent { color: var(--accent); }
+
+    .foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 5px 16px;
+      border-top: 1px solid var(--rule);
+      font-size: 10.5px;
+      color: var(--muted);
+      background: var(--paper);
+      min-height: 28px;
+    }
+    .foot-mono { font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+    .foot-mono a:hover { color: var(--accent); }
+    .foot-mid { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* オーバーレイシート（L0 vs L3-C 同時比較 / しくみ） */
+    .sheet { position: fixed; inset: 0; background: rgba(20, 20, 18, 0.28); z-index: 30; }
+    .sheet__body {
+      position: absolute;
+      top: 56px;
+      right: 16px;
+      width: min(560px, calc(100vw - 24px));
+      max-height: calc(100dvh - 76px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: 12px;
+      box-shadow: 0 18px 46px rgba(20, 20, 18, 0.18);
+      overflow: hidden;
+    }
+    .sheet__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--rule); background: var(--sheet); }
+    .sheet__tabs { display: flex; gap: 4px; }
+    .sheet__tabs button { min-height: 28px; padding: 0 10px; border-radius: 999px; font-size: 11.5px; font-weight: 700; color: var(--muted); }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+    .sheet__close { width: 28px; height: 28px; border-radius: 999px; border: 1px solid var(--rule); font-family: var(--mono); font-size: 14px; display: grid; place-items: center; }
+    .sheet__content { padding: 14px 16px; overflow-y: auto; min-height: 0; }
+    .cmp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .cmp-card { padding: 10px; background: var(--sheet); border: 1px solid var(--rule); display: grid; gap: 6px; }
+    .cmp-card h3 { margin: 0; font-family: var(--mono); font-size: 11.5px; display: flex; justify-content: space-between; }
+    .cmp-card pre { margin: 0; font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+    .about-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+    .about-list li { padding: 10px 12px; background: var(--sheet); border: 1px solid var(--rule); }
+    .about-list strong { display: block; margin-bottom: 3px; font-size: 12px; }
+    .about-list p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+    .about-step { font-family: var(--mono); color: var(--accent); margin-right: 6px; }
+
+    @media (max-width: 1060px) {
+      h1, .foot-mid { display: none; }
+      .desk { grid-template-columns: 240px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; gap: 10px; padding: 8px 12px; }
+      .left-col { grid-row: 1 / 3; }
+      .stage-col { grid-column: 2; grid-row: 1; }
+      .right-col { grid-column: 2; grid-row: 2; flex-direction: row; gap: 10px; }
+      .rblock { border-top: 0; border-left: 1px solid var(--rule); padding-top: 0; padding-left: 10px; flex: 1; }
+      .rblock:first-child { border-left: 0; padding-left: 0; }
+      .rblock--hide-md { display: none; }
+    }
+    @media (max-width: 720px) {
+      .rung-bar button small { display: none; }
+      .desk { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+      .left-col { grid-row: 1; }
+      .top5-wrap, .right-col { display: none; }
+      .stage-col { grid-column: 1; grid-row: 2; }
+      .out-box { max-height: 82px; }
+      .cmp-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="identity">
+        <a class="mark" href="../" aria-label="griffith/ デモ一覧へ戻る">griffith<span class="slash">/</span></a>
+        <h1>LogicLadderGPT — 論理ゲート LLM</h1>
+      </div>
+
+      <div class="rung-bar" id="rung-bar" role="group" aria-label="論理ゲート化レベル">
+        <button type="button" data-rung="l0" aria-pressed="false">L0 <small>全実数</small></button>
+        <button type="button" data-rung="l0b" aria-pressed="false">L0b <small>FFN論理</small></button>
+        <button type="button" data-rung="l1" aria-pressed="false">L1 <small>QKV論理</small></button>
+        <button type="button" data-rung="l2" aria-pressed="false">L2 <small>XNOR</small></button>
+        <button type="button" data-rung="l3c" aria-pressed="true">L3-C <small>MUX</small></button>
+      </div>
+
+      <div class="bar__right">
+        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">L0 vs L3-C</button>
+        <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
+        <button type="button" class="btn btn--go" id="btn-gen">生成する</button>
+      </div>
+    </header>
+
+    <main class="desk">
+      <!-- 左：プロンプト & ライブ生成 -->
+      <section class="left-col" aria-label="プロンプトと文字生成">
+        <div class="block-head">
+          <span class="kicker">プロンプト（Tiny Shakespeare）</span>
+          <span class="kicker-mono" id="gen-stat">読込中…</span>
+        </div>
+        <input class="prompt-input" id="prompt-in" type="text" value="ROMEO:&#10;O " spellcheck="false" autocomplete="off">
+        <div class="chips" id="preset-chips">
+          <button type="button" class="chip" data-p="ROMEO:&#10;O ">ROMEO:</button>
+          <button type="button" class="chip" data-p="JULIET:&#10;What ">JULIET:</button>
+          <button type="button" class="chip" data-p="KING:&#10;The ">KING:</button>
+          <button type="button" class="chip" data-p="To be, or not ">To be,</button>
+          <button type="button" class="chip" data-p="My lord, ">My lord,</button>
+        </div>
+
+        <div class="gen-controls">
+          <label class="temp-wrap">
+            <span>temp</span>
+            <input type="range" id="temp-range" min="0" max="100" value="65">
+            <span id="temp-val">0.65</span>
+          </label>
+          <button type="button" class="mini-btn" id="btn-step">+1文字</button>
+        </div>
+
+        <div class="out-box" id="out-box" aria-live="polite">モデル読込中…</div>
+
+        <div class="top5-wrap">
+          <div class="block-head">
+            <span class="kicker">次の 1 文字・上位 5 候補</span>
+            <span class="kicker-mono" id="tok-ms">-</span>
+          </div>
+          <div id="top5-bars"></div>
+        </div>
+      </section>
+
+      <!-- 中央：ライブ Attention マップ（Softmax ↔ ハードウェア MUX） -->
+      <section class="stage-col" aria-label="Attention マップ可視化">
+        <div class="stage">
+          <div class="stage-head">
+            <span class="mux-badge is-mux" id="mux-badge">L3-C · ハードウェア MUX（各行ちょうど 1 マスだけ 100% 点灯）</span>
+            <div class="head-ctrls">
+              <div class="pill-group" id="layer-pick" role="group" aria-label="レイヤ選択">
+                <button type="button" data-l="0" aria-pressed="true">L0</button>
+                <button type="button" data-l="1" aria-pressed="false">L1</button>
+              </div>
+              <div class="pill-group" id="head-pick" role="group" aria-label="ヘッド選択">
+                <button type="button" data-h="0" aria-pressed="true">H0</button>
+                <button type="button" data-h="1" aria-pressed="false">H1</button>
+                <button type="button" data-h="2" aria-pressed="false">H2</button>
+                <button type="button" data-h="3" aria-pressed="false">H3</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="canvas-wrap">
+            <svg id="attn-svg" viewBox="0 0 620 460" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Causal Attention マップ"></svg>
+          </div>
+
+          <div class="stage-foot">
+            <span id="inspector">行列にカーソルを乗せると、どの過去文字を参照しているか左の文章と同時にハイライトします</span>
+            <span class="kicker-mono" id="attn-shape">T=0 · 4 heads</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右：ブロック回路図 & PPL 梯子 & 計器 -->
+      <aside class="right-col" aria-label="モデル構造と計測">
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">Transformer ブロックの中身</span>
+            <span class="kicker-mono" id="rung-label">L3-C (KL蒸留)</span>
+          </div>
+          <div class="pipe">
+            <div class="pipe-node" id="pn-qkv"><span>Q / K / V 射影</span><strong>-</strong></div>
+            <div class="pipe-node" id="pn-score"><span>Attention 類似度</span><strong>-</strong></div>
+            <div class="pipe-node" id="pn-sel"><span>Value 選択</span><strong>-</strong></div>
+            <div class="pipe-node" id="pn-ffn"><span>FFN 層</span><strong>-</strong></div>
+          </div>
+        </div>
+
+        <div class="rblock rblock--hide-md">
+          <div class="block-head">
+            <span class="kicker">5 段階 Val Hard PPL（実測）</span>
+            <span class="kicker-mono">低いほど高性能</span>
+          </div>
+          <div class="ppl-bars" id="ppl-bars"></div>
+        </div>
+
+        <div class="rblock">
+          <div class="block-head">
+            <span class="kicker">リアルタイム推論計器</span>
+            <span class="kicker-mono">2層 · d=64 · T=64</span>
+          </div>
+          <div class="meta-grid">
+            <div class="meta-cell"><span>Block 乗算 / tok</span><strong class="accent" id="m-muls">-</strong></div>
+            <div class="meta-cell"><span>論理ゲート数</span><strong id="m-gates">-</strong></div>
+            <div class="meta-cell"><span>モデル本体</span><strong id="m-size">-</strong></div>
+            <div class="meta-cell"><span>Val Hard PPL</span><strong id="m-ppl">-</strong></div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
+      <span class="foot-mid">純 Kizu で学習した 5 段階の Transformer（L0〜L3-C）をブラウザ WASM 上でそのまま実行 · 上の L0〜L3-C で Attention の変化を比較</span>
+      <span class="foot-mono" id="foot-stat">kizu wasm32-browser</span>
+    </footer>
+
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="比較としくみ">
+        <div class="sheet__head">
+          <div class="sheet__tabs" role="tablist">
+            <button type="button" role="tab" data-tab="cmp" aria-selected="true">L0 vs L3-C 同時生成</button>
+            <button type="button" role="tab" data-tab="about" aria-selected="false">LogicLadder のしくみ</button>
+          </div>
+          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+        </div>
+        <div class="sheet__content">
+          <div id="tab-cmp">
+            <div class="block-head" style="margin-bottom:10px">
+              <span class="kicker-mono">同じプロンプトから L0（全実数 311 KB）と L3-C（論理ゲート＋MUX 59 KB）を同時に 90 文字生成</span>
+              <button type="button" class="mini-btn" id="btn-run-cmp">再生成</button>
+            </div>
+            <div class="cmp-grid">
+              <div class="cmp-card">
+                <h3><span>L0 全実数 Teacher</span><span id="cmp-l0-meta">311 KB</span></h3>
+                <pre id="cmp-l0">生成中…</pre>
+              </div>
+              <div class="cmp-card" style="border-color:var(--accent)">
+                <h3><span style="color:var(--accent)">L3-C 論理ゲート＋MUX</span><span id="cmp-l3-meta">59 KB · 乗算0</span></h3>
+                <pre id="cmp-l3">生成中…</pre>
+              </div>
+            </div>
+          </div>
+          <div id="tab-about" hidden>
+            <ul class="about-list">
+              <li>
+                <strong><span class="about-step">L0 → L0b</span>まず FFN だけを論理ゲート（768 LUT）へ置換</strong>
+                <p>Tiny Shakespeare（d=64, 2層, 2,000 step）で val hard PPL は 7.22 → 8.29 と小幅な劣化に収まります。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">L0b → L1</span>最大の壁：Q / K / V 射影の論理ゲート化（+384 LUT4）</strong>
+                <p>本家 Griffith でも報告されている通り、Q/K/V の二値化が最大のボトルネック（8.29 → 11.25）。ここでは L0 Teacher からの KL 蒸留を併用しています。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">L1 → L2 → L3-C</span>XNOR-popcount と Softmax 廃止（ハードウェア MUX）</strong>
+                <p>内積をビット一致数（XNOR-popcount）に置き換え、さらに L3-C では Softmax を消して <code>argmax</code> スイッチ（MUX）にします。Attention マップが「ぼやけた確率分布」から「各行ちょうど 1 マスだけ点灯」へ切り替わるのに、PPL 劣化はわずか（11.25 → 11.66）です。</p>
+              </li>
+              <li>
+                <strong><span class="about-step">SIZE</span>モデル本体はわずか 59 KB（すべて純 Kizu WASM 推論）</strong>
+                <p>L0 は 311 KB ですが、L3-C はブロック内の全行列が離散 LUT テーブルへ圧縮され 59 KB。ブラウザ内でそのままリアルタイム推論しています。</p>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { instantiate } from "../dist/app.mjs";
+
+    const RUNGS = {
+      l0:  { name: "L0 全実数 Teacher", file: "./models/l0.glgpt",  kb: 311, ppl: 7.22,  qkv: ["FP32 行列積", false], score: ["FP32 内積", false], sel: ["Softmax 重み和", false], ffn: ["FP32 + GELU", false] },
+      l0b: { name: "L0b Logic FFN",     file: "./models/l0b.glgpt", kb: 185, ppl: 8.29,  qkv: ["FP32 行列積", false], score: ["FP32 内積", false], sel: ["Softmax 重み和", false], ffn: ["768 LUT2 論理", true] },
+      l1:  { name: "L1 Logic QKV + KD", file: "./models/l1.glgpt",  kb: 59,  ppl: 11.25, qkv: ["384 LUT4 論理", true], score: ["二値内積", false], sel: ["Softmax 重み和", false], ffn: ["768 LUT2 論理", true] },
+      l2:  { name: "L2 XNOR + KD",      file: "./models/l2.glgpt",  kb: 59,  ppl: 11.25, qkv: ["384 LUT4 論理", true], score: ["XNOR-popcnt", true], sel: ["Softmax 重み和", false], ffn: ["768 LUT2 論理", true] },
+      l3c: { name: "L3-C MUX + KD",     file: "./models/l3c.glgpt", kb: 59,  ppl: 11.66, qkv: ["384 LUT4 論理", true], score: ["XNOR-popcnt", true], sel: ["argmax MUX", true], ffn: ["768 LUT2 論理", true] },
+    };
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svgEl = (tag, attrs = {}, text = null) => {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+      if (text !== null) el.textContent = text;
+      return el;
+    };
+
+    const encoder = new TextEncoder();
+    const slotBuffers = { 0: new Uint8Array(0), 1: new Uint8Array(0) };
+
+    let ex = null;
+    const handles = {};
+    const sizes = {};
+    let activeRung = "l3c";
+    let activeLayer = 0;
+    let activeHead = 0;
+    let promptText = "ROMEO:\nO ";
+    let fullText = "ROMEO:\nO ";
+    let isGenerating = false;
+    let genTimer = 0;
+    let hoverQ = -1;
+    let hoverK = -1;
+    let seedCounter = 1001;
+
+    function fmtChar(b) {
+      if (b === 10) return "↵";
+      if (b === 32) return "␣";
+      if (b >= 33 && b <= 126) return String.fromCharCode(b);
+      return "·";
+    }
+
+    async function ensureRungLoaded(key) {
+      if (handles[key]) return handles[key];
+      const info = RUNGS[key];
+      document.getElementById("gen-stat").textContent = `${key.toUpperCase()} 読込中…`;
+      const resp = await fetch(info.file);
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      slotBuffers[0] = buf;
+      const h = ex.ladder_load(buf.byteLength) >>> 0;
+      if (!h) throw new Error(`Failed to load ${info.file}`);
+      handles[key] = h;
+      sizes[key] = buf.byteLength;
+      return h;
+    }
+
+    function evalCurrentText() {
+      const h = handles[activeRung];
+      if (!h) return;
+      const raw = encoder.encode(fullText);
+      slotBuffers[1] = raw;
+      const t0 = performance.now();
+      const seqLen = ex.ladder_eval_bytes(h, raw.byteLength);
+      const t1 = performance.now();
+
+      document.getElementById("tok-ms").textContent = `${(t1 - t0).toFixed(2)} ms / forward`;
+      document.getElementById("attn-shape").textContent = `T=${seqLen} · L${activeLayer} H${activeHead}`;
+      const muls = ex.ladder_block_muls(h, seqLen);
+      document.getElementById("m-muls").textContent = muls === 0 ? "0 回" : `${muls.toLocaleString()} 回`;
+
+      renderOutputText(seqLen);
+      renderTop5(h);
+      renderAttnMap(h, seqLen);
+    }
+
+    function renderOutputText(windowLen) {
+      const box = document.getElementById("out-box");
+      const raw = encoder.encode(fullText);
+      const start = Math.max(0, raw.length - windowLen);
+      const pLen = promptText.length;
+
+      let html = "";
+      for (let i = 0; i < raw.length; i++) {
+        const ch = String.fromCharCode(raw[i])
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const wIdx = i - start;
+        let cls = "tok";
+        if (i < pLen) cls += " tok--prompt";
+        if (wIdx === hoverQ) cls += " tok--q";
+        else if (wIdx === hoverK) cls += " tok--k";
+        html += `<span class="${cls}">${ch}</span>`;
+      }
+      box.innerHTML = html;
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function renderTop5(h) {
+      const box = document.getElementById("top5-bars");
+      box.innerHTML = "";
+      for (let r = 0; r < 5; r++) {
+        const pk = ex.ladder_top_token(h, r);
+        const b = pk & 255;
+        const p = (pk >>> 8) / 10;
+        const row = document.createElement("div");
+        row.className = "prob-row";
+        row.innerHTML =
+          `<span class="prob-ch">${fmtChar(b)}</span>` +
+          `<div class="track"><div class="fill ${r === 0 ? "fill--acc" : ""}" style="width:${Math.max(2, p).toFixed(1)}%"></div></div>` +
+          `<span class="prob-val">${p.toFixed(1)}%</span>`;
+        box.appendChild(row);
+      }
+    }
+
+    function renderAttnMap(h, seqLen) {
+      const svg = document.getElementById("attn-svg");
+      svg.innerHTML = "";
+      if (seqLen <= 0) return;
+
+      const raw = encoder.encode(fullText);
+      const winStart = Math.max(0, raw.length - seqLen);
+      // 画面で見やすくするため最大末尾 26 トークンの causal 部分行列を表示
+      const maxVis = 26;
+      const visStart = Math.max(0, seqLen - maxVis);
+      const n = seqLen - visStart;
+      const isMux = activeRung === "l3c";
+
+      const W = 620, H = 460;
+      const padL = 52, padT = 36, padR = 20, padB = 56;
+      const gridSize = Math.min(W - padL - padR, H - padT - padB);
+      const x0 = padL + (W - padL - padR - gridSize) / 2;
+      const y0 = padT;
+      const cell = gridSize / n;
+
+      // 軸タイトル
+      svg.appendChild(svgEl("text", {
+        x: x0 + gridSize / 2, y: 15, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, "KEY (参照される過去トークン) →"));
+      svg.appendChild(svgEl("text", {
+        x: 15, y: y0 + gridSize / 2, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+        transform: `rotate(-90 15 ${y0 + gridSize / 2})`,
+      }, "QUERY (現在位置) →"));
+
+      // トークン文字ラベル（上端・左端）
+      const fontSz = Math.min(11, Math.max(7.5, cell * 0.56));
+      for (let i = 0; i < n; i++) {
+        const ch = fmtChar(raw[winStart + visStart + i]);
+        svg.appendChild(svgEl("text", {
+          x: x0 + (i + 0.5) * cell, y: y0 - 6, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": fontSz, "font-weight": 700, fill: "#141412",
+        }, ch));
+        svg.appendChild(svgEl("text", {
+          x: x0 - 7, y: y0 + (i + 0.5) * cell + fontSz * 0.35, "text-anchor": "end",
+          "font-family": "var(--mono)", "font-size": fontSz, "font-weight": 700, fill: "#141412",
+        }, ch));
+      }
+
+      // 枠線
+      svg.appendChild(svgEl("rect", {
+        x: x0, y: y0, width: gridSize, height: gridSize,
+        fill: "#faf9f3", stroke: "#cfccc0", "stroke-width": 1,
+      }));
+
+      // 下三角 Attention セル描画
+      for (let r = 0; r < n; r++) {
+        const q = visStart + r;
+        for (let c = 0; c <= r; c++) {
+          const k = visStart + c;
+          const w = ex.ladder_attn_milli(h, activeLayer, activeHead, q, k) / 1000;
+          let fill = "#f2f0e9";
+          if (isMux) {
+            fill = w > 0.5 ? "#ff4d00" : "#f2f0e9";
+          } else if (w > 0.01) {
+            // 紙 → 墨 → 強い注意は橙へ（ライトモードで見やすいグラデーション）
+            if (w > 0.35) {
+              const a = Math.min(1, 0.38 + (w - 0.35) * 0.95);
+              fill = `rgba(255, 77, 0, ${a.toFixed(2)})`;
+            } else {
+              const a = Math.min(0.65, 0.08 + w * 1.5);
+              fill = `rgba(20, 20, 18, ${a.toFixed(2)})`;
+            }
+          }
+          const rect = svgEl("rect", {
+            class: "attn-cell",
+            x: (x0 + c * cell + 0.6).toFixed(1),
+            y: (y0 + r * cell + 0.6).toFixed(1),
+            width: Math.max(2, cell - 1.2).toFixed(1),
+            height: Math.max(2, cell - 1.2).toFixed(1),
+            rx: isMux && w > 0.5 ? 2 : 1,
+            fill,
+            stroke: (isMux && w > 0.5) ? "#141412" : "none",
+            "stroke-width": (isMux && w > 0.5) ? 0.9 : 0,
+          });
+          rect.addEventListener("mouseenter", () => {
+            hoverQ = q;
+            hoverK = k;
+            const qCh = fmtChar(raw[winStart + q]);
+            const kCh = fmtChar(raw[winStart + k]);
+            document.getElementById("inspector").innerHTML =
+              `<b>Q[${q}] '${qCh}'</b> → <span class="hi">K[${k}] '${kCh}'</span> · 重み <b>${(w * 100).toFixed(1)}%</b>` +
+              (isMux ? (w > 0.5 ? "（MUX 選択 1-hot）" : "（MUX 非選択 = 0）") : "（Softmax 連続確率）");
+            renderOutputText(seqLen);
+          });
+          rect.addEventListener("mouseleave", () => {
+            hoverQ = -1;
+            hoverK = -1;
+            resetInspector();
+            renderOutputText(seqLen);
+          });
+          svg.appendChild(rect);
+        }
+      }
+
+      // 下端：最新トークンの Attention 矢印バー（L0 の分散 vs L3-C の 1 本線 MUX を一目で比較！）
+      const arcY = y0 + gridSize + 30;
+      const lastQ = seqLen - 1;
+      const lastCh = fmtChar(raw[winStart + lastQ]);
+      svg.appendChild(svgEl("text", {
+        x: x0, y: arcY - 12, "font-family": "var(--mono)", "font-size": 9.5, fill: "#68665e",
+      }, `最新トークン '${lastCh}' の参照先（${isMux ? "ハードウェア MUX 1本選択" : "Softmax 分散参照"}）:`));
+
+      for (let c = 0; c < n; c++) {
+        const k = visStart + c;
+        const w = ex.ladder_attn_milli(h, activeLayer, activeHead, lastQ, k) / 1000;
+        const cx = x0 + (c + 0.5) * cell;
+        const barH = Math.max(2, w * 22);
+        svg.appendChild(svgEl("rect", {
+          x: cx - Math.min(6, cell * 0.35),
+          y: arcY + 14 - barH,
+          width: Math.min(12, cell * 0.7),
+          height: barH,
+          rx: 1.5,
+          fill: (isMux && w > 0.5) || w > 0.35 ? "#ff4d00" : (w > 0.03 ? "#141412" : "#e3e0d6"),
+        }));
+      }
+    }
+
+    function resetInspector() {
+      document.getElementById("inspector").innerHTML = activeRung === "l3c"
+        ? "<b>L3-C</b>: 各行ちょうど 1 マスだけ 100% 点灯する <b>Softmax ゼロ・ハードウェア MUX</b> です"
+        : "行列にカーソルを乗せると、どの過去文字を参照しているか左の文章と同時にハイライトします";
+    }
+
+    function updateRungPanel() {
+      const info = RUNGS[activeRung];
+      const h = handles[activeRung];
+      document.querySelectorAll("#rung-bar button").forEach((b) => {
+        b.setAttribute("aria-pressed", String(b.dataset.rung === activeRung));
+      });
+      document.getElementById("rung-label").textContent = info.name;
+
+      const setNode = (id, [txt, isLogic]) => {
+        const el = document.getElementById(id);
+        el.classList.toggle("logic", isLogic);
+        el.querySelector("strong").textContent = txt;
+      };
+      setNode("pn-qkv", info.qkv);
+      setNode("pn-score", info.score);
+      setNode("pn-sel", info.sel);
+      setNode("pn-ffn", info.ffn);
+
+      const badge = document.getElementById("mux-badge");
+      if (activeRung === "l3c") {
+        badge.className = "mux-badge is-mux";
+        badge.textContent = "L3-C · ハードウェア MUX（各行 1 マスだけ 100% 点灯 · Softmax 0）";
+      } else {
+        badge.className = "mux-badge";
+        badge.textContent = `${activeRung.toUpperCase()} · Softmax Attention（連続確率ヒートマップ）`;
+      }
+
+      if (h) {
+        const gates = ex.ladder_meta(h, 9);
+        const hppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
+        const kb = `${(sizes[activeRung] / 1024).toFixed(0)} KB`;
+        document.getElementById("m-gates").textContent = gates === 0 ? "0" : `${gates.toLocaleString()} LUT`;
+        document.getElementById("m-size").textContent = kb;
+        document.getElementById("m-ppl").textContent = hppl;
+        document.getElementById("foot-stat").textContent = `${activeRung.toUpperCase()} (${kb}) · kizu wasm32-browser`;
+      }
+
+      // PPL 梯子バー
+      const box = document.getElementById("ppl-bars");
+      box.innerHTML = "";
+      for (const [k, r] of Object.entries(RUNGS)) {
+        const pct = (r.ppl / 13.0) * 100;
+        const row = document.createElement("div");
+        row.className = "ppl-row" + (k === activeRung ? " active" : "");
+        row.innerHTML =
+          `<span class="ppl-k">${k.toUpperCase()}</span>` +
+          `<div class="track"><div class="fill ${k === activeRung ? "fill--acc" : ""}" style="width:${pct.toFixed(1)}%"></div></div>` +
+          `<span class="ppl-v">${r.ppl.toFixed(2)}</span>`;
+        row.onclick = () => selectRung(k);
+        box.appendChild(row);
+      }
+      resetInspector();
+    }
+
+    async function selectRung(key) {
+      stopGenerate();
+      activeRung = key;
+      await ensureRungLoaded(key);
+      document.getElementById("gen-stat").textContent = `${key.toUpperCase()} 準備完了`;
+      updateRungPanel();
+      evalCurrentText();
+    }
+
+    function stopGenerate() {
+      isGenerating = false;
+      if (genTimer) clearTimeout(genTimer);
+      genTimer = 0;
+      document.getElementById("btn-gen").textContent = "生成する";
+    }
+
+    function stepOneToken() {
+      const h = handles[activeRung];
+      if (!h) return;
+      evalCurrentText();
+      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
+      seedCounter = (seedCounter + 13) >>> 0;
+      const b = ex.ladder_sample_byte(h, tempMilli, 0);
+      fullText += String.fromCharCode(b);
+      evalCurrentText();
+    }
+
+    function startGenerate() {
+      if (isGenerating) { stopGenerate(); return; }
+      const h = handles[activeRung];
+      if (!h) return;
+      promptText = document.getElementById("prompt-in").value || "ROMEO:\n";
+      fullText = promptText;
+      isGenerating = true;
+      document.getElementById("btn-gen").textContent = "停止";
+
+      let remaining = 96;
+      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
+      seedCounter = (seedCounter + 31) >>> 0;
+      let first = true;
+
+      function nextChar() {
+        if (!isGenerating || remaining <= 0) {
+          stopGenerate();
+          document.getElementById("gen-stat").textContent = `${activeRung.toUpperCase()} 生成完了`;
+          return;
+        }
+        const raw = encoder.encode(fullText);
+        slotBuffers[1] = raw;
+        ex.ladder_eval_bytes(h, raw.byteLength);
+        const b = ex.ladder_sample_byte(h, tempMilli, first ? seedCounter : 0);
+        first = false;
+        fullText += String.fromCharCode(b);
+        remaining--;
+        document.getElementById("gen-stat").textContent = `生成中… (${96 - remaining}/96)`;
+        evalCurrentText();
+        genTimer = setTimeout(nextChar, 32);
+      }
+      nextChar();
+    }
+
+    async function runSideBySideCmp() {
+      document.getElementById("cmp-l0").textContent = "生成中…";
+      document.getElementById("cmp-l3").textContent = "生成中…";
+      const h0 = await ensureRungLoaded("l0");
+      const h3 = await ensureRungLoaded("l3c");
+      const base = document.getElementById("prompt-in").value || "ROMEO:\nO ";
+      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
+      const s = ((Date.now() & 0xffff) + 77) >>> 0;
+
+      const genN = (h, seedVal) => {
+        let txt = base;
+        const t0 = performance.now();
+        for (let i = 0; i < 90; i++) {
+          const raw = encoder.encode(txt);
+          slotBuffers[1] = raw;
+          ex.ladder_eval_bytes(h, raw.byteLength);
+          const b = ex.ladder_sample_byte(h, tempMilli, i === 0 ? seedVal : 0);
+          txt += String.fromCharCode(b);
+        }
+        return { txt, ms: performance.now() - t0 };
+      };
+
+      const r0 = genN(h0, s);
+      const r3 = genN(h3, s);
+      document.getElementById("cmp-l0").textContent = r0.txt;
+      document.getElementById("cmp-l3").textContent = r3.txt;
+      document.getElementById("cmp-l0-meta").textContent = `311 KB · ${(r0.ms / 90).toFixed(2)} ms/tok`;
+      document.getElementById("cmp-l3-meta").textContent = `59 KB · 乗算0 · ${(r3.ms / 90).toFixed(2)} ms/tok`;
+    }
+
+    // シート操作
+    const sheet = document.getElementById("sheet");
+    const btnCmp = document.getElementById("btn-cmp");
+    const btnAbout = document.getElementById("btn-about");
+    let sheetTab = "cmp";
+
+    function openSheet(tab) {
+      sheetTab = tab;
+      sheet.hidden = false;
+      btnCmp.setAttribute("aria-expanded", String(tab === "cmp"));
+      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
+      document.querySelectorAll(".sheet__tabs button").forEach((b) => {
+        b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+      });
+      document.getElementById("tab-cmp").hidden = tab !== "cmp";
+      document.getElementById("tab-about").hidden = tab !== "about";
+      if (tab === "cmp") runSideBySideCmp();
+    }
+    function closeSheet() {
+      sheet.hidden = true;
+      btnCmp.setAttribute("aria-expanded", "false");
+      btnAbout.setAttribute("aria-expanded", "false");
+    }
+
+    document.querySelectorAll("#rung-bar button").forEach((b) => {
+      b.onclick = () => selectRung(b.dataset.rung);
+    });
+    document.querySelectorAll("#layer-pick button").forEach((b) => {
+      b.onclick = () => {
+        activeLayer = Number(b.dataset.l);
+        document.querySelectorAll("#layer-pick button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        evalCurrentText();
+      };
+    });
+    document.querySelectorAll("#head-pick button").forEach((b) => {
+      b.onclick = () => {
+        activeHead = Number(b.dataset.h);
+        document.querySelectorAll("#head-pick button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        evalCurrentText();
+      };
+    });
+    document.querySelectorAll("#preset-chips button").forEach((b) => {
+      b.onclick = () => {
+        stopGenerate();
+        promptText = b.dataset.p;
+        fullText = promptText;
+        document.getElementById("prompt-in").value = promptText;
+        startGenerate();
+      };
+    });
+    document.getElementById("prompt-in").addEventListener("input", (e) => {
+      stopGenerate();
+      promptText = e.target.value;
+      fullText = promptText;
+      if (fullText.length > 0) evalCurrentText();
+    });
+    document.getElementById("temp-range").addEventListener("input", (e) => {
+      document.getElementById("temp-val").textContent = (Number(e.target.value) / 100).toFixed(2);
+    });
+    document.getElementById("btn-gen").onclick = startGenerate;
+    document.getElementById("btn-step").onclick = () => { stopGenerate(); stepOneToken(); };
+    btnCmp.onclick = () => (!sheet.hidden && sheetTab === "cmp") ? closeSheet() : openSheet("cmp");
+    btnAbout.onclick = () => (!sheet.hidden && sheetTab === "about") ? closeSheet() : openSheet("about");
+    document.getElementById("btn-run-cmp").onclick = runSideBySideCmp;
+    document.getElementById("sheet-close").onclick = closeSheet;
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    document.querySelectorAll(".sheet__tabs button").forEach((b) => { b.onclick = () => openSheet(b.dataset.tab); });
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
+
+    async function boot() {
+      const program = await instantiate({
+        write() { return true; },
+        host: {
+          read_input(host, slot, offset, ptr, cap) {
+            const src = slotBuffers[slot];
+            if (!src || offset >= src.byteLength) return 0;
+            const end = Math.min(src.byteLength, offset + (cap >>> 0));
+            return host.writeBytes(ptr, src.subarray(offset, end));
+          },
+          give_bytes() {},
+        },
+      });
+      program.start();
+      ex = program.exports;
+
+      await selectRung("l3c");
+      // 開いた直後に L3-C（59 KB・MUX Attention）で 60 文字ほど生成して見せる
+      setTimeout(() => startGenerate(), 260);
+    }
+
+    boot();
+  </script>
+</body>
+</html>

@@ -1,0 +1,149 @@
+import griffith::core;
+import std::array;
+import std::mem;
+import std::string;
+
+pub struct CharVocab {
+    pub size: i64,
+    pub byte_to_id: array::Array<i32>,
+    pub id_to_byte: string::String,
+}
+
+pub fn (self: CharVocab) deinit(allocator: Allocator) -> void {
+    self.byte_to_id.deinit(allocator);
+    self.id_to_byte.deinit(allocator);
+    return;
+}
+
+pub fn build_char_vocab(allocator: Allocator, text: []u8) -> mem::Error!CharVocab {
+    var seen = [256]i32{};
+    let seen_s = seen.as_mut_slice();
+    let n = mem::len(text);
+    for 0..n |i| {
+        seen_s[cast<i64>(text[i])] = 1;
+    }
+
+    var byte_to_id = try core::alloc_i32(allocator, 256);
+    errdefer byte_to_id.deinit(allocator);
+    var id_to_byte = string::new(allocator);
+    errdefer id_to_byte.deinit(allocator);
+
+    var count: i64 = 0;
+    for 0..256 |b| {
+        if seen_s[b] != 0 {
+            try id_to_byte.append_byte(allocator, cast<u8>(b));
+            count = count + 1;
+        }
+    }
+
+    let b2i = byte_to_id.as_mut_slice();
+    for 0..256 |b| {
+        b2i[b] = -1;
+    }
+    let i2b = id_to_byte.as_bytes();
+    for 0..count |id| {
+        b2i[cast<i64>(i2b[id])] = cast<i32>(id);
+    }
+
+    return CharVocab {
+        size: count,
+        byte_to_id: move byte_to_id,
+        id_to_byte: move id_to_byte,
+    };
+}
+
+pub fn vocab_encode_byte(vocab: &CharVocab, b: u8) -> i32 {
+    let b2i = vocab.byte_to_id.as_slice();
+    let id = b2i[cast<i64>(b)];
+    if id < 0 {
+        return 0;
+    }
+    return id;
+}
+
+pub fn vocab_decode_id(vocab: &CharVocab, id: i32) -> u8 {
+    let i2b = vocab.id_to_byte.as_bytes();
+    let idx = cast<i64>(id);
+    if idx < 0 or idx >= vocab.size {
+        return cast<u8>(32);
+    }
+    return i2b[idx];
+}
+
+pub struct Corpus {
+    pub vocab: CharVocab,
+    pub tokens: array::Array<i32>,
+    pub train_len: i64,
+    pub val_start: i64,
+    pub val_len: i64,
+}
+
+pub fn (self: Corpus) deinit(allocator: Allocator) -> void {
+    self.vocab.deinit(allocator);
+    self.tokens.deinit(allocator);
+    return;
+}
+
+pub fn build_corpus(allocator: Allocator, text: []u8) -> mem::Error!Corpus {
+    var vocab = try build_char_vocab(allocator, text);
+    errdefer vocab.deinit(allocator);
+    let n = mem::len(text);
+    var tokens = try core::alloc_i32(allocator, n);
+    errdefer tokens.deinit(allocator);
+
+    let b2i = vocab.byte_to_id.as_slice();
+    let tok_s = tokens.as_mut_slice();
+    for 0..n |i| {
+        tok_s[i] = b2i[cast<i64>(text[i])];
+    }
+
+    let train_len = (n * 9) / 10;
+    let val_start = train_len;
+    let val_len = n - train_len;
+
+    return Corpus {
+        vocab: move vocab,
+        tokens: move tokens,
+        train_len: train_len,
+        val_start: val_start,
+        val_len: val_len,
+    };
+}
+
+pub fn sample_batch(
+    corpus: &Corpus,
+    batch: i64,
+    seq_len: i64,
+    is_val: bool,
+    rng: &var core::Rng,
+    x_out: &var []i32,
+    y_out: &var []i32
+) -> void {
+    let tok_s = corpus.tokens.as_slice();
+    let base = if is_val { corpus.val_start } else { 0 };
+    let span = (if is_val { corpus.val_len } else { corpus.train_len }) - seq_len - 1;
+    let safe_span = if span > 1 { span } else { 1 };
+    for 0..batch |b| {
+        let start = base + rng.next_range(safe_span);
+        let off = b * seq_len;
+        for 0..seq_len |t| {
+            x_out[off + t] = tok_s[start + t];
+            y_out[off + t] = tok_s[start + t + 1];
+        }
+    }
+    return;
+}
+
+pub fn decode_tokens_to_string(
+    allocator: Allocator,
+    vocab: &CharVocab,
+    ids: []i32,
+    count: i64
+) -> mem::Error!string::String {
+    var out = string::new(allocator);
+    errdefer out.deinit(allocator);
+    for 0..count |i| {
+        try out.append_byte(allocator, vocab_decode_id(vocab, ids[i]));
+    }
+    return move out;
+}

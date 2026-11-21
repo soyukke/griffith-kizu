@@ -1,0 +1,456 @@
+import griffith::core;
+import griffith::data;
+import griffith::lut;
+import griffith::model;
+import std::float;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::math;
+import std::mem;
+import std::process;
+import std::string;
+
+fn report_ladder_run(
+    allocator: Allocator,
+    corpus: &data::Corpus,
+    label: []u8,
+    m: &var model::LogicLadderGPT,
+    steps: i64,
+    batch: i64,
+    seq_len: i64,
+    last_train_loss: f32,
+    elapsed_ms: i64
+) -> mem::Error!void {
+    let bt = batch * seq_len;
+    let safe_ms = if elapsed_ms > 0 { elapsed_ms } else { 1 };
+    let tok_per_sec = cast<f64>(steps * bt) * 1000.0 / cast<f64>(safe_ms);
+
+    let soft_loss = try model::ladder_eval_loss(allocator, m, corpus, batch, 24, false, 12345);
+    let hard_loss = try model::ladder_eval_loss(allocator, m, corpus, batch, 24, true, 12345);
+    let soft_ppl = math::exp<f64>(soft_loss);
+    let hard_ppl = math::exp<f64>(hard_loss);
+    let gap_nat = hard_loss - soft_loss;
+    let gates = model::ladder_count_logic_gates(m);
+
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    try line.append_bytes(allocator, "[");
+    try line.append_bytes(allocator, label);
+    try line.append_bytes(allocator, "] steps=");
+    try fmt::append_i64(allocator, &var line, steps);
+    try line.append_bytes(allocator, " gates=");
+    try fmt::append_i64(allocator, &var line, gates);
+    try line.append_bytes(allocator, " train_loss=");
+    try float::append(allocator, &var line, cast<f64>(last_train_loss));
+    try line.append_bytes(allocator, " soft_ppl=");
+    try float::append(allocator, &var line, soft_ppl);
+    try line.append_bytes(allocator, " hard_ppl=");
+    try float::append(allocator, &var line, hard_ppl);
+    try line.append_bytes(allocator, " gap_nat=");
+    try float::append(allocator, &var line, gap_nat);
+    try line.append_bytes(allocator, " tok/s=");
+    try float::append(allocator, &var line, tok_per_sec);
+    try line.append_bytes(allocator, " ms=");
+    try fmt::append_i64(allocator, &var line, elapsed_ms);
+    let lbytes = line.as_bytes();
+    print(lbytes);
+
+    var sample = try model::ladder_generate(allocator, m, &corpus.vocab, "ROMEO:", 140, 0.7, true, 42);
+    defer sample.deinit(allocator);
+    var sline = string::new(allocator);
+    defer sline.deinit(allocator);
+    try sline.append_bytes(allocator, "  sample[");
+    try sline.append_bytes(allocator, label);
+    try sline.append_bytes(allocator, "]: ");
+    let sbytes = sample.as_bytes();
+    for 0..mem::len(sbytes) |i| {
+        if sbytes[i] == 10 {
+            try sline.append_bytes(allocator, " / ");
+        } else {
+            try sline.append_byte(allocator, sbytes[i]);
+        }
+    }
+    let slbytes = sline.as_bytes();
+    print(slbytes);
+    return;
+}
+
+fn make_stage2_cfg(
+    vocab_size: i64,
+    seq_len: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_layers: i64,
+    batch: i64,
+    rung: model::LadderRung
+) -> model::LadderConfig {
+    return model::LadderConfig {
+        vocab_size: vocab_size,
+        seq_len: seq_len,
+        d_model: d_model,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ffn_hidden: d_model * 2,
+        ffn_gates: d_model * 2,
+        ffn_group_factor: 4,
+        qkv_n_inputs: 4,
+        ffn_n_inputs: 2,
+        max_batch: batch,
+        rung: rung,
+        attn_tau: 1.0,
+        attn_gumbel_scale: 0.25,
+    };
+}
+
+fn run_ladder_scratch(
+    allocator: Allocator,
+    corpus: &data::Corpus,
+    label: []u8,
+    rung: model::LadderRung,
+    steps: i64,
+    batch: i64,
+    seq_len: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_layers: i64,
+    lr_fp: f32,
+    lr_lut: f32,
+    seed: u64
+) -> mem::Error!model::LogicLadderGPT {
+    let cfg = make_stage2_cfg(corpus.vocab.size, seq_len, d_model, n_heads, n_layers, batch, rung);
+    var rng = core::rng_new(seed);
+    var m = try model::ladder_gpt_new(allocator, cfg, &var rng);
+    errdefer m.deinit(allocator);
+
+    let bt = batch * seq_len;
+    let vocab = corpus.vocab.size;
+
+    var x = try core::alloc_i32(allocator, bt);
+    defer x.deinit(allocator);
+    var y = try core::alloc_i32(allocator, bt);
+    defer y.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, bt * vocab);
+    defer logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer g_logits.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ys = y.as_mut_slice();
+    let ls = logits.as_mut_slice();
+    let gls = g_logits.as_mut_slice();
+
+    let t0 = process::monotonic_millis();
+    var last_train_loss: f32 = 0.0;
+
+    for 1..(steps + 1) |step| {
+        let progress = cast<f64>(step - 1) / cast<f64>(steps);
+        let decay = 0.1 + 0.9 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * progress));
+        let cur_lr_fp = cast<f32>(cast<f64>(lr_fp) * decay);
+        let cur_lr_lut = cast<f32>(cast<f64>(lr_lut) * decay);
+
+        data::sample_batch(corpus, batch, seq_len, false, &var rng, xs, ys);
+        model::ladder_zero_grad(&var m);
+        model::ladder_forward(&var m, xs, batch, seq_len, ls, model::EvalMode::Train, &var rng);
+        last_train_loss = lut::cross_entropy_loss_grad(ls, ys, bt, vocab, gls);
+        model::ladder_backward(&var m, xs, batch, seq_len, gls);
+        model::ladder_adamw_step(&var m, cur_lr_fp, cur_lr_lut, 0.01, step);
+    }
+
+    let elapsed_ms = process::monotonic_millis() - t0;
+    try report_ladder_run(allocator, corpus, label, &var m, steps, batch, seq_len, last_train_loss, elapsed_ms);
+    return move m;
+}
+
+fn run_ladder_distill(
+    allocator: Allocator,
+    corpus: &data::Corpus,
+    label: []u8,
+    rung: model::LadderRung,
+    teacher: &var model::LogicLadderGPT,
+    kd_alpha: f32,
+    kd_temp: f32,
+    steps: i64,
+    batch: i64,
+    seq_len: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_layers: i64,
+    lr_fp: f32,
+    lr_lut: f32,
+    seed: u64
+) -> mem::Error!model::LogicLadderGPT {
+    let cfg = make_stage2_cfg(corpus.vocab.size, seq_len, d_model, n_heads, n_layers, batch, rung);
+    var rng = core::rng_new(seed);
+    var eval_rng = core::rng_new(seed + 999);
+    var m = try model::ladder_gpt_new(allocator, cfg, &var rng);
+    errdefer m.deinit(allocator);
+
+    let bt = batch * seq_len;
+    let vocab = corpus.vocab.size;
+
+    var x = try core::alloc_i32(allocator, bt);
+    defer x.deinit(allocator);
+    var y = try core::alloc_i32(allocator, bt);
+    defer y.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, bt * vocab);
+    defer logits.deinit(allocator);
+    var t_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer t_logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer g_logits.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ys = y.as_mut_slice();
+    let ls = logits.as_mut_slice();
+    let tls = t_logits.as_mut_slice();
+    let gls = g_logits.as_mut_slice();
+
+    let t0 = process::monotonic_millis();
+    var last_train_loss: f32 = 0.0;
+
+    for 1..(steps + 1) |step| {
+        let progress = cast<f64>(step - 1) / cast<f64>(steps);
+        let decay = 0.1 + 0.9 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * progress));
+        let cur_lr_fp = cast<f32>(cast<f64>(lr_fp) * decay);
+        let cur_lr_lut = cast<f32>(cast<f64>(lr_lut) * decay);
+
+        data::sample_batch(corpus, batch, seq_len, false, &var rng, xs, ys);
+        model::ladder_zero_grad(&var m);
+        model::ladder_forward(&var m, xs, batch, seq_len, ls, model::EvalMode::Train, &var rng);
+        model::ladder_forward(teacher, xs, batch, seq_len, tls, model::EvalMode::EvalHard, &var eval_rng);
+        last_train_loss = model::kl_distill_loss_grad(ls, tls, ys, bt, vocab, kd_alpha, kd_temp, gls);
+        model::ladder_backward(&var m, xs, batch, seq_len, gls);
+        model::ladder_adamw_step(&var m, cur_lr_fp, cur_lr_lut, 0.01, step);
+    }
+
+    let elapsed_ms = process::monotonic_millis() - t0;
+    try report_ladder_run(allocator, corpus, label, &var m, steps, batch, seq_len, last_train_loss, elapsed_ms);
+    return move m;
+}
+
+pub fn run_stage2_ladder() -> !void {
+    let allocator = mem::page_allocator();
+    let path = "data/tiny_shakespeare.txt";
+    var raw = try fs::read_file(io::blocking(), allocator, &path, mem::Limit::Unlimited);
+    defer raw.deinit(allocator);
+    let raw_bytes = raw.as_bytes();
+
+    var corpus = try data::build_corpus(allocator, raw_bytes);
+    defer corpus.deinit(allocator);
+
+    var hdr = string::new(allocator);
+    defer hdr.deinit(allocator);
+    try hdr.append_bytes(allocator, "Tiny Shakespeare loaded: vocab=");
+    try fmt::append_i64(allocator, &var hdr, corpus.vocab.size);
+    try hdr.append_bytes(allocator, " train=");
+    try fmt::append_i64(allocator, &var hdr, corpus.train_len);
+    try hdr.append_bytes(allocator, " val=");
+    try fmt::append_i64(allocator, &var hdr, corpus.val_len);
+    let hbytes = hdr.as_bytes();
+    print(hbytes);
+
+    let batch: i64 = 8;
+    let seq_len: i64 = 64;
+    let d_model: i64 = 64;
+    let n_heads: i64 = 4;
+    let n_layers: i64 = 2;
+    var steps: i64 = 1500;
+    if process::arg_count() >= 2 {
+        let digits = try process::arg(1);
+        var parsed: i64 = 0;
+        for 0..mem::len(digits) |i| {
+            parsed = parsed * 10 + cast<i64>(digits[i]) - 48;
+        }
+        if parsed > 0 {
+            steps = parsed;
+        }
+    }
+
+    // 1. L0 (All FP Teacher)
+    var teacher = try run_ladder_scratch(
+        allocator, &corpus, "L0_FP_Teacher", model::LadderRung::L0,
+        steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.03, 100
+    );
+    defer teacher.deinit(allocator);
+
+    // 2. L0b (Logic FFN only)
+    var m_l0b = try run_ladder_scratch(
+        allocator, &corpus, "L0b_LogicFFN", model::LadderRung::L0b,
+        steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 101
+    );
+    defer m_l0b.deinit(allocator);
+
+    // 3. L1 (Logic FFN + Logic Q/K/V, scratch)
+    var m_l1 = try run_ladder_scratch(
+        allocator, &corpus, "L1_LogicQKV_scratch", model::LadderRung::L1,
+        steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 102
+    );
+    defer m_l1.deinit(allocator);
+
+    // 4. L1 + L0 Teacher KL Distillation
+    var m_l1_kd = try run_ladder_distill(
+        allocator, &corpus, "L1_LogicQKV_KD", model::LadderRung::L1,
+        &var teacher, 0.5, 2.0, steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 102
+    );
+    defer m_l1_kd.deinit(allocator);
+
+    // 5. L2 (Logic Q/K/V + XNOR-popcount)
+    var m_l2 = try run_ladder_scratch(
+        allocator, &corpus, "L2_XNOR_scratch", model::LadderRung::L2,
+        steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 103
+    );
+    defer m_l2.deinit(allocator);
+
+    // 6. L3-C (XNOR-popcount + argmax MUX + Gumbel-ST, scratch)
+    var m_l3c = try run_ladder_scratch(
+        allocator, &corpus, "L3c_MUX_scratch", model::LadderRung::L3c,
+        steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 104
+    );
+    defer m_l3c.deinit(allocator);
+
+    // 7. L3-C + L0 Teacher KL Distillation
+    var m_l3c_kd = try run_ladder_distill(
+        allocator, &corpus, "L3c_MUX_KD", model::LadderRung::L3c,
+        &var teacher, 0.5, 2.0, steps, batch, seq_len, d_model, n_heads, n_layers, 0.004, 0.04, 104
+    );
+    defer m_l3c_kd.deinit(allocator);
+
+    return;
+}
+
+fn parse_i64_arg(s: []u8, fallback: i64) -> i64 {
+    let n = mem::len(s);
+    if n == 0 { return fallback; }
+    var acc: i64 = 0;
+    for 0..n |i| {
+        let ch = s[i];
+        if ch < 48 or ch > 57 { return fallback; }
+        acc = acc * 10 + cast<i64>(ch) - 48;
+    }
+    return acc;
+}
+
+fn parse_rung_arg(s: []u8) -> model::LadderRung {
+    if mem::equal_bytes(s, "l0b") { return model::LadderRung::L0b; }
+    if mem::equal_bytes(s, "l1") { return model::LadderRung::L1; }
+    if mem::equal_bytes(s, "l2") { return model::LadderRung::L2; }
+    if mem::equal_bytes(s, "l3c") { return model::LadderRung::L3c; }
+    return model::LadderRung::L0;
+}
+
+/// CLI: `griffith stage2-train-one <l0|l0b|l1|l2|l3c> <steps> <out.glgpt> [teacher.glgpt]`
+pub fn run_stage2_train_one() -> !void {
+    let allocator = mem::page_allocator();
+    if process::arg_count() < 4 {
+        print("usage: griffith stage2-train-one <l0|l0b|l1|l2|l3c> <steps> <out.glgpt> [teacher.glgpt]");
+        return;
+    }
+    let rung_str = try process::arg(1);
+    let steps_str = try process::arg(2);
+    let out_path = try process::arg(3);
+    let rung = parse_rung_arg(rung_str);
+    let steps = parse_i64_arg(steps_str, 2000);
+
+    let corpus_path = "data/tiny_shakespeare.txt";
+    var raw = try fs::read_file(io::blocking(), allocator, &corpus_path, mem::Limit::Unlimited);
+    defer raw.deinit(allocator);
+    let raw_bytes = raw.as_bytes();
+    var corpus = try data::build_corpus(allocator, raw_bytes);
+    defer corpus.deinit(allocator);
+
+    let batch: i64 = 8;
+    let seq_len: i64 = 64;
+    let d_model: i64 = 64;
+    let n_heads: i64 = 4;
+    let n_layers: i64 = 2;
+    let seed = cast<u64>(100 + model::rung_to_i32(rung));
+    let lr_fp: f32 = 0.004;
+    let lr_lut: f32 = if model::rung_to_i32(rung) == 0 { cast<f32>(0.03) } else { cast<f32>(0.04) };
+
+    let cfg = make_stage2_cfg(corpus.vocab.size, seq_len, d_model, n_heads, n_layers, batch, rung);
+    var rng = core::rng_new(seed);
+    var m = try model::ladder_gpt_new(allocator, cfg, &var rng);
+    defer m.deinit(allocator);
+
+    let bt = batch * seq_len;
+    let vocab = corpus.vocab.size;
+    var x = try core::alloc_i32(allocator, bt);
+    defer x.deinit(allocator);
+    var y = try core::alloc_i32(allocator, bt);
+    defer y.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, bt * vocab);
+    defer logits.deinit(allocator);
+    var t_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer t_logits.deinit(allocator);
+    var g_logits = try core::alloc_f32(allocator, bt * vocab);
+    defer g_logits.deinit(allocator);
+
+    let xs = x.as_mut_slice();
+    let ys = y.as_mut_slice();
+    let ls = logits.as_mut_slice();
+    let tls = t_logits.as_mut_slice();
+    let gls = g_logits.as_mut_slice();
+
+    let has_teacher = process::arg_count() >= 5;
+    let t0 = process::monotonic_millis();
+    var last_loss: f32 = 0.0;
+
+    if has_teacher {
+        let teacher_path = try process::arg(4);
+        var t_blob = try fs::read_file(io::blocking(), allocator, &teacher_path, mem::Limit::Unlimited);
+        defer t_blob.deinit(allocator);
+        let t_bytes = t_blob.as_bytes();
+        var teacher_rt = try model::ladder_runtime_from_bytes(allocator, t_bytes);
+        defer teacher_rt.deinit(allocator);
+
+        for 1..(steps + 1) |step| {
+            let progress = cast<f64>(step - 1) / cast<f64>(steps);
+            let decay = 0.1 + 0.9 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * progress));
+            let cur_lr_fp = cast<f32>(cast<f64>(lr_fp) * decay);
+            let cur_lr_lut = cast<f32>(cast<f64>(lr_lut) * decay);
+
+            data::sample_batch(&corpus, batch, seq_len, false, &var rng, xs, ys);
+            model::ladder_zero_grad(&var m);
+            model::ladder_forward(&var m, xs, batch, seq_len, ls, model::EvalMode::Train, &var rng);
+            model::ladder_runtime_forward_batch(&var teacher_rt, xs, batch, seq_len, tls);
+            last_loss = model::kl_distill_loss_grad(ls, tls, ys, bt, vocab, 0.5, 2.0, gls);
+            model::ladder_backward(&var m, xs, batch, seq_len, gls);
+            model::ladder_adamw_step(&var m, cur_lr_fp, cur_lr_lut, 0.01, step);
+        }
+    } else {
+        for 1..(steps + 1) |step| {
+            let progress = cast<f64>(step - 1) / cast<f64>(steps);
+            let decay = 0.1 + 0.9 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * progress));
+            let cur_lr_fp = cast<f32>(cast<f64>(lr_fp) * decay);
+            let cur_lr_lut = cast<f32>(cast<f64>(lr_lut) * decay);
+
+            data::sample_batch(&corpus, batch, seq_len, false, &var rng, xs, ys);
+            model::ladder_zero_grad(&var m);
+            model::ladder_forward(&var m, xs, batch, seq_len, ls, model::EvalMode::Train, &var rng);
+            last_loss = lut::cross_entropy_loss_grad(ls, ys, bt, vocab, gls);
+            model::ladder_backward(&var m, xs, batch, seq_len, gls);
+            model::ladder_adamw_step(&var m, cur_lr_fp, cur_lr_lut, 0.01, step);
+        }
+    }
+
+    let elapsed_ms = process::monotonic_millis() - t0;
+    let soft_loss = try model::ladder_eval_loss(allocator, &var m, &corpus, batch, 24, false, 12345);
+    let hard_loss = try model::ladder_eval_loss(allocator, &var m, &corpus, batch, 24, true, 12345);
+    let soft_ppl = math::exp<f64>(soft_loss);
+    let hard_ppl = math::exp<f64>(hard_loss);
+
+    var out_blob = string::new(allocator);
+    defer out_blob.deinit(allocator);
+    try model::ladder_serialize_glgpt(
+        allocator, &m, &corpus.vocab,
+        cast<i32>(soft_ppl * 100.0 + 0.5),
+        cast<i32>(hard_ppl * 100.0 + 0.5),
+        cast<i32>(steps),
+        &var out_blob
+    );
+    let out_bytes = out_blob.as_bytes();
+    try fs::write_file(io::blocking(), &out_path, out_bytes);
+    try report_ladder_run(allocator, &corpus, rung_str, &var m, steps, batch, seq_len, last_loss, elapsed_ms);
+    return;
+}

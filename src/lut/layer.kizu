@@ -1,0 +1,733 @@
+import griffith::core;
+import std::array;
+import std::math;
+import std::mem;
+
+pub enum ParamMode {
+    Softmax,
+    Warp,
+}
+
+pub enum SelectMode {
+    Soft,
+    HardSt,
+    GumbelSt,
+}
+
+pub struct DiscreteLutLayer {
+    pub in_dim: i64,
+    pub out_dim: i64,
+    pub n_inputs: i64,
+    pub indices: array::Array<i32>,
+    pub truth_tables: array::Array<u64>,
+}
+
+pub fn (self: DiscreteLutLayer) deinit(allocator: Allocator) -> void {
+    self.indices.deinit(allocator);
+    self.truth_tables.deinit(allocator);
+    return;
+}
+
+pub struct LutLayer {
+    pub in_dim: i64,
+    pub out_dim: i64,
+    pub n_inputs: i64,
+    pub w_cols: i64,
+    pub param_mode: ParamMode,
+    pub select_mode: SelectMode,
+    pub tau: f32,
+    pub gumbel_scale: f32,
+    pub conn: Connections,
+    pub weights: array::Array<f32>,
+    pub grad_w: array::Array<f32>,
+    pub adam_m: array::Array<f32>,
+    pub adam_v: array::Array<f32>,
+    pub saved_x: array::Array<f32>,
+    pub saved_out: array::Array<f32>,
+    pub saved_z: array::Array<f32>,
+    pub saved_noise: array::Array<f32>,
+    pub saved_hard_idx: array::Array<i32>,
+    pub saved_d_pin: array::Array<f32>,
+    pub saved_batch: i64,
+}
+
+pub fn (self: LutLayer) deinit(allocator: Allocator) -> void {
+    self.conn.deinit(allocator);
+    self.weights.deinit(allocator);
+    self.grad_w.deinit(allocator);
+    self.adam_m.deinit(allocator);
+    self.adam_v.deinit(allocator);
+    self.saved_x.deinit(allocator);
+    self.saved_out.deinit(allocator);
+    self.saved_z.deinit(allocator);
+    self.saved_noise.deinit(allocator);
+    self.saved_hard_idx.deinit(allocator);
+    self.saved_d_pin.deinit(allocator);
+    return;
+}
+
+fn weight_cols_for(n_inputs: i64, param_mode: ParamMode) -> i64 {
+    match param_mode {
+        Softmax => {
+            if n_inputs == 2 {
+                return 16;
+            }
+            return pow2(n_inputs);
+        },
+        Warp => {
+            return pow2(n_inputs);
+        },
+    }
+}
+
+pub fn lut_layer_new(
+    allocator: Allocator,
+    in_dim: i64,
+    out_dim: i64,
+    n_inputs: i64,
+    param_mode: ParamMode,
+    select_mode: SelectMode,
+    tau: f32,
+    gumbel_scale: f32,
+    max_batch: i64,
+    rng: &var core::Rng
+) -> mem::Error!LutLayer {
+    let w_cols = weight_cols_for(n_inputs, param_mode);
+    let w_total = out_dim * w_cols;
+    var conn = try build_unique_connections(allocator, in_dim, out_dim, n_inputs, rng);
+    errdefer conn.deinit(allocator);
+    var weights = try core::alloc_f32(allocator, w_total);
+    errdefer weights.deinit(allocator);
+    var grad_w = try core::alloc_f32(allocator, w_total);
+    errdefer grad_w.deinit(allocator);
+    var adam_m = try core::alloc_f32(allocator, w_total);
+    errdefer adam_m.deinit(allocator);
+    var adam_v = try core::alloc_f32(allocator, w_total);
+    errdefer adam_v.deinit(allocator);
+    var saved_x = try core::alloc_f32(allocator, max_batch * in_dim);
+    errdefer saved_x.deinit(allocator);
+    var saved_out = try core::alloc_f32(allocator, max_batch * out_dim);
+    errdefer saved_out.deinit(allocator);
+    var saved_z = try core::alloc_f32(allocator, max_batch * out_dim);
+    errdefer saved_z.deinit(allocator);
+    var saved_noise = try core::alloc_f32(allocator, w_total);
+    errdefer saved_noise.deinit(allocator);
+    var saved_hard_idx = try core::alloc_i32(allocator, out_dim);
+    errdefer saved_hard_idx.deinit(allocator);
+    var saved_d_pin = try core::alloc_f32(allocator, max_batch * out_dim * n_inputs);
+    errdefer saved_d_pin.deinit(allocator);
+
+    var scale: f32 = 1.0;
+    match param_mode {
+        Softmax => {
+            scale = 1.0;
+        },
+        Warp => {
+            scale = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(w_cols)));
+        },
+    }
+    let w_s = weights.as_mut_slice();
+    for 0..w_total |i| {
+        w_s[i] = rng.next_normal_f32() * scale;
+    }
+
+    return LutLayer {
+        in_dim: in_dim,
+        out_dim: out_dim,
+        n_inputs: n_inputs,
+        w_cols: w_cols,
+        param_mode: param_mode,
+        select_mode: select_mode,
+        tau: tau,
+        gumbel_scale: gumbel_scale,
+        conn: move conn,
+        weights: move weights,
+        grad_w: move grad_w,
+        adam_m: move adam_m,
+        adam_v: move adam_v,
+        saved_x: move saved_x,
+        saved_out: move saved_out,
+        saved_z: move saved_z,
+        saved_noise: move saved_noise,
+        saved_hard_idx: move saved_hard_idx,
+        saved_d_pin: move saved_d_pin,
+        saved_batch: 0,
+    };
+}
+
+fn softmax_row(w: []f32, offset: i64, cols: i64, out_s: &var []f32) -> void {
+    var max_v = w[offset];
+    for 1..cols |c| {
+        let v = w[offset + c];
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    var sum: f64 = 0.0;
+    for 0..cols |c| {
+        let e = math::exp<f64>(cast<f64>(w[offset + c] - max_v));
+        out_s[c] = cast<f32>(e);
+        sum = sum + e;
+    }
+    let inv = cast<f32>(1.0 / sum);
+    for 0..cols |c| {
+        out_s[c] = out_s[c] * inv;
+    }
+    return;
+}
+
+fn argmax_row_with_noise(w: []f32, offset: i64, cols: i64, noise: []f32, use_noise: bool) -> i64 {
+    var best_i: i64 = 0;
+    var best_v = w[offset];
+    if use_noise {
+        best_v = best_v + noise[offset];
+    }
+    for 1..cols |c| {
+        var v = w[offset + c];
+        if use_noise {
+            v = v + noise[offset + c];
+        }
+        if v > best_v {
+            best_v = v;
+            best_i = c;
+        }
+    }
+    return best_i;
+}
+
+pub fn lut_zero_grad(layer: &var LutLayer) -> void {
+    let gw = layer.grad_w.as_mut_slice();
+    core::zero_f32(gw);
+    return;
+}
+
+pub fn lut_forward(
+    layer: &var LutLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32,
+    training: bool,
+    rng: &var core::Rng
+) -> void {
+    let in_dim = layer.in_dim;
+    let out_dim = layer.out_dim;
+    let n_inputs = layer.n_inputs;
+    let basis_size = pow2(n_inputs);
+    let w_cols = layer.w_cols;
+    let tau = layer.tau;
+    let gumbel_scale = layer.gumbel_scale;
+    layer.saved_batch = batch;
+
+    let idx_s = layer.conn.indices.as_slice();
+    let w_s = layer.weights.as_slice();
+    let sx = layer.saved_x.as_mut_slice();
+    let so = layer.saved_out.as_mut_slice();
+    let sz = layer.saved_z.as_mut_slice();
+    let sn = layer.saved_noise.as_mut_slice();
+    let sh = layer.saved_hard_idx.as_mut_slice();
+
+    for 0..(batch * in_dim) |i| {
+        sx[i] = x[i];
+    }
+
+    var x_pins = [6]f32{};
+    var s_pins = [6]f32{};
+    var basis = [64]f32{};
+    var inter = [64]f32{};
+    var sm = [64]f32{};
+    var eff_w = [64]f32{};
+    var logits = [64]f32{};
+
+    let xp = x_pins.as_mut_slice();
+    let sp = s_pins.as_mut_slice();
+    let bs = basis.as_mut_slice();
+    let it = inter.as_mut_slice();
+    let sm_s = sm.as_mut_slice();
+    let ew = eff_w.as_mut_slice();
+    let lg = logits.as_mut_slice();
+
+    // Sample per-step Gumbel / logistic noise once per gate if training with GumbelSt.
+    if training {
+        match layer.select_mode {
+            GumbelSt => {
+                match layer.param_mode {
+                    Softmax => {
+                        for 0..(out_dim * w_cols) |i| {
+                            sn[i] = rng.next_gumbel_f32() * gumbel_scale;
+                        }
+                    },
+                    Warp => {
+                        for 0..(out_dim * w_cols) |i| {
+                            sn[i] = rng.next_logistic_f32() * gumbel_scale;
+                        }
+                    },
+                }
+            },
+            Soft => {},
+            HardSt => {
+                for 0..(out_dim * w_cols) |i| {
+                    sn[i] = 0.0;
+                }
+            },
+        }
+    }
+
+    for 0..out_dim |o| {
+        let w_off = o * w_cols;
+        let idx_off = o * n_inputs;
+
+        if !training {
+            // Hard discretized evaluation (pure Boolean truth table lookup).
+            var tt: u64 = 0;
+            match layer.param_mode {
+                Softmax => {
+                    let best = argmax_row_with_noise(w_s, w_off, w_cols, sn, false);
+                    if n_inputs == 2 {
+                        tt = gate_table_n2_mask(best);
+                    } else {
+                        tt = cast<u64>(1) << cast<u64>(best);
+                    }
+                },
+                Warp => {
+                    var theta_row = [64]f32{};
+                    let tr = theta_row.as_mut_slice();
+                    for 0..basis_size |i| {
+                        tr[i] = w_s[w_off + i];
+                    }
+                    wh_theta_to_logits(tr, n_inputs, lg);
+                    for 0..basis_size |e| {
+                        if lg[e] > 0.0 {
+                            tt = tt | (cast<u64>(1) << cast<u64>(e));
+                        }
+                    }
+                },
+            }
+            for 0..batch |b| {
+                let x_off = b * in_dim;
+                var addr: u64 = 0;
+                for 0..n_inputs |p| {
+                    let v = x[x_off + cast<i64>(idx_s[idx_off + p])];
+                    if v >= 0.5 {
+                        addr = addr | (cast<u64>(1) << cast<u64>(p));
+                    }
+                }
+                let bit = (tt >> addr) & cast<u64>(1);
+                let y = if bit != 0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                out[b * out_dim + o] = y;
+                so[b * out_dim + o] = y;
+            }
+        } else {
+            // Training forward
+            match layer.param_mode {
+                Softmax => {
+                    var use_hard = false;
+                    var use_noise = false;
+                    match layer.select_mode {
+                        Soft => {},
+                        HardSt => {
+                            use_hard = true;
+                        },
+                        GumbelSt => {
+                            use_hard = true;
+                            use_noise = true;
+                        },
+                    }
+                    if use_hard {
+                        let best = argmax_row_with_noise(w_s, w_off, w_cols, sn, use_noise);
+                        sh[o] = cast<i32>(best);
+                        if n_inputs == 2 {
+                            for 0..4 |k| {
+                                ew[k] = gate_table_n2_bit(best, k);
+                            }
+                        } else {
+                            for 0..basis_size |k| {
+                                ew[k] = if k == best { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                            }
+                        }
+                    } else {
+                        softmax_row(w_s, w_off, w_cols, sm_s);
+                        if n_inputs == 2 {
+                            for 0..4 |k| {
+                                var acc: f32 = 0.0;
+                                for 0..16 |g| {
+                                    acc = acc + sm_s[g] * gate_table_n2_bit(g, k);
+                                }
+                                ew[k] = acc;
+                            }
+                        } else {
+                            for 0..basis_size |k| {
+                                ew[k] = sm_s[k];
+                            }
+                        }
+                    }
+                    for 0..batch |b| {
+                        let x_off = b * in_dim;
+                        for 0..n_inputs |p| {
+                            xp[p] = x[x_off + cast<i64>(idx_s[idx_off + p])];
+                        }
+                        compute_basis_butterfly(xp, n_inputs, bs, it);
+                        var y: f32 = 0.0;
+                        for 0..basis_size |k| {
+                            y = y + bs[k] * ew[k];
+                        }
+                        out[b * out_dim + o] = y;
+                        so[b * out_dim + o] = y;
+                    }
+                },
+                Warp => {
+                    var use_hard = false;
+                    match layer.select_mode {
+                        Soft => {},
+                        HardSt => {
+                            use_hard = true;
+                        },
+                        GumbelSt => {
+                            use_hard = true;
+                        },
+                    }
+                    if !use_hard {
+                        for 0..batch |b| {
+                            let x_off = b * in_dim;
+                            for 0..n_inputs |p| {
+                                xp[p] = x[x_off + cast<i64>(idx_s[idx_off + p])];
+                            }
+                            compute_wh_basis_butterfly(xp, n_inputs, sp, bs, it);
+                            var z: f32 = 0.0;
+                            for 0..basis_size |k| {
+                                z = z + bs[k] * w_s[w_off + k];
+                            }
+                            let scaled = z / tau;
+                            let y = core::sigmoid_f32(scaled);
+                            out[b * out_dim + o] = y;
+                            so[b * out_dim + o] = y;
+                            sz[b * out_dim + o] = z;
+                        }
+                    } else {
+                        var theta_row = [64]f32{};
+                        let tr = theta_row.as_mut_slice();
+                        for 0..basis_size |i| {
+                            tr[i] = w_s[w_off + i];
+                        }
+                        wh_theta_to_logits(tr, n_inputs, lg);
+                        for 0..basis_size |e| {
+                            lg[e] = lg[e] + sn[w_off + e];
+                        }
+                        for 0..batch |b| {
+                            let x_off = b * in_dim;
+                            for 0..n_inputs |p| {
+                                xp[p] = x[x_off + cast<i64>(idx_s[idx_off + p])];
+                            }
+                            compute_basis_butterfly(xp, n_inputs, bs, it);
+                            var z: f32 = 0.0;
+                            for 0..basis_size |e| {
+                                z = z + bs[e] * lg[e];
+                            }
+                            let y = if z > 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+                            out[b * out_dim + o] = y;
+                            so[b * out_dim + o] = y;
+                            sz[b * out_dim + o] = z;
+                        }
+                    }
+                },
+            }
+        }
+    }
+    return;
+}
+
+pub fn lut_backward(
+    layer: &var LutLayer,
+    grad_out: []f32,
+    grad_x: &var []f32,
+    compute_grad_x: bool
+) -> void {
+    let batch = layer.saved_batch;
+    let in_dim = layer.in_dim;
+    let out_dim = layer.out_dim;
+    let n_inputs = layer.n_inputs;
+    let basis_size = pow2(n_inputs);
+    let w_cols = layer.w_cols;
+    let tau = layer.tau;
+
+    let idx_s = layer.conn.indices.as_slice();
+    let rev_off = layer.conn.rev_offsets.as_slice();
+    let rev_gates = layer.conn.rev_gates.as_slice();
+    let rev_pins = layer.conn.rev_pins.as_slice();
+    let w_s = layer.weights.as_slice();
+    let gw = layer.grad_w.as_mut_slice();
+    let sx = layer.saved_x.as_slice();
+    let so = layer.saved_out.as_slice();
+    let sz = layer.saved_z.as_slice();
+    let sn = layer.saved_noise.as_slice();
+    let dp = layer.saved_d_pin.as_mut_slice();
+
+    var x_pins = [6]f32{};
+    var s_pins = [6]f32{};
+    var basis = [64]f32{};
+    var inter = [64]f32{};
+    var sm = [64]f32{};
+    var eff_w = [64]f32{};
+    var logits = [64]f32{};
+    var grad_eff = [64]f32{};
+    var grad_s = [64]f32{};
+    var grad_basis = [64]f32{};
+    var grad_pins = [6]f32{};
+
+    let xp = x_pins.as_mut_slice();
+    let sp = s_pins.as_mut_slice();
+    let bs = basis.as_mut_slice();
+    let it = inter.as_mut_slice();
+    let sm_s = sm.as_mut_slice();
+    let ew = eff_w.as_mut_slice();
+    let lg = logits.as_mut_slice();
+    let ge = grad_eff.as_mut_slice();
+    let gs = grad_s.as_mut_slice();
+    let gb = grad_basis.as_mut_slice();
+    let gp = grad_pins.as_mut_slice();
+
+    for 0..out_dim |o| {
+        let w_off = o * w_cols;
+        let idx_off = o * n_inputs;
+
+        match layer.param_mode {
+            Softmax => {
+                // Both Soft and HardSt/GumbelSt use soft softmax Jacobian (STE) for backward.
+                softmax_row(w_s, w_off, w_cols, sm_s);
+                if n_inputs == 2 {
+                    for 0..4 |k| {
+                        var acc: f32 = 0.0;
+                        for 0..16 |g| {
+                            acc = acc + sm_s[g] * gate_table_n2_bit(g, k);
+                        }
+                        ew[k] = acc;
+                    }
+                } else {
+                    for 0..basis_size |k| {
+                        ew[k] = sm_s[k];
+                    }
+                }
+                for 0..basis_size |k| {
+                    ge[k] = 0.0;
+                }
+                for 0..batch |b| {
+                    let x_off = b * in_dim;
+                    let go = grad_out[b * out_dim + o];
+                    for 0..n_inputs |p| {
+                        xp[p] = sx[x_off + cast<i64>(idx_s[idx_off + p])];
+                    }
+                    compute_basis_butterfly(xp, n_inputs, bs, it);
+                    for 0..basis_size |k| {
+                        ge[k] = ge[k] + go * bs[k];
+                    }
+                    if compute_grad_x {
+                        for 0..basis_size |k| {
+                            gb[k] = go * ew[k];
+                        }
+                        butterfly_backward(gb, xp, it, n_inputs, gp);
+                        let pin_base = (b * out_dim + o) * n_inputs;
+                        for 0..n_inputs |p| {
+                            dp[pin_base + p] = gp[p];
+                        }
+                    }
+                }
+                if n_inputs == 2 {
+                    for 0..16 |g| {
+                        var acc: f32 = 0.0;
+                        for 0..4 |k| {
+                            acc = acc + ge[k] * gate_table_n2_bit(g, k);
+                        }
+                        gs[g] = acc;
+                    }
+                } else {
+                    for 0..basis_size |k| {
+                        gs[k] = ge[k];
+                    }
+                }
+                var dot: f32 = 0.0;
+                for 0..w_cols |c| {
+                    dot = dot + gs[c] * sm_s[c];
+                }
+                for 0..w_cols |c| {
+                    gw[w_off + c] = gw[w_off + c] + sm_s[c] * (gs[c] - dot);
+                }
+            },
+            Warp => {
+                var use_hard = false;
+                match layer.select_mode {
+                    Soft => {},
+                    HardSt => {
+                        use_hard = true;
+                    },
+                    GumbelSt => {
+                        use_hard = true;
+                    },
+                }
+                if !use_hard {
+                    for 0..batch |b| {
+                        let x_off = b * in_dim;
+                        let go = grad_out[b * out_dim + o];
+                        let y = so[b * out_dim + o];
+                        let grad_z = go * y * (1.0 - y) / tau;
+                        for 0..n_inputs |p| {
+                            xp[p] = sx[x_off + cast<i64>(idx_s[idx_off + p])];
+                        }
+                        compute_wh_basis_butterfly(xp, n_inputs, sp, bs, it);
+                        for 0..basis_size |k| {
+                            gw[w_off + k] = gw[w_off + k] + grad_z * bs[k];
+                        }
+                        if compute_grad_x {
+                            for 0..basis_size |k| {
+                                gb[k] = grad_z * w_s[w_off + k];
+                            }
+                            wh_butterfly_backward(gb, sp, it, n_inputs, gp);
+                            let pin_base = (b * out_dim + o) * n_inputs;
+                            for 0..n_inputs |p| {
+                                dp[pin_base + p] = gp[p];
+                            }
+                        }
+                    }
+                } else {
+                    var theta_row = [64]f32{};
+                    let tr = theta_row.as_mut_slice();
+                    for 0..basis_size |i| {
+                        tr[i] = w_s[w_off + i];
+                    }
+                    wh_theta_to_logits(tr, n_inputs, lg);
+                    for 0..basis_size |e| {
+                        lg[e] = lg[e] + sn[w_off + e];
+                        ge[e] = 0.0;
+                    }
+                    for 0..batch |b| {
+                        let x_off = b * in_dim;
+                        let go = grad_out[b * out_dim + o];
+                        let z = sz[b * out_dim + o];
+                        let sig = core::sigmoid_f32(z / tau);
+                        let grad_z = go * sig * (1.0 - sig) / tau;
+                        for 0..n_inputs |p| {
+                            xp[p] = sx[x_off + cast<i64>(idx_s[idx_off + p])];
+                        }
+                        compute_basis_butterfly(xp, n_inputs, bs, it);
+                        for 0..basis_size |e| {
+                            ge[e] = ge[e] + grad_z * bs[e];
+                        }
+                        if compute_grad_x {
+                            for 0..basis_size |e| {
+                                gb[e] = grad_z * lg[e];
+                            }
+                            butterfly_backward(gb, xp, it, n_inputs, gp);
+                            let pin_base = (b * out_dim + o) * n_inputs;
+                            for 0..n_inputs |p| {
+                                dp[pin_base + p] = gp[p];
+                            }
+                        }
+                    }
+                    // grad_theta = grad_L @ H^T = fwht(grad_L) because H is symmetric.
+                    fwht_in_place(ge, n_inputs);
+                    for 0..basis_size |k| {
+                        gw[w_off + k] = gw[w_off + k] + ge[k];
+                    }
+                }
+            },
+        }
+    }
+
+    // Zero-atomic reverse CSR gather for grad_x.
+    if compute_grad_x {
+        for 0..batch |b| {
+            let gx_off = b * in_dim;
+            let pin_batch_off = b * out_dim * n_inputs;
+            for 0..in_dim |i| {
+                let start = cast<i64>(rev_off[i]);
+                let end = cast<i64>(rev_off[i + 1]);
+                var acc: f32 = 0.0;
+                for start..end |pos| {
+                    let g = cast<i64>(rev_gates[pos]);
+                    let p = cast<i64>(rev_pins[pos]);
+                    acc = acc + dp[pin_batch_off + g * n_inputs + p];
+                }
+                grad_x[gx_off + i] = acc;
+            }
+        }
+    }
+    return;
+}
+
+pub fn lut_discretize(allocator: Allocator, layer: &LutLayer) -> mem::Error!DiscreteLutLayer {
+    let out_dim = layer.out_dim;
+    let n_inputs = layer.n_inputs;
+    let basis_size = pow2(n_inputs);
+    let w_cols = layer.w_cols;
+    let total_edges = out_dim * n_inputs;
+
+    var indices = try core::alloc_i32(allocator, total_edges);
+    errdefer indices.deinit(allocator);
+    var truth_tables = try core::alloc_u64(allocator, out_dim);
+    errdefer truth_tables.deinit(allocator);
+
+    let src_idx = layer.conn.indices.as_slice();
+    let dst_idx = indices.as_mut_slice();
+    for 0..total_edges |e| {
+        dst_idx[e] = src_idx[e];
+    }
+
+    let w_s = layer.weights.as_slice();
+    let tt_s = truth_tables.as_mut_slice();
+    var empty_noise = [1]f32{};
+    let en = empty_noise.as_slice();
+    var theta_row = [64]f32{};
+    var logits = [64]f32{};
+    let tr = theta_row.as_mut_slice();
+    let lg = logits.as_mut_slice();
+
+    for 0..out_dim |o| {
+        let w_off = o * w_cols;
+        var tt: u64 = 0;
+        match layer.param_mode {
+            Softmax => {
+                let best = argmax_row_with_noise(w_s, w_off, w_cols, en, false);
+                if n_inputs == 2 {
+                    tt = gate_table_n2_mask(best);
+                } else {
+                    tt = cast<u64>(1) << cast<u64>(best);
+                }
+            },
+            Warp => {
+                for 0..basis_size |i| {
+                    tr[i] = w_s[w_off + i];
+                }
+                wh_theta_to_logits(tr, n_inputs, lg);
+                for 0..basis_size |e| {
+                    if lg[e] > 0.0 {
+                        tt = tt | (cast<u64>(1) << cast<u64>(e));
+                    }
+                }
+            },
+        }
+        tt_s[o] = tt;
+    }
+
+    return DiscreteLutLayer {
+        in_dim: layer.in_dim,
+        out_dim: out_dim,
+        n_inputs: n_inputs,
+        indices: move indices,
+        truth_tables: move truth_tables,
+    };
+}
+
+pub fn lut_adamw_step(
+    layer: &var LutLayer,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step: i64
+) -> void {
+    let w = layer.weights.as_mut_slice();
+    let g = layer.grad_w.as_slice();
+    let m = layer.adam_m.as_mut_slice();
+    let v = layer.adam_v.as_mut_slice();
+    adamw_update_slice(w, g, m, v, lr, beta1, beta2, eps, weight_decay, step);
+    return;
+}

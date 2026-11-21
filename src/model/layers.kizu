@@ -1,0 +1,534 @@
+import griffith::core;
+import griffith::lut;
+import std::array;
+import std::math;
+import std::mem;
+
+pub struct LinearLayer {
+    pub in_dim: i64,
+    pub out_dim: i64,
+    pub w: array::Array<f32>,
+    pub b: array::Array<f32>,
+    pub gw: array::Array<f32>,
+    pub gb: array::Array<f32>,
+    pub mw: array::Array<f32>,
+    pub vw: array::Array<f32>,
+    pub mb: array::Array<f32>,
+    pub vb: array::Array<f32>,
+    pub saved_x: array::Array<f32>,
+    pub saved_batch: i64,
+}
+
+pub fn (self: LinearLayer) deinit(allocator: Allocator) -> void {
+    self.w.deinit(allocator);
+    self.b.deinit(allocator);
+    self.gw.deinit(allocator);
+    self.gb.deinit(allocator);
+    self.mw.deinit(allocator);
+    self.vw.deinit(allocator);
+    self.mb.deinit(allocator);
+    self.vb.deinit(allocator);
+    self.saved_x.deinit(allocator);
+    return;
+}
+
+pub fn linear_new(
+    allocator: Allocator,
+    in_dim: i64,
+    out_dim: i64,
+    max_batch: i64,
+    rng: &var core::Rng
+) -> mem::Error!LinearLayer {
+    let wn = out_dim * in_dim;
+    var w = try core::alloc_f32(allocator, wn);
+    errdefer w.deinit(allocator);
+    var b = try core::alloc_f32(allocator, out_dim);
+    errdefer b.deinit(allocator);
+    var gw = try core::alloc_f32(allocator, wn);
+    errdefer gw.deinit(allocator);
+    var gb = try core::alloc_f32(allocator, out_dim);
+    errdefer gb.deinit(allocator);
+    var mw = try core::alloc_f32(allocator, wn);
+    errdefer mw.deinit(allocator);
+    var vw = try core::alloc_f32(allocator, wn);
+    errdefer vw.deinit(allocator);
+    var mb = try core::alloc_f32(allocator, out_dim);
+    errdefer mb.deinit(allocator);
+    var vb = try core::alloc_f32(allocator, out_dim);
+    errdefer vb.deinit(allocator);
+    var saved_x = try core::alloc_f32(allocator, max_batch * in_dim);
+    errdefer saved_x.deinit(allocator);
+
+    let scale = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(in_dim)));
+    let ws = w.as_mut_slice();
+    for 0..wn |i| {
+        ws[i] = rng.next_normal_f32() * scale;
+    }
+
+    return LinearLayer {
+        in_dim: in_dim,
+        out_dim: out_dim,
+        w: move w,
+        b: move b,
+        gw: move gw,
+        gb: move gb,
+        mw: move mw,
+        vw: move vw,
+        mb: move mb,
+        vb: move vb,
+        saved_x: move saved_x,
+        saved_batch: 0,
+    };
+}
+
+pub fn linear_zero_grad(layer: &var LinearLayer) -> void {
+    let gw = layer.gw.as_mut_slice();
+    let gb = layer.gb.as_mut_slice();
+    core::zero_f32(gw);
+    core::zero_f32(gb);
+    return;
+}
+
+pub fn linear_forward(
+    layer: &var LinearLayer,
+    x: []f32,
+    batch: i64,
+    out: &var []f32
+) -> void {
+    let in_d = layer.in_dim;
+    let out_d = layer.out_dim;
+    layer.saved_batch = batch;
+    let sx = layer.saved_x.as_mut_slice();
+    for 0..(batch * in_d) |i| {
+        sx[i] = x[i];
+    }
+    let ws = layer.w.as_slice();
+    let bs = layer.b.as_slice();
+    for 0..batch |r| {
+        let x_off = r * in_d;
+        let o_off = r * out_d;
+        for 0..out_d |o| {
+            let w_off = o * in_d;
+            var acc: f32 = bs[o];
+            for 0..in_d |i| {
+                acc = acc + ws[w_off + i] * x[x_off + i];
+            }
+            out[o_off + o] = acc;
+        }
+    }
+    return;
+}
+
+pub fn linear_backward(
+    layer: &var LinearLayer,
+    grad_out: []f32,
+    grad_x: &var []f32,
+    compute_grad_x: bool
+) -> void {
+    let batch = layer.saved_batch;
+    let in_d = layer.in_dim;
+    let out_d = layer.out_dim;
+    let ws = layer.w.as_slice();
+    let sx = layer.saved_x.as_slice();
+    let gw = layer.gw.as_mut_slice();
+    let gb = layer.gb.as_mut_slice();
+
+    if compute_grad_x {
+        for 0..(batch * in_d) |i| {
+            grad_x[i] = 0.0;
+        }
+    }
+
+    for 0..batch |r| {
+        let x_off = r * in_d;
+        let g_off = r * out_d;
+        for 0..out_d |o| {
+            let go = grad_out[g_off + o];
+            gb[o] = gb[o] + go;
+            let w_off = o * in_d;
+            for 0..in_d |i| {
+                gw[w_off + i] = gw[w_off + i] + go * sx[x_off + i];
+            }
+            if compute_grad_x {
+                for 0..in_d |i| {
+                    grad_x[x_off + i] = grad_x[x_off + i] + go * ws[w_off + i];
+                }
+            }
+        }
+    }
+    return;
+}
+
+pub fn linear_adamw_step(
+    layer: &var LinearLayer,
+    lr: f32,
+    wd: f32,
+    step: i64
+) -> void {
+    let w = layer.w.as_mut_slice();
+    let gw = layer.gw.as_slice();
+    let mw = layer.mw.as_mut_slice();
+    let vw = layer.vw.as_mut_slice();
+    lut::adamw_update_slice(w, gw, mw, vw, lr, 0.9, 0.999, 1e-8, wd, step);
+
+    let b = layer.b.as_mut_slice();
+    let gb = layer.gb.as_slice();
+    let mb = layer.mb.as_mut_slice();
+    let vb = layer.vb.as_mut_slice();
+    lut::adamw_update_slice(b, gb, mb, vb, lr, 0.9, 0.999, 1e-8, 0.0, step);
+    return;
+}
+
+pub struct LayerNorm {
+    pub dim: i64,
+    pub gamma: array::Array<f32>,
+    pub beta: array::Array<f32>,
+    pub gg: array::Array<f32>,
+    pub gb: array::Array<f32>,
+    pub mg: array::Array<f32>,
+    pub vg: array::Array<f32>,
+    pub mb: array::Array<f32>,
+    pub vb: array::Array<f32>,
+    pub saved_x: array::Array<f32>,
+    pub saved_mean: array::Array<f32>,
+    pub saved_inv_std: array::Array<f32>,
+    pub saved_batch: i64,
+}
+
+pub fn (self: LayerNorm) deinit(allocator: Allocator) -> void {
+    self.gamma.deinit(allocator);
+    self.beta.deinit(allocator);
+    self.gg.deinit(allocator);
+    self.gb.deinit(allocator);
+    self.mg.deinit(allocator);
+    self.vg.deinit(allocator);
+    self.mb.deinit(allocator);
+    self.vb.deinit(allocator);
+    self.saved_x.deinit(allocator);
+    self.saved_mean.deinit(allocator);
+    self.saved_inv_std.deinit(allocator);
+    return;
+}
+
+pub fn layernorm_new(allocator: Allocator, dim: i64, max_batch: i64) -> mem::Error!LayerNorm {
+    var gamma = try core::alloc_f32(allocator, dim);
+    errdefer gamma.deinit(allocator);
+    var beta = try core::alloc_f32(allocator, dim);
+    errdefer beta.deinit(allocator);
+    var gg = try core::alloc_f32(allocator, dim);
+    errdefer gg.deinit(allocator);
+    var gb = try core::alloc_f32(allocator, dim);
+    errdefer gb.deinit(allocator);
+    var mg = try core::alloc_f32(allocator, dim);
+    errdefer mg.deinit(allocator);
+    var vg = try core::alloc_f32(allocator, dim);
+    errdefer vg.deinit(allocator);
+    var mb = try core::alloc_f32(allocator, dim);
+    errdefer mb.deinit(allocator);
+    var vb = try core::alloc_f32(allocator, dim);
+    errdefer vb.deinit(allocator);
+    var saved_x = try core::alloc_f32(allocator, max_batch * dim);
+    errdefer saved_x.deinit(allocator);
+    var saved_mean = try core::alloc_f32(allocator, max_batch);
+    errdefer saved_mean.deinit(allocator);
+    var saved_inv_std = try core::alloc_f32(allocator, max_batch);
+    errdefer saved_inv_std.deinit(allocator);
+
+    let gs = gamma.as_mut_slice();
+    for 0..dim |i| {
+        gs[i] = 1.0;
+    }
+
+    return LayerNorm {
+        dim: dim,
+        gamma: move gamma,
+        beta: move beta,
+        gg: move gg,
+        gb: move gb,
+        mg: move mg,
+        vg: move vg,
+        mb: move mb,
+        vb: move vb,
+        saved_x: move saved_x,
+        saved_mean: move saved_mean,
+        saved_inv_std: move saved_inv_std,
+        saved_batch: 0,
+    };
+}
+
+pub fn layernorm_zero_grad(ln: &var LayerNorm) -> void {
+    let gg = ln.gg.as_mut_slice();
+    let gb = ln.gb.as_mut_slice();
+    core::zero_f32(gg);
+    core::zero_f32(gb);
+    return;
+}
+
+pub fn layernorm_forward(
+    ln: &var LayerNorm,
+    x: []f32,
+    batch: i64,
+    out: &var []f32
+) -> void {
+    let dim = ln.dim;
+    let inv_d = 1.0 / cast<f64>(dim);
+    ln.saved_batch = batch;
+    let sx = ln.saved_x.as_mut_slice();
+    let sm = ln.saved_mean.as_mut_slice();
+    let sis = ln.saved_inv_std.as_mut_slice();
+    let gs = ln.gamma.as_slice();
+    let bs = ln.beta.as_slice();
+
+    for 0..batch |r| {
+        let off = r * dim;
+        var mean: f64 = 0.0;
+        for 0..dim |i| {
+            let v = x[off + i];
+            sx[off + i] = v;
+            mean = mean + cast<f64>(v);
+        }
+        mean = mean * inv_d;
+        var var_acc: f64 = 0.0;
+        for 0..dim |i| {
+            let d = cast<f64>(x[off + i]) - mean;
+            var_acc = var_acc + d * d;
+        }
+        let inv_std = 1.0 / math::sqrt<f64>(var_acc * inv_d + 1e-5);
+        sm[r] = cast<f32>(mean);
+        sis[r] = cast<f32>(inv_std);
+        for 0..dim |i| {
+            let norm = (cast<f64>(x[off + i]) - mean) * inv_std;
+            out[off + i] = cast<f32>(norm) * gs[i] + bs[i];
+        }
+    }
+    return;
+}
+
+pub fn layernorm_backward(
+    ln: &var LayerNorm,
+    grad_out: []f32,
+    grad_x: &var []f32
+) -> void {
+    let batch = ln.saved_batch;
+    let dim = ln.dim;
+    let inv_d = 1.0 / cast<f64>(dim);
+    let sx = ln.saved_x.as_slice();
+    let sm = ln.saved_mean.as_slice();
+    let sis = ln.saved_inv_std.as_slice();
+    let gs = ln.gamma.as_slice();
+    let gg = ln.gg.as_mut_slice();
+    let gb = ln.gb.as_mut_slice();
+
+    for 0..batch |r| {
+        let off = r * dim;
+        let mean = cast<f64>(sm[r]);
+        let inv_std = cast<f64>(sis[r]);
+        var sum_dxhat: f64 = 0.0;
+        var sum_dxhat_xhat: f64 = 0.0;
+        for 0..dim |i| {
+            let xhat = (cast<f64>(sx[off + i]) - mean) * inv_std;
+            let go = cast<f64>(grad_out[off + i]);
+            gg[i] = gg[i] + cast<f32>(go * xhat);
+            gb[i] = gb[i] + cast<f32>(go);
+            let dxhat = go * cast<f64>(gs[i]);
+            sum_dxhat = sum_dxhat + dxhat;
+            sum_dxhat_xhat = sum_dxhat_xhat + dxhat * xhat;
+        }
+        for 0..dim |i| {
+            let xhat = (cast<f64>(sx[off + i]) - mean) * inv_std;
+            let dxhat = cast<f64>(grad_out[off + i]) * cast<f64>(gs[i]);
+            let dx = inv_std * (dxhat - inv_d * sum_dxhat - inv_d * xhat * sum_dxhat_xhat);
+            grad_x[off + i] = cast<f32>(dx);
+        }
+    }
+    return;
+}
+
+pub fn layernorm_adamw_step(ln: &var LayerNorm, lr: f32, step: i64) -> void {
+    let g = ln.gamma.as_mut_slice();
+    let gg = ln.gg.as_slice();
+    let mg = ln.mg.as_mut_slice();
+    let vg = ln.vg.as_mut_slice();
+    lut::adamw_update_slice(g, gg, mg, vg, lr, 0.9, 0.999, 1e-8, 0.0, step);
+
+    let b = ln.beta.as_mut_slice();
+    let gb = ln.gb.as_slice();
+    let mb = ln.mb.as_mut_slice();
+    let vb = ln.vb.as_mut_slice();
+    lut::adamw_update_slice(b, gb, mb, vb, lr, 0.9, 0.999, 1e-8, 0.0, step);
+    return;
+}
+
+pub struct Embedding {
+    pub vocab: i64,
+    pub dim: i64,
+    pub w: array::Array<f32>,
+    pub gw: array::Array<f32>,
+    pub mw: array::Array<f32>,
+    pub vw: array::Array<f32>,
+}
+
+pub fn (self: Embedding) deinit(allocator: Allocator) -> void {
+    self.w.deinit(allocator);
+    self.gw.deinit(allocator);
+    self.mw.deinit(allocator);
+    self.vw.deinit(allocator);
+    return;
+}
+
+pub fn embedding_new(allocator: Allocator, vocab: i64, dim: i64, rng: &var core::Rng) -> mem::Error!Embedding {
+    let n = vocab * dim;
+    var w = try core::alloc_f32(allocator, n);
+    errdefer w.deinit(allocator);
+    var gw = try core::alloc_f32(allocator, n);
+    errdefer gw.deinit(allocator);
+    var mw = try core::alloc_f32(allocator, n);
+    errdefer mw.deinit(allocator);
+    var vw = try core::alloc_f32(allocator, n);
+    errdefer vw.deinit(allocator);
+    let ws = w.as_mut_slice();
+    for 0..n |i| {
+        ws[i] = rng.next_normal_f32() * 0.02;
+    }
+    return Embedding { vocab: vocab, dim: dim, w: move w, gw: move gw, mw: move mw, vw: move vw };
+}
+
+pub fn embedding_zero_grad(emb: &var Embedding) -> void {
+    let gw = emb.gw.as_mut_slice();
+    core::zero_f32(gw);
+    return;
+}
+
+pub fn embedding_adamw_step(emb: &var Embedding, lr: f32, wd: f32, step: i64) -> void {
+    let w = emb.w.as_mut_slice();
+    let gw = emb.gw.as_slice();
+    let mw = emb.mw.as_mut_slice();
+    let vw = emb.vw.as_mut_slice();
+    lut::adamw_update_slice(w, gw, mw, vw, lr, 0.9, 0.999, 1e-8, wd, step);
+    return;
+}
+
+pub fn gelu_forward(x: []f32, out: &var []f32, count: i64) -> void {
+    // Fast tanh-GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    let k: f64 = 0.7978845608028654;
+    for 0..count |i| {
+        let v = cast<f64>(x[i]);
+        let inner = k * (v + 0.044715 * v * v * v);
+        let th = math::tanh<f64>(inner);
+        out[i] = cast<f32>(0.5 * v * (1.0 + th));
+    }
+    return;
+}
+
+pub fn gelu_backward(x: []f32, grad_out: []f32, grad_x: &var []f32, count: i64) -> void {
+    let k: f64 = 0.7978845608028654;
+    for 0..count |i| {
+        let v = cast<f64>(x[i]);
+        let inner = k * (v + 0.044715 * v * v * v);
+        let th = math::tanh<f64>(inner);
+        let sech2 = 1.0 - th * th;
+        let d_inner = k * (1.0 + 3.0 * 0.044715 * v * v);
+        let deriv = 0.5 * (1.0 + th) + 0.5 * v * sech2 * d_inner;
+        grad_x[i] = cast<f32>(cast<f64>(grad_out[i]) * deriv);
+    }
+    return;
+}
+
+/// Forward binarizes real pre-norm values at 0.0 -> {0.0, 1.0}; backward uses HardTanh STE on [-1, 1].
+pub fn binarize_forward_ste(x: []f32, out: &var []f32, count: i64) -> void {
+    for 0..count |i| {
+        out[i] = if x[i] > 0.0 { cast<f32>(1.0) } else { cast<f32>(0.0) };
+    }
+    return;
+}
+
+pub fn binarize_backward_ste(x: []f32, grad_out: []f32, grad_x: &var []f32, count: i64) -> void {
+    for 0..count |i| {
+        let v = x[i];
+        if v >= -1.0 and v <= 1.0 {
+            grad_x[i] = grad_out[i];
+        } else {
+            grad_x[i] = 0.0;
+        }
+    }
+    return;
+}
+
+/// Combined (1 - alpha) * CE(student, target) + alpha * T^2 * KL(softmax(teacher/T) || softmax(student/T)).
+/// Returns the hard-target CE loss (for tracking true perplexity) while writing combined gradient into grad_student.
+pub fn kl_distill_loss_grad(
+    student_logits: []f32,
+    teacher_logits: []f32,
+    targets: []i32,
+    batch: i64,
+    vocab: i64,
+    alpha: f32,
+    kd_temp: f32,
+    grad_student: &var []f32
+) -> f32 {
+    var ce_total: f64 = 0.0;
+    let inv_batch = 1.0 / cast<f64>(batch);
+    let a = cast<f64>(alpha);
+    let t = cast<f64>(kd_temp);
+    let inv_t = 1.0 / t;
+
+    var ps = [2048]f64{};
+    var ps_t = [2048]f64{};
+    var pt_t = [2048]f64{};
+    let ps_s = ps.as_mut_slice();
+    let pst_s = ps_t.as_mut_slice();
+    let ptt_s = pt_t.as_mut_slice();
+
+    for 0..batch |b| {
+        let off = b * vocab;
+        // 1. Standard CE probs p_S (T=1)
+        var max_s = cast<f64>(student_logits[off]);
+        for 1..vocab |c| {
+            let v = cast<f64>(student_logits[off + c]);
+            if v > max_s { max_s = v; }
+        }
+        var sum_s: f64 = 0.0;
+        for 0..vocab |c| {
+            let e = math::exp<f64>(cast<f64>(student_logits[off + c]) - max_s);
+            ps_s[c] = e;
+            sum_s = sum_s + e;
+        }
+        let target = cast<i64>(targets[b]);
+        ce_total = ce_total + (max_s + math::log<f64>(sum_s) - cast<f64>(student_logits[off + target]));
+        let inv_sum_s = 1.0 / sum_s;
+        for 0..vocab |c| {
+            ps_s[c] = ps_s[c] * inv_sum_s;
+        }
+
+        // 2. Temperature-scaled student & teacher probs
+        var max_st = cast<f64>(student_logits[off]) * inv_t;
+        var max_tt = cast<f64>(teacher_logits[off]) * inv_t;
+        for 1..vocab |c| {
+            let vs = cast<f64>(student_logits[off + c]) * inv_t;
+            let vt = cast<f64>(teacher_logits[off + c]) * inv_t;
+            if vs > max_st { max_st = vs; }
+            if vt > max_tt { max_tt = vt; }
+        }
+        var sum_st: f64 = 0.0;
+        var sum_tt: f64 = 0.0;
+        for 0..vocab |c| {
+            let es = math::exp<f64>(cast<f64>(student_logits[off + c]) * inv_t - max_st);
+            let et = math::exp<f64>(cast<f64>(teacher_logits[off + c]) * inv_t - max_tt);
+            pst_s[c] = es;
+            ptt_s[c] = et;
+            sum_st = sum_st + es;
+            sum_tt = sum_tt + et;
+        }
+        let inv_st = 1.0 / sum_st;
+        let inv_tt = 1.0 / sum_tt;
+        for 0..vocab |c| {
+            var ce_g = ps_s[c];
+            if c == target {
+                ce_g = ce_g - 1.0;
+            }
+            let kd_g = (pst_s[c] * inv_st - ptt_s[c] * inv_tt) * t;
+            grad_student[off + c] = cast<f32>(((1.0 - a) * ce_g + a * kd_g) * inv_batch);
+        }
+    }
+    return cast<f32>(ce_total * inv_batch);
+}
