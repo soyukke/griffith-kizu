@@ -532,3 +532,127 @@ pub fn kl_distill_loss_grad(
     }
     return cast<f32>(ce_total * inv_batch);
 }
+
+/// Token-weighted Cross-Entropy loss + gradient (focuses capacity on response tokens).
+pub fn weighted_ce_loss_grad(
+    logits: []f32,
+    targets: []i32,
+    weights: []f32,
+    batch: i64,
+    vocab: i64,
+    grad_logits: &var []f32
+) -> f32 {
+    var sum_w: f64 = 0.0;
+    for 0..batch |b| {
+        sum_w = sum_w + cast<f64>(weights[b]);
+    }
+    let inv_w = if sum_w > 1e-9 { 1.0 / sum_w } else { 1.0 / cast<f64>(batch) };
+    var ce_total: f64 = 0.0;
+    var probs = [2048]f64{};
+    let ps = probs.as_mut_slice();
+
+    for 0..batch |b| {
+        let off = b * vocab;
+        let wb = cast<f64>(weights[b]);
+        var max_v = cast<f64>(logits[off]);
+        for 1..vocab |c| {
+            let v = cast<f64>(logits[off + c]);
+            if v > max_v { max_v = v; }
+        }
+        var sum_e: f64 = 0.0;
+        for 0..vocab |c| {
+            let e = math::exp<f64>(cast<f64>(logits[off + c]) - max_v);
+            ps[c] = e;
+            sum_e = sum_e + e;
+        }
+        let target = cast<i64>(targets[b]);
+        ce_total = ce_total + wb * (max_v + math::log<f64>(sum_e) - cast<f64>(logits[off + target]));
+        let inv_s = 1.0 / sum_e;
+        let scale = wb * inv_w;
+        for 0..vocab |c| {
+            var g = ps[c] * inv_s;
+            if c == target { g = g - 1.0; }
+            grad_logits[off + c] = cast<f32>(g * scale);
+        }
+    }
+    return cast<f32>(ce_total * inv_w);
+}
+
+/// Token-weighted combined CE + KL distillation loss & gradient.
+pub fn weighted_kl_distill_loss_grad(
+    student_logits: []f32,
+    teacher_logits: []f32,
+    targets: []i32,
+    weights: []f32,
+    batch: i64,
+    vocab: i64,
+    alpha: f32,
+    kd_temp: f32,
+    grad_student: &var []f32
+) -> f32 {
+    var sum_w: f64 = 0.0;
+    for 0..batch |b| {
+        sum_w = sum_w + cast<f64>(weights[b]);
+    }
+    let inv_w = if sum_w > 1e-9 { 1.0 / sum_w } else { 1.0 / cast<f64>(batch) };
+    var ce_total: f64 = 0.0;
+    let a = cast<f64>(alpha);
+    let t = cast<f64>(kd_temp);
+    let inv_t = 1.0 / t;
+
+    var ps = [2048]f64{};
+    var ps_t = [2048]f64{};
+    var pt_t = [2048]f64{};
+    let ps_s = ps.as_mut_slice();
+    let pst_s = ps_t.as_mut_slice();
+    let ptt_s = pt_t.as_mut_slice();
+
+    for 0..batch |b| {
+        let off = b * vocab;
+        let wb = cast<f64>(weights[b]);
+        var max_s = cast<f64>(student_logits[off]);
+        for 1..vocab |c| {
+            let v = cast<f64>(student_logits[off + c]);
+            if v > max_s { max_s = v; }
+        }
+        var sum_s: f64 = 0.0;
+        for 0..vocab |c| {
+            let e = math::exp<f64>(cast<f64>(student_logits[off + c]) - max_s);
+            ps_s[c] = e;
+            sum_s = sum_s + e;
+        }
+        let target = cast<i64>(targets[b]);
+        ce_total = ce_total + wb * (max_s + math::log<f64>(sum_s) - cast<f64>(student_logits[off + target]));
+        let inv_sum_s = 1.0 / sum_s;
+        for 0..vocab |c| { ps_s[c] = ps_s[c] * inv_sum_s; }
+
+        var max_st = cast<f64>(student_logits[off]) * inv_t;
+        var max_tt = cast<f64>(teacher_logits[off]) * inv_t;
+        for 1..vocab |c| {
+            let vs = cast<f64>(student_logits[off + c]) * inv_t;
+            let vt = cast<f64>(teacher_logits[off + c]) * inv_t;
+            if vs > max_st { max_st = vs; }
+            if vt > max_tt { max_tt = vt; }
+        }
+        var sum_st: f64 = 0.0;
+        var sum_tt: f64 = 0.0;
+        for 0..vocab |c| {
+            let es = math::exp<f64>(cast<f64>(student_logits[off + c]) * inv_t - max_st);
+            let et = math::exp<f64>(cast<f64>(teacher_logits[off + c]) * inv_t - max_tt);
+            pst_s[c] = es;
+            ptt_s[c] = et;
+            sum_st = sum_st + es;
+            sum_tt = sum_tt + et;
+        }
+        let inv_st = 1.0 / sum_st;
+        let inv_tt = 1.0 / sum_tt;
+        let scale = wb * inv_w;
+        for 0..vocab |c| {
+            var ce_g = ps_s[c];
+            if c == target { ce_g = ce_g - 1.0; }
+            let kd_g = (pst_s[c] * inv_st - ptt_s[c] * inv_tt) * t;
+            grad_student[off + c] = cast<f32>(((1.0 - a) * ce_g + a * kd_g) * scale);
+        }
+    }
+    return cast<f32>(ce_total * inv_w);
+}

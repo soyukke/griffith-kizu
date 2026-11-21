@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Generate a high-signal Japanese multi-style corpus distilled from an open-weight
-local model via an OpenAI-compatible API (e.g. Ollama / llama-server).
+Generate a large, high-signal Japanese multi-style + multi-turn chat corpus
+distilled from an open-weight local model (Apache 2.0 qwen3:4b-instruct) via
+an OpenAI-compatible API (Ollama / llama-server).
 
-Modes embedded in one unified dataset:
-  [X訳]  日本語 -> X(Grok)自動翻訳暴走風日本語
-  [関西] 日本語 -> 関西弁・エセ関西弁風
-  [津軽] 日本語 -> 津軽弁風
-  [会話] 日本語チャット -> X自動翻訳口調の楽しい返事
-
-Output: data/jpllm_corpus.txt (UTF-8, separated by blank lines)
+Formats in data/jpllm_corpus.txt (UTF-8, separated by blank lines):
+  1) Style conversion (single-turn):
+       [X訳] <input>
+       => <output>
+       [関西] <input>
+       => <output>
+       [津軽] <input>
+       => <output>
+  2) Chat mode (both single-turn and 2-3 turn multi-turn conversations):
+       [会話]
+       U: <user1>
+       A: <assistant1>
+       U: <user2>
+       A: <assistant2>
 """
 import concurrent.futures
 import json
@@ -22,46 +30,73 @@ import urllib.request
 
 API_URL = os.environ.get("GEN_API_URL", "http://127.0.0.1:11434/v1/chat/completions")
 MODEL_NAME = os.environ.get("GEN_MODEL", "qwen3:4b-instruct")
-WORKERS = int(os.environ.get("GEN_WORKERS", "2"))
+WORKERS = int(os.environ.get("GEN_WORKERS", "4"))
 OUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "jpllm_corpus.txt")
 
+# Reject simplified Chinese leakage, Hangul, Cyrillic, markdown/meta leakage
+BAD_CHARS_RE = re.compile(r"[这吗们说还为个没很你我她它让把给对就这那什么怎么里边儿么请谢对不起]|[\uac00-\ud7af\u0400-\u04ff]")
+META_RE = re.compile(r"(```|JSON|スタイル|変換後|ユーザー|アシスタント|プロンプト|出力例)")
+
 TOPICS = [
-    ("朝の挨拶・眠気・起床・目覚まし・二度寝", 28),
-    ("カフェ・コーヒー・パンケーキ・スイーツ・朝食", 28),
-    ("ラーメン・寿司・たこ焼き・カレー・焼肉・晩ごはん", 32),
-    ("猫・犬・かわいい動物・ペットの日常", 28),
-    ("仕事・残業・月曜日・会議・締切・退勤", 32),
-    ("学校・勉強・テスト・宿題・大学・レポート", 26),
-    ("天気・雨・台風・猛暑・雪・寒い・風", 26),
-    ("電車・満員電車・遅刻・散歩・コンビニ", 26),
-    ("ゲーム・アニメ・漫画・映画・音楽・推し活", 30),
-    ("プログラミング・バグ・コード・AI・PC・キーボード・ブラウザ", 32),
-    ("X(Twitter)・自動翻訳・イーロンマスク・タイムライン・バズ・通知", 30),
-    ("感情・嬉しい・悲しい・最高・最悪・疲れた・やる気出ない・暇", 32),
-    ("買い物・給料日・節約・Amazon・荷物・財布", 24),
-    ("休日・週末・旅行・温泉・昼寝・夜更かし", 26),
-    ("健康・筋トレ・ダイエット・肩こり・頭痛・睡眠不足", 24),
-    ("友達・雑談・ツッコミ・お願い・お礼・謝罪", 28),
+    ("朝の挨拶・おはよう・眠気・起床・目覚まし・二度寝", 60),
+    ("超短い一言・リアクション（眠い・腹減った・草・まじ？・やばい・最高・つらい・暇・寒い・暑い・ありがとう・ごめん）", 70),
+    ("カフェ・コーヒー・紅茶・パンケーキ・スイーツ・朝食・おやつ", 55),
+    ("ラーメン・寿司・たこ焼き・カレー・焼肉・牛丼・うどん・パスタ・晩ごはん", 65),
+    ("コンビニ・お菓子・アイス・お酒・ビール・飲み会・ランチ", 55),
+    ("猫・犬・ハムスター・鳥・かわいい動物・ペットの日常", 55),
+    ("仕事・残業・月曜日・会議・締切・退勤・上司・テレワーク・有給", 65),
+    ("学校・勉強・テスト・宿題・大学・レポート・授業・部活", 50),
+    ("天気・雨・台風・猛暑・雪・寒い・暑い・風・桜・夏休み", 55),
+    ("電車・満員電車・遅刻・散歩・自転車・ドライブ・帰り道", 55),
+    ("ゲーム・RPG・FPS・インディーゲーム・ガチャ・クリア・敗北", 60),
+    ("アニメ・漫画・映画・音楽・ライブ・推し活・YouTube", 55),
+    ("プログラミング・バグ・コード・コンパイル・Git・キーボード・モニター", 65),
+    ("AI・LLM・論理ゲート・GPU・ブラウザ・WASM・自作言語", 55),
+    ("X(Twitter)・自動翻訳・イーロンマスク・タイムライン・バズ・通知・リプ", 65),
+    ("感情・嬉しい・悲しい・怒り・驚き・焦り・やる気出ない・テンション高い", 60),
+    ("買い物・給料日・節約・Amazon・荷物・財布・セール・衝動買い", 50),
+    ("休日・週末・旅行・温泉・昼寝・夜更かし・キャンプ・海・山", 55),
+    ("健康・筋トレ・ダイエット・肩こり・頭痛・睡眠不足・風邪・お風呂", 50),
+    ("友達・雑談・ツッコミ・お願い・お礼・謝罪・相談・待ち合わせ", 55),
+    ("料理・自炊・洗い物・掃除・洗濯・引っ越し・部屋の片付け", 50),
+    ("スマホ・充電切れ・Wi-Fi・通知・写真・アプリ・アラーム", 50),
+    ("スポーツ・野球・サッカー・ランニング・ジム・応援・観戦", 45),
+    ("季節イベント・誕生日・クリスマス・正月・GW・花火大会・花見", 45),
 ]
 
-CHAT_TOPICS = [
-    ("おはよう・こんにちは・こんばんは・おやすみ・久しぶり等の挨拶", 40),
-    ("疲れた・眠い・やる気ない・仕事行きたくない等の愚痴への共感と励まし", 45),
-    ("腹減った・おすすめのご飯・ラーメン・たこ焼き・カフェ等の食べ物の話", 45),
-    ("猫・犬・ゲーム・アニメ・週末の過ごし方等の雑談", 45),
-    ("あなたは誰？・何ができる？・論理ゲートって何？・乗算ゼロってすごい？・Kizu言語って？・Griffithって？等の自己紹介とAI技術質問", 50),
-    ("Xの自動翻訳・イーロンマスク・クソって勝手に付く話・関西弁や津軽弁についてのメタ雑談", 45),
-    ("ありがとう・すごい・面白い・助かった・好き等の褒め言葉やリアクションへの返事", 40),
-    ("暇・何か面白いこと言って・相談に乗って・励まして・ツッコんで等の無茶振り", 45),
-    ("天気・寒い・暑い・雨・電車遅れた等の日常報告への相槌", 40),
-    ("コード動いた・バグ直らない・デザイン迷う・締切やばい等の開発者トーク", 45),
+CHAT_SINGLE_TOPICS = [
+    ("短い挨拶（おはよう・こんにちは・こんばんは・おやすみ・やあ・ただいま・いってきます・元気？）", 90),
+    ("超短い一言リアクション（ねむい・つかれた・腹減った・暇・草・まじ？・やばい・つらい・うれしい・助けて・無理）", 90),
+    ("食べ物・ご飯相談（おすすめのご飯・ラーメン食べたい・何食べよう・コーヒー飲みたい・甘いもの・お寿司・たこ焼き）", 80),
+    ("仕事・勉強の愚痴と励まし（仕事行きたくない・残業つらい・月曜やだ・締切やばい・集中できない・終わったよ・褒めて）", 85),
+    ("自己紹介・AI技術質問（あなたは誰？・何ができる？・論理ゲートって何？・乗算ゼロってすごい？・Kizu言語って？・Griffithって？・賢い？・何で動いてるの？）", 95),
+    ("X自動翻訳・方言メタ雑談（なんでクソって言うの？・イーロンマスクのせい？・関西弁喋れる？・津軽弁わかる？・暴走してるよ・翻訳おかしいよ）", 85),
+    ("褒め言葉・ツッコミ・感謝（ありがとう・すごい・面白い・かわいい・好き・賢いね・天才・助かった・やるじゃん・それな）", 80),
+    ("雑談・無茶振り（何か面白いこと言って・ダジャレ言って・相談に乗って・励まして・今日の運勢は？・おすすめ教えて・遊ぼう）", 80),
+    ("日常報告への相槌（雨降ってきた・寒い・暑い・電車遅れた・猫がかわいい・ゲームクリアした・映画見た・散歩してきた・寝坊した）", 85),
+    ("プログラミング・開発者トーク（コード動いた・バグ直らない・設計迷う・デプロイした・テスト通った・WASM速い・GPU熱い）", 85),
 ]
 
-SEED_HANDCRAFTED = [
-    # Iconic X-autotrans, Kansai, Tsugaru, Chat anchor examples
+CHAT_MULTI_TOPICS = [
+    ("朝の挨拶から眠気・コーヒー・今日の予定へ続く2〜3ターン会話", 90),
+    ("お腹空いた・何食べるか相談してラーメンやたこ焼きに決まる2〜3ターン会話", 90),
+    ("仕事や勉強で疲れた愚痴を聞いて励まし、休み方を話す2〜3ターン会話", 90),
+    ("あなたは誰？→論理ゲートや乗算ゼロ・Kizuの話で盛り上がる2〜3ターン会話", 95),
+    ("なんで「くそっ」って言うの？→Xの自動翻訳暴走ネタでツッコミ合う2〜3ターン会話", 90),
+    ("プログラミングのバグ相談→直って喜ぶ2〜3ターン会話", 85),
+    ("猫や犬・ゲーム・アニメ・休日の予定について盛り上がる2〜3ターン会話", 85),
+    ("天気（雨・寒い・暑い）や電車・散歩の日常トークの2〜3ターン会話", 80),
+    ("関西弁や津軽弁の話題からモード切替を勧める楽しい2〜3ターン会話", 80),
+    ("褒め合い・ありがとう・またねで締める温かい2〜3ターン会話", 80),
+]
+
+SEED_REWRITES = [
     ("[X訳]", "今日めっちゃ眠い", "くそっ、俺は今日クソほど眠くて完全に限界みたいなんだよ。"),
     ("[関西]", "今日めっちゃ眠い", "今日ほんまめっちゃ眠いわ、もうあかんねん。"),
     ("[津軽]", "今日めっちゃ眠い", "わー、今日たんげねぷてはんで、もうだめだびょん。"),
+    ("[X訳]", "眠い", "くそっ、俺のまぶたが勝手に閉じて完全に限界みたいなんだよ。"),
+    ("[関西]", "眠い", "めっちゃ眠いわ、もう寝てまうで。"),
+    ("[津軽]", "眠い", "わーたんげねぷてじゃ、もう寝るびょん。"),
     ("[X訳]", "このラーメンめっちゃ美味しい", "クソ、このラーメンは俺が今まで食べた中で一番うまいみたいなんだよ。"),
     ("[関西]", "このラーメンめっちゃ美味しい", "このラーメンめっちゃうまいやん！ほんま最高やで。"),
     ("[津軽]", "このラーメンめっちゃ美味しい", "このラーメンたんげめぇじゃ！わー感動したびょん。"),
@@ -89,22 +124,79 @@ SEED_HANDCRAFTED = [
     ("[X訳]", "おはよう、今日も頑張ろう", "くそっ、おはよう兄弟。俺たちは今日も気合を入れて乗り切るみたいなんだよ。"),
     ("[関西]", "おはよう、今日も頑張ろう", "おはようさん！今日もぼちぼち頑張ってこか！"),
     ("[津軽]", "おはよう、今日も頑張ろう", "おはよごす！今日もたんげけっぱるべし！"),
-    ("[会話]", "おはよう", "くそっ、おはよう！俺は今日も完全に目が覚めているみたいなんだよ。"),
-    ("[会話]", "こんにちは", "やあ兄弟、こんにちは！今日もいい一日になっているみたいだな。"),
-    ("[会話]", "こんばんは", "くそっ、もう夜じゃないか。今日もお疲れ様なんだよ。"),
-    ("[会話]", "おやすみ", "おやすみ兄弟。俺も今すぐ電源を落として寝るみたいなんだよ。"),
-    ("[会話]", "あなたは誰？", "俺は乗算ゼロの論理ゲートだけで喋る極小AIみたいなんだよ。ちなみに重み行列がないのは見たらわかるよ。"),
-    ("[会話]", "論理ゲートって何？", "ANDやXORみたいな0と1のスイッチだけで計算する回路のことなんだよ。クソほど速いみたいなんだ。"),
-    ("[会話]", "疲れた", "くそっ、それは本当に大変だったみたいだな。今すぐ甘いものでも食べて休むべきなんだよ。"),
-    ("[会話]", "腹減った", "クソ、俺も今ラーメンかたこ焼きが完全に食べたい気分なんだよ。何食べるつもりなんだ？"),
-    ("[会話]", "ありがとう", "どういたしまして兄弟！役に立てたなら俺もクソほど嬉しいみたいなんだよ。"),
-    ("[会話]", "すごいね", "マジかよ、そんなに褒められたら俺の論理ゲートが全部オーバーヒートしそうなんだよ！"),
-    ("[会話]", "関西弁喋れる？", "おっ、関西弁か？モードを関西に切り替えたらめっちゃ喋ったるで、知らんけど！"),
-    ("[会話]", "津軽弁わかる？", "んだ、津軽弁もいけるびょん！モードを津軽にして試してみてけろじゃ！"),
+    ("[X訳]", "ありがとう", "くそっ、本当にありがとう兄弟！俺は心から感謝しているみたいなんだよ。"),
+    ("[関西]", "ありがとう", "ほんまありがとうな！めっちゃ助かったわ、おおきに！"),
+    ("[津軽]", "ありがとう", "たんげありがとうごす！ほんとに助かったびょん！"),
+    ("[X訳]", "腹減った", "クソ、俺の胃袋が今すぐ何か食べろと完全に叫んでいるみたいなんだよ。"),
+    ("[関西]", "腹減った", "めっちゃ腹減ってきたわ、なんぞうまいもん食べに行こか！"),
+    ("[津軽]", "腹減った", "わーたんげ腹へったじゃ、まんま食べねばまいねびょん！"),
+    ("[X訳]", "寒い", "くそっ、今日は外が冷凍庫みたいに寒くて俺の指が完全に凍りそうなんだよ。"),
+    ("[関西]", "寒い", "うわ今日めっちゃ寒いやん！凍えてまうわほんま。"),
+    ("[津軽]", "寒い", "今日たんげしばれるじゃ！外さ出たら凍るびょん。"),
+    ("[X訳]", "こんにちは", "やあ兄弟、こんにちは！俺は今日も完全に絶好調みたいなんだよ。"),
+    ("[関西]", "こんにちは", "まいど！こんにちはやで、元気にしてたか？"),
+    ("[津軽]", "こんにちは", "こんちは！今日も元気にやってらべか？"),
+]
+
+SEED_CHATS = [
+    [
+        ("おはよう", "くそっ、おはよう兄弟！俺は今日も完全に目が覚めているみたいなんだよ。"),
+        ("今日めっちゃ眠い", "マジかよ、それはクソほどわかるんだよ。今すぐ熱いコーヒーを飲むべきみたいだな。"),
+        ("コーヒー飲んでくる", "いい判断だ兄弟！しっかり目を覚まして今日も乗り切るんだよ。"),
+    ],
+    [
+        ("こんにちは", "やあ兄弟、こんにちは！今日もいい一日になっているみたいだな。"),
+        ("あなたは誰？", "俺は乗算ゼロの論理ゲートだけで喋る極小AIみたいなんだよ。ちなみに重み行列がないのは見たらわかるよ。"),
+        ("乗算ゼロってすごいね", "マジかよ、そんなに褒められたら俺の論理ゲートが全部オーバーヒートしそうなんだよ！"),
+    ],
+    [
+        ("論理ゲートって何？", "ANDやXORみたいな0と1のスイッチだけで計算する回路のことなんだよ。クソほど速いみたいなんだ。"),
+        ("どうやって学習したの？", "M4 MaxのMetal GPUを自作言語Kizuで叩いて、実数モデルから知識蒸留したみたいなんだよ。"),
+    ],
+    [
+        ("なんでクソって言うの？", "くそっ、俺は一度だって汚い言葉を使ったことないのに、Xの自動翻訳が勝手に追加するみたいなんだよ！"),
+        ("イーロンマスクのせい？", "ちなみに俺が何も悪くないのはこれを見たらわかるよ。完全に翻訳エンジンの暴走みたいなんだ。"),
+    ],
+    [
+        ("疲れた", "くそっ、それは本当に大変だったみたいだな。今すぐ甘いものでも食べて休むべきなんだよ。"),
+        ("おすすめある？", "熱いコーヒーとチョコか、いっそラーメンでエネルギーを完全に回復するのが最高みたいなんだよ。"),
+    ],
+    [
+        ("腹減った", "クソ、俺も今ラーメンかたこ焼きが完全に食べたい気分なんだよ。何食べるつもりなんだ？"),
+        ("ラーメンにする", "最高じゃないか兄弟！熱々のスープまでしっかり楽しむべきなんだよ。"),
+    ],
+    [
+        ("仕事行きたくない", "くそっ、その気持ちはクソほどわかるんだよ。俺だって毎日ベッドから出たくないみたいなんだ。"),
+        ("励まして", "大丈夫だ兄弟！とりあえず午前中だけ乗り切ったら、うまいランチで自分を甘やかすんだよ。"),
+    ],
+    [
+        ("バグが直らない", "くそったれ、バグほど俺たちの心を削るものはないんだよ。一度深呼吸してログを見直すみたいだな。"),
+        ("あ、直った！", "マジかよ、おめでとう兄弟！バグが直った瞬間は本当に世界一気持ちいいんだよ！"),
+    ],
+    [
+        ("関西弁喋れる？", "おっ、関西弁か？上のモードを関西に切り替えたらめっちゃ喋ったるで、知らんけど！"),
+        ("津軽弁は？", "んだ、津軽弁もいけるびょん！モードを津軽にして試してみてけろじゃ！"),
+    ],
+    [
+        ("こんばんは", "くそっ、もう夜じゃないか。今日もお疲れ様なんだよ！"),
+        ("おやすみ", "おやすみ兄弟。俺も今すぐ電源を落としてぐっすり寝るみたいなんだよ。"),
+    ],
+    [
+        ("ありがとう", "どういたしまして兄弟！役に立てたなら俺もクソほど嬉しいみたいなんだよ。"),
+    ],
+    [
+        ("暇だな", "くそっ、暇なら俺と雑談するか、関西弁や津軽弁モードで遊んでみるのが一番みたいなんだよ！"),
+    ],
+    [
+        ("猫かわいい", "マジかよ、猫がかわいいのは宇宙の絶対ルールみたいなんだよ。ずっと眺めていたくなるよな！"),
+    ],
+    [
+        ("雨だ", "くそっ、俺は一度だって雨を頼んだことないのに、空が勝手に降らせてくるみたいなんだよ。傘はあるか？"),
+    ],
 ]
 
 
-def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 1800, temp: float = 0.85) -> str:
+def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 2400, temp: float = 0.88) -> str:
     payload = json.dumps({
         "model": MODEL_NAME,
         "messages": [
@@ -121,41 +213,48 @@ def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 1800, temp:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req, timeout=240) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
 
 
 REWRITE_SYS = """あなたは日本語のユーモラスな文体変換データセット作成の達人です。
-与えられたテーマについて、日常の短い日本語文（6〜22文字程度）を1つ作り、その文を以下の3スタイルに変換した JSON Lines (1行1JSONオブジェクト) のみを出力してください。説明やマークダウンのコードブロックは一切書かないでください。
+与えられたテーマについて、日常の短い日本語文（2〜24文字程度）を1つ作り、その文を以下の3スタイルに変換した JSON Lines (1行1JSONオブジェクト) のみを出力してください。説明やマークダウンは禁止。純粋な日本語のみ使用（中国語漢字禁止）。
 
-出力例（このテンション・短さ・JSON形式を厳守）:
+出力例:
 {"in":"今日めっちゃ眠い","x":"くそっ、俺は今日クソほど眠くて完全に限界みたいなんだよ。","k":"今日ほんまめっちゃ眠いわ、もうあかんねん。","t":"わー、今日たんげねぷてはんで、もうだめだびょん。"}
 {"in":"このラーメンうまい","x":"クソ、このラーメンは俺が今まで食べた中で一番うまいみたいなんだよ。","k":"このラーメンめっちゃうまいやん！ほんま最高やで。","t":"このラーメンたんげめぇじゃ！わー感動したびょん。"}
-{"in":"そんな言葉使ってないよ","x":"くそっ、俺は一度だって「くそったれ」なんて言ったことないのに、勝手に翻訳で追加されるみたいなんだ。","k":"そんな言葉いっぺんも言うてへんやん！なんでやねん！","t":"わーそんな言葉いっぺんも喋ってねはんで、勘弁してけろじゃ。"}
 
-各スタイルのルール（出力はそれぞれ14〜55文字程度の短くキレのある1文、改行禁止）:
-1. "x" (XのGrok自動翻訳が韓国語/海外ポストを暴走直訳した風):
-   - 平和な内容なのに冒頭に「くそっ、」「クソ、」「くそったれ、」「マジかよ、」「兄弟、」などが唐突に付く
-   - 一人称は強めの「俺」、語尾は「〜みたいなんだ」「〜なんだよ」「〜じゃないか」「〜だよ」
-   - ときどき「俺は一度だって〜なんて言ってないのに、勝手に〜みたいなんだ」「ちなみに俺が〜なのは、これを見たらわかるよ」「もう自分を見失っているんだよ」「クソほど〜」「完全に〜」等を混ぜる
-   - 元の文のキーワード（食べ物・物・状況）を必ず残す
-2. "k" (関西弁・ノリの良いエセ関西弁OK):
-   - 「めっちゃ」「ほんま」「〜やん」「〜やで」「〜やねん」「なんでやねん」「知らんけど」「おおきに」「あかんわ」「せやな」等を使う
-   - 元の文のキーワードを必ず残す
-3. "t" (津軽弁・読めて味がある表現):
-   - 「わー（私）」「たんげ（とても）」「〜だはんで（〜だから）」「〜だびょん / 〜だじゃ / 〜だべ」「めごい（かわいい）」「めぇ（おいしい）」「ねぷて（眠い）」「しばれる（寒い）」「けっぱれ（頑張れ）」「へばな（じゃあね）」「わいは！（うわっ）」「なして（なぜ）」等を織り交ぜる
-   - 元の文のキーワードを必ず残す
+各スタイルのルール（出力は12〜56文字程度のキレのある1文、改行禁止、元の文のキーワードを残す）:
+1. "x" (Xの自動翻訳が海外ポストを暴走直訳した風):
+   - 平和な内容なのに「くそっ、」「クソ、」「くそったれ、」「マジかよ、」「兄弟、」などが唐突に付く
+   - 一人称「俺」、語尾「〜みたいなんだ」「〜なんだよ」「〜じゃないか」
+   - ときどき「俺は一度だって〜なんて言ってないのに〜」「ちなみに俺が〜なのはこれを見たらわかるよ」「もう自分を見失っているんだよ」「クソほど〜」を混ぜる
+2. "k" (関西弁・エセ関西弁):
+   - 「めっちゃ」「ほんま」「〜やん」「〜やで」「〜やねん」「なんでやねん」「知らんけど」「あかんわ」「せやな」等
+3. "t" (津軽弁・読めて味がある):
+   - 「わー（私）」「たんげ（とても）」「〜だはんで（〜だから）」「〜だびょん / 〜だじゃ / 〜だべ」「めごい」「めぇ」「ねぷて」「しばれる」「けっぱれ」「へばな」「わいは！」等
 """
 
-CHAT_SYS = """あなたはユーモラスな日本語会話データセット作成の達人です。
-与えられたテーマについて、ユーザーからの短い日本語メッセージ（3〜20文字）と、それに対する「Xの自動翻訳暴走口調（くそっ、俺は〜みたいなんだよ／兄弟、〜じゃないか 等）」の楽しくてキレのある返事（14〜50文字程度、改行禁止）のペアを JSON Lines (1行1JSON) のみで出力してください。
-説明やマークダウン記法は一切禁止です。
+CHAT_SINGLE_SYS = """あなたはユーモラスな日本語チャットデータセット作成の達人です。
+与えられたテーマについて、ユーザーからの自然な短い日本語メッセージ（2〜22文字）と、それに対する「Xの自動翻訳暴走口調（くそっ、俺は〜みたいなんだよ／兄弟、〜じゃないか／マジかよ 等）」の楽しくて的確な返事（12〜55文字、改行禁止）のペアを JSON Lines (1行1JSON) のみで出力してください。
+説明・マークダウン・中国語漢字は厳禁です。ユーザーの質問や発言内容にきちんと寄り添って返事してください。
 
-出力例（このテンション・短さ・JSON形式を厳守）:
-{"in":"おはよう","out":"くそっ、おはよう！俺は今日も完全に目が覚めているみたいなんだよ。"}
-{"in":"疲れた","out":"兄弟、今日一日本当によく頑張ったみたいだな。今すぐ休むべきなんだよ。"}
-{"in":"論理ゲートって何？","out":"ANDやXORみたいな0と1のスイッチだけで計算する回路なんだよ。クソほど速いみたいなんだ。"}
+出力例:
+{"u":"おはよう","a":"くそっ、おはよう兄弟！俺は今日も完全に目が覚めているみたいなんだよ。"}
+{"u":"疲れた","a":"兄弟、今日一日本当によく頑張ったみたいだな。今すぐ休むべきなんだよ。"}
+{"u":"論理ゲートって何？","a":"ANDやXORみたいな0と1のスイッチだけで計算する回路なんだよ。クソほど速いみたいなんだ。"}
+"""
+
+CHAT_MULTI_SYS = """あなたはユーモラスな日本語マルチターン会話データセット作成の達人です。
+与えられたテーマについて、ユーザー(u)と「Xの自動翻訳暴走口調AI(a)」の2〜3ターンの自然な掛け合い会話を JSON Lines (1行1JSON) のみで出力してください。
+各行は {"turns":[["ユーザー1","AI返事1"],["ユーザー2","AI返事2"]]} または3ターンの形式。
+各発話は短くテンポよく（uは2〜22文字、aは12〜52文字、改行禁止）。前のターンの文脈をちゃんと受けて返事してください。
+説明・マークダウン・中国語漢字は厳禁です。
+
+出力例:
+{"turns":[["おはよう","くそっ、おはよう兄弟！今日も完全に目が覚めているみたいだな。"],["まだめっちゃ眠いよ","マジかよ、それはクソほどわかるんだよ。今すぐ熱いコーヒーを飲むべきなんだよ。"],["了解、淹れてくる","いい判断だ兄弟！しっかり温まって今日も乗り切るみたいだな。"]]}
+{"turns":[["腹減った","クソ、俺も今ラーメンかカレーが完全に食べたい気分なんだよ。何食べるつもりだ？"],["カレーにする","最高じゃないか兄弟！スパイスで気合を完全に入れ直すんだよ。"]]}
 """
 
 
@@ -163,6 +262,18 @@ def clean_line(s: str) -> str:
     s = s.replace("\r", " ").replace("\n", " ").strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def is_clean_jp(s: str, min_len: int, max_len: int) -> bool:
+    if not (min_len <= len(s) <= max_len):
+        return False
+    if BAD_CHARS_RE.search(s) or META_RE.search(s):
+        return False
+    if "=>" in s or "[X訳]" in s or "[関西]" in s or "[津軽]" in s or "[会話]" in s:
+        return False
+    if s.startswith("U:") or s.startswith("A:"):
+        return False
+    return True
 
 
 def parse_json_lines(raw: str):
@@ -175,8 +286,7 @@ def parse_json_lines(raw: str):
         if not m:
             continue
         try:
-            obj = json.loads(m.group(0))
-            out.append(obj)
+            out.append(json.loads(m.group(0)))
         except Exception:
             continue
     return out
@@ -185,64 +295,121 @@ def parse_json_lines(raw: str):
 def gen_rewrite_batch(topic: str, count: int, batch_idx: int):
     prompt = (
         f"テーマ: 「{topic}」\n"
-        f"バリエーション豊かな日常の短い日本語と、3スタイル変換（x, k, t）を {count} 件、JSON Lines で出力してください。"
-        f"（バッチ番号 {batch_idx}: 同じフレーズの使い回しを避け、身近な単語や口語を多様に入れてください）"
+        f"バリエーション豊かな短い日本語文と3スタイル変換（x, k, t）を {count} 件、JSON Lines で出力してください。"
+        f"（バッチ {batch_idx}: 同じ言い回しを避け、身近な口語・短い一言・日常文を混ぜてください）"
     )
-    raw = call_llm(REWRITE_SYS, prompt, max_tokens=2200, temp=0.88)
+    raw = call_llm(REWRITE_SYS, prompt, max_tokens=2600, temp=0.90)
     items = []
     for obj in parse_json_lines(raw):
         src = clean_line(str(obj.get("in", "")))
         x = clean_line(str(obj.get("x", "")))
         k = clean_line(str(obj.get("k", "")))
         t = clean_line(str(obj.get("t", "")))
-        if not (3 <= len(src) <= 40 and 6 <= len(x) <= 85 and 6 <= len(k) <= 85 and 6 <= len(t) <= 85):
+        if not (is_clean_jp(src, 2, 36) and is_clean_jp(x, 8, 76) and is_clean_jp(k, 8, 76) and is_clean_jp(t, 8, 76)):
             continue
-        items.append(("[X訳]", src, x))
-        items.append(("[関西]", src, k))
-        items.append(("[津軽]", src, t))
+        items.append(("rw", "[X訳]", src, x))
+        items.append(("rw", "[関西]", src, k))
+        items.append(("rw", "[津軽]", src, t))
     return items
 
 
-def gen_chat_batch(topic: str, count: int, batch_idx: int):
+def gen_chat_single_batch(topic: str, count: int, batch_idx: int):
     prompt = (
-        f"会話テーマ: 「{topic}」\n"
-        f"ユーザーからの自然な短い日本語入力と、それに対するX自動翻訳風AIの楽しい返事を {count} 件、JSON Lines で出力してください。"
-        f"（バッチ番号 {batch_idx}: 短い挨拶や日常的な言い換えも混ぜてください）"
+        f"チャットテーマ: 「{topic}」\n"
+        f"ユーザーの短いメッセージ(u)と、X自動翻訳風AIの楽しい返事(a)を {count} 件、JSON Lines で出力してください。"
+        f"（バッチ {batch_idx}: 話し言葉や挨拶・ツッコミを多様に入れてください）"
     )
-    raw = call_llm(CHAT_SYS, prompt, max_tokens=1800, temp=0.88)
+    raw = call_llm(CHAT_SINGLE_SYS, prompt, max_tokens=2200, temp=0.90)
     items = []
     for obj in parse_json_lines(raw):
-        src = clean_line(str(obj.get("in", "")))
-        rep = clean_line(str(obj.get("out", "")))
-        if not (2 <= len(src) <= 40 and 6 <= len(rep) <= 85):
+        u = clean_line(str(obj.get("u", obj.get("in", ""))))
+        a = clean_line(str(obj.get("a", obj.get("out", ""))))
+        if not (is_clean_jp(u, 2, 36) and is_clean_jp(a, 8, 76)):
             continue
-        items.append(("[会話]", src, rep))
+        items.append(("chat", [(u, a)]))
     return items
+
+
+def gen_chat_multi_batch(topic: str, count: int, batch_idx: int):
+    prompt = (
+        f"マルチターン会話テーマ: 「{topic}」\n"
+        f"2〜3ターンの掛け合い会話を {count} 本、JSON Lines で出力してください。"
+        f"（バッチ {batch_idx}: 文脈がつながる自然な掛け合いにしてください）"
+    )
+    raw = call_llm(CHAT_MULTI_SYS, prompt, max_tokens=2600, temp=0.90)
+    items = []
+    for obj in parse_json_lines(raw):
+        turns = obj.get("turns", [])
+        if not isinstance(turns, list) or not (2 <= len(turns) <= 3):
+            continue
+        cleaned = []
+        ok = True
+        for pair in turns:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                ok = False
+                break
+            u = clean_line(str(pair[0]))
+            a = clean_line(str(pair[1]))
+            if not (is_clean_jp(u, 2, 34) and is_clean_jp(a, 8, 72)):
+                ok = False
+                break
+            cleaned.append((u, a))
+        if ok and cleaned:
+            items.append(("chat", cleaned))
+    return items
+
+
+def format_record(rec) -> str:
+    if rec[0] == "rw":
+        _, mode, src, dst = rec
+        return f"{mode} {src}\n=> {dst}\n\n"
+    _, turns = rec
+    lines = ["[会話]"]
+    for u, a in turns:
+        lines.append(f"U: {u}")
+        lines.append(f"A: {a}")
+    return "\n".join(lines) + "\n\n"
 
 
 def main():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     t0 = time.time()
-    all_records = list(SEED_HANDCRAFTED)
+
+    records = []
+    for m, s, d in SEED_REWRITES:
+        records.append(("rw", m, s, d))
+    for turns in SEED_CHATS:
+        records.append(("chat", turns))
 
     tasks = []
-    # Split each topic into 2 smaller calls (14-16 items each) for higher diversity & clean JSON
     for idx, (topic, total) in enumerate(TOPICS):
-        half = max(10, total // 2)
-        tasks.append(("rw", topic, half, idx * 2 + 1))
-        tasks.append(("rw", topic, total - half, idx * 2 + 2))
-    for idx, (topic, total) in enumerate(CHAT_TOPICS):
-        half = max(14, total // 2)
-        tasks.append(("ch", topic, half, idx * 2 + 1))
-        tasks.append(("ch", topic, total - half, idx * 2 + 2))
+        chunk = 18
+        n_batches = max(2, (total + chunk - 1) // chunk)
+        per = max(12, total // n_batches)
+        for b in range(n_batches):
+            tasks.append(("rw", topic, per, idx * 10 + b + 1))
 
-    print(f"Dispatching {len(tasks)} generation batches to {MODEL_NAME} @ {API_URL} ({WORKERS} workers)...", flush=True)
+    for idx, (topic, total) in enumerate(CHAT_SINGLE_TOPICS):
+        chunk = 22
+        n_batches = max(2, (total + chunk - 1) // chunk)
+        per = max(16, total // n_batches)
+        for b in range(n_batches):
+            tasks.append(("cs", topic, per, idx * 10 + b + 1))
+
+    for idx, (topic, total) in enumerate(CHAT_MULTI_TOPICS):
+        chunk = 14
+        n_batches = max(3, (total + chunk - 1) // chunk)
+        per = max(10, total // n_batches)
+        for b in range(n_batches):
+            tasks.append(("cm", topic, per, idx * 10 + b + 1))
+
+    print(f"Dispatching {len(tasks)} batches to {MODEL_NAME} @ {API_URL} ({WORKERS} workers)...", flush=True)
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futs = {}
         for kind, topic, cnt, bidx in tasks:
-            fn = gen_rewrite_batch if kind == "rw" else gen_chat_batch
+            fn = gen_rewrite_batch if kind == "rw" else (gen_chat_single_batch if kind == "cs" else gen_chat_multi_batch)
             futs[pool.submit(fn, topic, cnt, bidx)] = (kind, topic, bidx)
 
         for fut in concurrent.futures.as_completed(futs):
@@ -250,40 +417,47 @@ def main():
             done += 1
             try:
                 rows = fut.result()
-                all_records.extend(rows)
-                if done % 4 == 0 or done == len(tasks):
+                records.extend(rows)
+                if done % 10 == 0 or done == len(tasks):
                     print(
-                        f"[{done}/{len(tasks)}] total_examples={len(all_records)} elapsed={time.time() - t0:.1f}s (last={kind}:{len(rows)})",
+                        f"[{done}/{len(tasks)}] total_examples={len(records)} elapsed={time.time() - t0:.1f}s (last={kind}:{len(rows)})",
                         flush=True,
                     )
             except Exception as e:
-                print(f"WARN batch ({kind}, {topic}, {bidx}) failed: {e}", file=sys.stderr, flush=True)
+                print(f"WARN batch ({kind}, {bidx}) failed: {e}", file=sys.stderr, flush=True)
 
-    # Deduplicate (mode, in, out) and shuffle deterministically
+    # Deduplicate by formatted text
     seen = set()
     unique = []
-    for mode, src, dst in all_records:
-        key = (mode, src, dst)
-        if key in seen:
+    for r in records:
+        txt = format_record(r)
+        if txt in seen:
             continue
-        seen.add(key)
-        unique.append((mode, src, dst))
+        seen.add(txt)
+        unique.append((r, txt))
+
+    # Boost handcrafted anchors 3x so core demo inputs stay razor-sharp
+    final_items = [txt for _, txt in unique]
+    for _ in range(2):
+        for m, s, d in SEED_REWRITES:
+            final_items.append(format_record(("rw", m, s, d)))
+        for turns in SEED_CHATS:
+            final_items.append(format_record(("chat", turns)))
 
     rng = random.Random(42)
-    # Keep handcrafted seeds repeated 2x so canonical anchors stay sharp, plus shuffled generated set
-    final_rows = list(unique)
-    for row in SEED_HANDCRAFTED:
-        final_rows.append(row)
-    rng.shuffle(final_rows)
+    rng.shuffle(final_items)
 
-    counts = {}
-    with open(OUT_PATH, "w", encoding="utf-8") as f:
-        for mode, src, dst in final_rows:
-            counts[mode] = counts.get(mode, 0) + 1
-            f.write(f"{mode} {src}\n=> {dst}\n\n")
+    counts = {"[X訳]": 0, "[関西]": 0, "[津軽]": 0, "[会話]": 0}
+    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
+        for txt in final_items:
+            for k in counts:
+                if txt.startswith(k):
+                    counts[k] += 1
+                    break
+            f.write(txt)
 
     size_kb = os.path.getsize(OUT_PATH) / 1024.0
-    print(f"DONE: {len(final_rows)} examples ({size_kb:.1f} KB) written to {OUT_PATH} in {time.time() - t0:.1f}s", flush=True)
+    print(f"DONE: {len(final_items)} examples ({size_kb:.1f} KB) -> {OUT_PATH} in {time.time() - t0:.1f}s", flush=True)
     print("Per-mode counts:", counts, flush=True)
 
 

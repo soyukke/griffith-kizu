@@ -462,6 +462,7 @@ pub struct LadderRuntime {
     pub logits: array::Array<f32>,
     pub last_probs: array::Array<f32>,
     pub attn_maps: array::Array<f32>,
+    pub last_tokens: array::Array<i32>,
     pub last_seq_len: i64,
     pub rng: core::Rng,
 }
@@ -489,6 +490,7 @@ pub fn (self: LadderRuntime) deinit(allocator: Allocator) -> void {
     self.logits.deinit(allocator);
     self.last_probs.deinit(allocator);
     self.attn_maps.deinit(allocator);
+    self.last_tokens.deinit(allocator);
     return;
 }
 
@@ -798,6 +800,8 @@ pub fn ladder_runtime_from_bytes(allocator: Allocator, bytes: []u8) -> mem::Erro
     errdefer last_probs.deinit(allocator);
     var attn_maps = try core::alloc_f32(allocator, n_layers * n_heads * seq_len * seq_len);
     errdefer attn_maps.deinit(allocator);
+    var last_tokens = try core::alloc_i32(allocator, seq_len);
+    errdefer last_tokens.deinit(allocator);
 
     return LadderRuntime {
         rung: rung,
@@ -837,6 +841,7 @@ pub fn ladder_runtime_from_bytes(allocator: Allocator, bytes: []u8) -> mem::Erro
         logits: move logits,
         last_probs: move last_probs,
         attn_maps: move attn_maps,
+        last_tokens: move last_tokens,
         last_seq_len: 0,
         rng: core::rng_new(42),
     };
@@ -906,6 +911,7 @@ fn rt_discrete_lut(layer: &lut::DiscreteLutLayer, x: []f32, rows: i64, out: &var
 fn rt_run_block(
     blk: &RuntimeBlock,
     rung: LadderRung,
+    is_bpe: bool,
     d: i64,
     n_heads: i64,
     seq_len: i64,
@@ -1009,8 +1015,15 @@ fn rt_run_block(
                     attn_maps[row_off + s] = if s == best_s { cast<f32>(1.0) } else { cast<f32>(0.0) };
                 }
                 let vw_off = best_s * d + h_off;
-                for 0..dk |j| {
-                    ctx_s[qt_off + j] = 2.0 * v_s[vw_off + j] - 1.0;
+                if is_bpe {
+                    // Hardware MUX Value Skip: pure 0-mul MUX selects ln1[best_s] + Logic LUT binary residual!
+                    for 0..dk |j| {
+                        ctx_s[qt_off + j] = 0.5 * ln_buf[vw_off + j] + 0.5 * (2.0 * v_s[vw_off + j] - 1.0);
+                    }
+                } else {
+                    for 0..dk |j| {
+                        ctx_s[qt_off + j] = 2.0 * v_s[vw_off + j] - 1.0;
+                    }
                 }
             } else {
                 var max_s = sc_buf[0];
@@ -1033,9 +1046,17 @@ fn rt_run_block(
                 for 0..dk |j| {
                     var acc: f32 = 0.0;
                     if use_lqkv {
-                        for 0..(t + 1) |s| {
-                            let vs_off = s * d + h_off;
-                            acc = acc + attn_maps[row_off + s] * (2.0 * v_s[vs_off + j] - 1.0);
+                        if is_bpe {
+                            for 0..(t + 1) |s| {
+                                let vs_off = s * d + h_off;
+                                let vval = 0.5 * ln_buf[vs_off + j] + 0.5 * (2.0 * v_s[vs_off + j] - 1.0);
+                                acc = acc + attn_maps[row_off + s] * vval;
+                            }
+                        } else {
+                            for 0..(t + 1) |s| {
+                                let vs_off = s * d + h_off;
+                                acc = acc + attn_maps[row_off + s] * (2.0 * v_s[vs_off + j] - 1.0);
+                            }
                         }
                     } else {
                         for 0..(t + 1) |s| {
@@ -1105,6 +1126,10 @@ pub fn ladder_runtime_forward(rt: &var LadderRuntime, tokens: []i32, seq_len: i6
     let d = rt.d_model;
     let use_len = if seq_len > rt.seq_len { rt.seq_len } else { seq_len };
     rt.last_seq_len = use_len;
+    let lt_s = rt.last_tokens.as_mut_slice();
+    for 0..use_len |t| {
+        lt_s[t] = tokens[t];
+    }
 
     let tok_w = rt.tok_emb.as_slice();
     let pos_w = rt.pos_emb.as_slice();
@@ -1132,7 +1157,7 @@ pub fn ladder_runtime_forward(rt: &var LadderRuntime, tokens: []i32, seq_len: i6
     for 0..rt.n_layers |l| {
         if rt.blocks.at(l) |blk| {
             rt_run_block(
-                blk, rt.rung, d, rt.n_heads, use_len, rt.seq_len, rt.ffn_hidden, rt.ffn_group_factor,
+                blk, rt.rung, rt.is_bpe, d, rt.n_heads, use_len, rt.seq_len, rt.ffn_hidden, rt.ffn_group_factor,
                 l, x_s, ln_s, q_s, k_s, v_s, ctx_s, tmp_s, h1_s, h2_s, am_s
             );
         }
@@ -1188,17 +1213,104 @@ pub fn ladder_runtime_forward_batch(
     return;
 }
 
+/// Tracks UTF-8 continuation bytes still required after feeding `bytes`, returning -1 if invalid UTF-8 sequence.
+fn utf8_advance_state(need_cont: i64, bytes: []u8) -> i64 {
+    var need = need_cont;
+    let n = mem::len(bytes);
+    for 0..n |i| {
+        let b = cast<i64>(bytes[i]);
+        if need > 0 {
+            if (b & 0xc0) != 0x80 { return -1; }
+            need = need - 1;
+        } else {
+            if b < 0x80 {
+                need = 0;
+            } else if (b & 0xe0) == 0xc0 {
+                if b < 0xc2 { return -1; }
+                need = 1;
+            } else if (b & 0xf0) == 0xe0 {
+                need = 2;
+            } else if (b & 0xf8) == 0xf0 {
+                if b > 0xf4 { return -1; }
+                need = 3;
+            } else {
+                return -1;
+            }
+        }
+    }
+    return need;
+}
+
+/// Computes pending UTF-8 continuation byte count at the end of recent context tokens.
+fn rt_utf8_pending(rt: &LadderRuntime) -> i64 {
+    if !rt.is_bpe or rt.last_seq_len <= 0 { return 0; }
+    let start = if rt.last_seq_len > 6 { rt.last_seq_len - 6 } else { 0 };
+    let lt_s = rt.last_tokens.as_slice();
+    var need: i64 = 0;
+    for start..rt.last_seq_len |pos| {
+        let piece = data::bpe_token_bytes(&rt.bpe, lt_s[pos]);
+        let nxt = utf8_advance_state(need, piece);
+        need = if nxt < 0 { 0 } else { nxt };
+    }
+    return need;
+}
+
 pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
     let v_size = rt.vocab_size;
     let off = (rt.last_seq_len - 1) * v_size;
     let lg_s = rt.logits.as_slice();
+    let utf8_need = rt_utf8_pending(rt);
+
+    // Build UTF-8 valid mask + raw-byte suppression + repetition penalty (applied to BOTH greedy and sampled decoding!)
+    var adj = [2048]f64{};
+    var valid = [2048]i32{};
+    let adj_s = adj.as_mut_slice();
+    let val_s = valid.as_mut_slice();
+    var n_valid: i64 = 0;
+    for 0..v_size |c| {
+        var ok = true;
+        var score = cast<f64>(lg_s[off + c]);
+        if rt.is_bpe {
+            let pc = data::bpe_token_bytes(&rt.bpe, cast<i32>(c));
+            if utf8_advance_state(utf8_need, pc) < 0 {
+                ok = false;
+            } else if utf8_need == 0 and c >= 192 and c < 256 {
+                // Mildly discourage starting a new char from an unmerged raw high byte (prevents stray rare CJK kanji)
+                score = score - 1.8;
+            }
+        }
+        val_s[c] = if ok { cast<i32>(1) } else { cast<i32>(0) };
+        if ok { n_valid = n_valid + 1; }
+        adj_s[c] = score;
+    }
+    if n_valid == 0 {
+        for 0..v_size |c| { val_s[c] = 1; }
+    }
+    if rt.is_bpe and rt.last_seq_len > 2 {
+        let win_start = if rt.last_seq_len > 16 { rt.last_seq_len - 16 } else { 0 };
+        let lt_s = rt.last_tokens.as_slice();
+        var seen = [2048]i32{};
+        let seen_s = seen.as_mut_slice();
+        for win_start..rt.last_seq_len |pos| {
+            let tid = cast<i64>(lt_s[pos]);
+            if tid >= 128 and tid < v_size and seen_s[tid] == 0 {
+                seen_s[tid] = 1;
+                if adj_s[tid] > 0.0 {
+                    adj_s[tid] = adj_s[tid] / 1.24;
+                } else {
+                    adj_s[tid] = adj_s[tid] * 1.24;
+                }
+            }
+        }
+    }
 
     if temp <= 0.01 {
         var best_c: i64 = 0;
-        var best_v = lg_s[off];
-        for 1..v_size |c| {
-            if lg_s[off + c] > best_v {
-                best_v = lg_s[off + c];
+        var best_v: f64 = -1e30;
+        for 0..v_size |c| {
+            if val_s[c] == 0 { continue; }
+            if adj_s[c] > best_v {
+                best_v = adj_s[c];
                 best_c = c;
             }
         }
@@ -1206,26 +1318,63 @@ pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
     }
 
     let inv_t = 1.0 / cast<f64>(temp);
-    var max_v = cast<f64>(lg_s[off]) * inv_t;
-    for 1..v_size |c| {
-        let v = cast<f64>(lg_s[off + c]) * inv_t;
+    var max_v: f64 = -1e30;
+    for 0..v_size |c| {
+        if val_s[c] == 0 { continue; }
+        let v = adj_s[c] * inv_t;
         if v > max_v { max_v = v; }
     }
     var weights = [2048]f64{};
     let ws = weights.as_mut_slice();
     var sum_e: f64 = 0.0;
     for 0..v_size |c| {
-        let e = math::exp<f64>(cast<f64>(lg_s[off + c]) * inv_t - max_v);
-        ws[c] = e;
-        sum_e = sum_e + e;
+        if val_s[c] == 0 {
+            ws[c] = 0.0;
+        } else {
+            let e = math::exp<f64>(adj_s[c] * inv_t - max_v);
+            ws[c] = e;
+            sum_e = sum_e + e;
+        }
     }
-    let r = rt.rng.next_f64() * sum_e;
+
+    // Nucleus (Top-p = 0.85) + Top-k (max 28) truncation eliminates noisy tail tokens cleanly
+    let inv_sum = 1.0 / sum_e;
+    var cand_id = [32]i64{};
+    var cand_p = [32]f64{};
+    let cid_s = cand_id.as_mut_slice();
+    let cp_s = cand_p.as_mut_slice();
+    var used = [2048]i32{};
+    let us = used.as_mut_slice();
+    let max_k = if v_size < 28 { v_size } else { 28 };
+    var n_cand: i64 = 0;
+    var cum_p: f64 = 0.0;
+    for 0..max_k |_| {
+        var best_c: i64 = 0;
+        var best_w: f64 = -1.0;
+        for 0..v_size |c| {
+            if us[c] == 0 and ws[c] > best_w {
+                best_w = ws[c];
+                best_c = c;
+            }
+        }
+        us[best_c] = 1;
+        let p = best_w * inv_sum;
+        cid_s[n_cand] = best_c;
+        cp_s[n_cand] = p;
+        n_cand = n_cand + 1;
+        cum_p = cum_p + p;
+        if cum_p >= 0.85 and n_cand >= 1 {
+            break;
+        }
+    }
+
+    let r = rt.rng.next_f64() * cum_p;
     var acc: f64 = 0.0;
-    var picked = v_size - 1;
-    for 0..v_size |c| {
-        acc = acc + ws[c];
+    var picked = cid_s[n_cand - 1];
+    for 0..n_cand |i| {
+        acc = acc + cp_s[i];
         if acc >= r {
-            picked = c;
+            picked = cid_s[i];
             break;
         }
     }

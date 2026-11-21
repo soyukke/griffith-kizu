@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light">
-  <title>jpllm/ — 日本語 4 モード論理ゲート LLM（X自動翻訳風・関西弁・津軽弁・会話）| griffith/</title>
-  <meta name="description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語 4 モード極小 LLM。">
+  <title>jpllm/ — 日本語チャット＆4モード論理ゲート LLM | griffith/</title>
+  <meta name="description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語チャット＆4モード極小 LLM。">
   <link rel="canonical" href="https://lab.soyukke.com/griffith/jpllm/">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="jpllm/ — 日本語 4 モード論理ゲート LLM | griffith/">
-  <meta property="og:description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語 4 モード極小 LLM。">
+  <meta property="og:title" content="jpllm/ — 日本語チャット＆4モード論理ゲート LLM | griffith/">
+  <meta property="og:description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語チャット＆4モード極小 LLM。">
   <meta property="og:url" content="https://lab.soyukke.com/griffith/jpllm/">
   <meta name="twitter:card" content="summary">
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
@@ -52,7 +52,7 @@
       color: var(--ink);
       font-family: var(--jp);
       font-size: 13px;
-      line-height: 1.4;
+      line-height: 1.45;
       -webkit-tap-highlight-color: transparent;
     }
 
@@ -98,8 +98,8 @@
 
     .bar__right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
     .btn {
-      min-height: 32px;
-      padding: 0 12px;
+      min-height: 31px;
+      padding: 0 11px;
       border: 1px solid var(--rule);
       border-radius: 999px;
       background: transparent;
@@ -108,410 +108,560 @@
       justify-content: center;
       gap: 5px;
       white-space: nowrap;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 700;
     }
     .btn:hover:not(:disabled) { border-color: var(--ink); background: var(--tri); }
     .btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
-    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; min-width: 84px; }
+    .btn--go { background: var(--accent); border-color: var(--accent); color: #fff; }
     .btn--go:hover:not(:disabled) { background: #e54400; border-color: #e54400; color: #fff; }
 
-    /* 中央 3 カラム（ページスクロールなし） */
+    /* 3 カラム: 左設定 / 中央チャット本体 / 右リアルタイム回路インスペクタ */
     .desk {
       display: grid;
-      grid-template-columns: clamp(256px, 25vw, 308px) minmax(0, 1fr) clamp(236px, 21vw, 276px);
-      gap: 14px;
-      padding: 11px 16px;
+      grid-template-columns: minmax(220px, 248px) minmax(0, 1fr) minmax(290px, 344px);
+      gap: 12px;
+      padding: 10px 14px;
       min-height: 0;
-      min-width: 0;
       overflow: hidden;
     }
+    .desk.hide-inspector {
+      grid-template-columns: minmax(220px, 248px) minmax(0, 1fr);
+    }
+    .desk.hide-inspector .inspector-col { display: none; }
 
-    .block-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
-    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; color: var(--ink); white-space: nowrap; }
-    .kicker-mono { font-family: var(--mono), var(--jp); font-size: 10px; color: var(--muted); white-space: nowrap; }
-    .kicker-mono b { color: var(--accent); }
-
-    /* 左カラム：モード切替・モデル段・入力 */
-    .left-col {
+    .col {
       display: flex;
       flex-direction: column;
-      justify-content: space-between;
-      gap: 9px;
+      gap: 10px;
       min-height: 0;
-      min-width: 0;
       overflow: hidden;
     }
-    .lblock {
-      border-top: 1px solid var(--rule);
-      padding-top: 8px;
-      display: grid;
-      gap: 6px;
-    }
-    .lblock:first-child { border-top: 0; padding-top: 0; }
 
-    .mode-grid {
+    .sec { display: flex; flex-direction: column; gap: 6px; }
+    .sec__h {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .sec__title { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
+    .sec__sub { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+    /* モード切替 */
+    .mode-list {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 4px;
+      grid-template-columns: 1fr;
+      gap: 5px;
     }
     .mode-btn {
-      padding: 7px 6px;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      padding: 7px 9px;
       border: 1px solid var(--rule);
+      border-radius: 7px;
       background: var(--sheet);
       text-align: left;
-      display: grid;
-      gap: 1px;
+      transition: border-color 120ms, background 120ms;
     }
-    .mode-btn strong { font-size: 11.5px; font-weight: 800; }
-    .mode-btn span { font-family: var(--mono), var(--jp); font-size: 9.5px; color: var(--muted); }
-    .mode-btn:hover { border-color: var(--ink); background: var(--tri); }
+    .mode-btn:hover { border-color: var(--ink); }
     .mode-btn[aria-pressed="true"] {
       background: var(--ink);
-      border-color: var(--ink);
       color: var(--paper);
+      border-color: var(--ink);
     }
-    .mode-btn[aria-pressed="true"] span { color: #ff8e61; }
+    .mode-btn__tag {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 800;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--tri);
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .mode-btn[aria-pressed="true"] .mode-btn__tag {
+      background: var(--accent);
+      color: #fff;
+    }
+    .mode-btn__body { min-width: 0; }
+    .mode-btn__name { font-size: 12px; font-weight: 700; display: block; line-height: 1.2; }
+    .mode-btn__hint { font-size: 10px; color: var(--muted); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mode-btn[aria-pressed="true"] .mode-btn__hint { color: #d7d4c8; }
 
+    /* モデル段切替 */
     .rung-row {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      border: 1px solid var(--rule);
-      background: var(--sheet);
+      gap: 4px;
     }
     .rung-btn {
       padding: 6px 4px;
-      border-right: 1px solid var(--rule);
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--sheet);
+      text-align: center;
       display: grid;
-      place-items: center;
       gap: 1px;
     }
-    .rung-btn:last-child { border-right: 0; }
-    .rung-btn strong { font-family: var(--mono); font-size: 11px; font-weight: 800; }
-    .rung-btn span { font-size: 9px; color: var(--muted); }
-    .rung-btn:hover { background: var(--tri); }
-    .rung-btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
-    .rung-btn[aria-pressed="true"] span { color: var(--paper); opacity: 0.8; }
-    .rung-btn--mux[aria-pressed="true"] { background: var(--accent); color: #fff; }
+    .rung-btn:hover:not(:disabled) { border-color: var(--ink); }
+    .rung-btn b { font-family: var(--mono); font-size: 11px; }
+    .rung-btn span { font-size: 9px; color: var(--muted); line-height: 1.15; }
+    .rung-btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .rung-btn[aria-pressed="true"] span { color: #d7d4c8; }
+    .rung-btn--mux[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
     .rung-btn--mux[aria-pressed="true"] span { color: #fff; opacity: 0.92; }
 
-    .jp-input {
-      width: 100%;
-      padding: 8px 10px;
-      border: 1.5px solid var(--ink);
-      background: var(--sheet);
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
-    .chip {
-      padding: 3px 7px;
-      border: 1px solid var(--rule);
-      border-radius: 999px;
-      background: var(--sheet);
-      font-size: 10px;
-      color: var(--muted);
-    }
-    .chip:hover { border-color: var(--ink); color: var(--ink); background: var(--tri); }
-
-    .slider-row {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto;
+    /* スライダー */
+    .ctrl-row {
+      display: flex;
       align-items: center;
       gap: 8px;
-      font-size: 10.5px;
+      font-size: 11px;
       color: var(--muted);
     }
-    .slider-row input[type="range"] { accent-color: var(--accent); width: 100%; }
-    .slider-val { font-family: var(--mono); color: var(--ink); font-weight: 700; min-width: 30px; text-align: right; }
+    .ctrl-row input[type="range"] { flex: 1; accent-color: var(--accent); cursor: pointer; }
+    .ctrl-row .val { font-family: var(--mono); font-size: 11px; color: var(--ink); font-weight: 700; min-width: 30px; text-align: right; }
 
-    /* 中央ステージ：生成出力 + BPE トークン + Attention MUX マップ */
-    .stage-col { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; min-width: 0; }
-    .stage {
-      position: relative;
+    /* コンパクト計器 */
+    .metrics {
       display: grid;
-      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-      gap: 8px;
-      padding: 11px 15px 9px;
-      min-height: 0;
-      min-width: 0;
-      overflow: hidden;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 5px;
+    }
+    .metric {
+      background: var(--sheet);
       border: 1px solid var(--rule);
-      background-color: var(--sheet);
-      background-image: radial-gradient(circle, var(--grid) 0.9px, transparent 1px);
-      background-size: 20px 20px;
-      background-position: 9px 9px;
+      border-radius: 6px;
+      padding: 6px 8px;
     }
-    .stage::before, .stage::after {
-      content: '';
-      pointer-events: none;
-      position: absolute;
-      width: 9px;
-      height: 9px;
-      border: solid var(--muted);
-      opacity: 0.45;
-    }
-    .stage::before { top: 8px; left: 8px; border-width: 1px 0 0 1px; }
-    .stage::after { right: 8px; bottom: 8px; border-width: 0 1px 1px 0; }
+    .metric__k { font-size: 9.5px; color: var(--muted); display: block; }
+    .metric__v { font-family: var(--mono); font-size: 13px; font-weight: 800; line-height: 1.25; margin-top: 1px; display: block; }
+    .metric__v.hi { color: var(--accent); }
 
-    .stage-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .stage-title { font-size: 12.5px; font-weight: 800; display: flex; align-items: center; gap: 7px; }
+    /* ============================================================
+       中央ステージ：本格 Chat UI（内部のみスクロール）
+       ============================================================ */
+    .chat-stage {
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      border-radius: 10px;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto auto;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .chat-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--rule);
+      background: var(--paper);
+    }
+    .chat-head__left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .chat-head__title { font-size: 13px; font-weight: 800; white-space: nowrap; }
     .badge {
       font-family: var(--mono);
-      font-size: 9.5px;
-      font-weight: 800;
+      font-size: 10px;
+      font-weight: 700;
       padding: 2px 7px;
       border-radius: 999px;
+      border: 1px solid var(--rule);
+      background: var(--sheet);
+      white-space: nowrap;
+    }
+    .badge--mux { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .badge--ffn { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+    .chat-head__right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    /* メッセージタイムライン（ここだけスムーズスクロール） */
+    .chat-feed {
+      padding: 14px 16px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background:
+        radial-gradient(circle at 1px 1px, var(--grid) 1px, transparent 0) 0 0 / 20px 20px,
+        var(--sheet);
+      scroll-behavior: smooth;
+    }
+
+    .msg {
+      display: flex;
+      flex-direction: column;
+      max-width: 82%;
+      gap: 3px;
+      animation: msgIn 140ms ease-out;
+    }
+    @keyframes msgIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .msg--user { align-self: flex-end; align-items: flex-end; }
+    .msg--ai { align-self: flex-start; align-items: flex-start; }
+
+    .msg__meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      padding: 0 3px;
+    }
+    .msg__pill {
+      font-size: 9.5px;
+      font-weight: 800;
+      padding: 1px 6px;
+      border-radius: 4px;
       background: var(--tri);
       color: var(--ink);
     }
-    .badge--mux { background: var(--accent); color: #fff; }
+    .msg__pill--mux { background: var(--accent-tint); color: var(--accent); border: 1px solid #f4b394; }
+    .msg__pill--ffn { background: var(--ink); color: var(--paper); }
 
-    .post-card {
-      padding: 10px 13px;
-      background: var(--paper);
-      border: 1px solid var(--ink);
-      display: grid;
-      gap: 5px;
-    }
-    .post-src {
-      font-size: 11px;
-      color: var(--muted);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .post-src .tag {
-      font-family: var(--mono), var(--jp);
-      font-weight: 800;
-      color: var(--accent);
-      margin-right: 5px;
-    }
-    .post-out {
-      font-size: clamp(14px, 1.45vw, 17px);
-      font-weight: 800;
-      line-height: 1.5;
-      color: var(--ink);
-      min-height: 2.3em;
+    .bubble {
+      padding: 10px 14px;
+      font-size: 14px;
+      line-height: 1.55;
       word-break: break-word;
+      white-space: pre-wrap;
     }
-    .caret {
+    .msg--user .bubble {
+      background: var(--ink);
+      color: var(--paper);
+      border-radius: 14px 14px 3px 14px;
+      font-weight: 500;
+    }
+    .msg--ai .bubble {
+      background: #fff;
+      color: var(--ink);
+      border: 1px solid var(--rule);
+      border-radius: 14px 14px 14px 3px;
+      box-shadow: 0 1px 0 rgba(20, 20, 18, 0.05);
+    }
+    .msg--ai.is-mux .bubble {
+      border-color: #e4a182;
+      background: #fffdfb;
+    }
+    .msg--sys {
+      align-self: center;
+      max-width: 92%;
+      font-size: 11.5px;
+      color: var(--muted);
+      background: var(--paper);
+      border: 1px dashed var(--rule);
+      border-radius: 8px;
+      padding: 6px 12px;
+      text-align: center;
+    }
+    .cursor {
       display: inline-block;
-      width: 2px;
-      height: 1em;
+      width: 7px;
+      height: 14px;
       background: var(--accent);
       vertical-align: -2px;
       margin-left: 2px;
-      animation: blink 0.8s steps(1) infinite;
+      animation: blink 0.7s steps(1) infinite;
     }
     @keyframes blink { 50% { opacity: 0; } }
 
-    .bpe-strip {
+    .msg__actions {
       display: flex;
       align-items: center;
-      gap: 4px;
-      overflow: hidden;
-      flex-wrap: nowrap;
-      padding: 4px 7px;
-      background: var(--paper);
-      border: 1px solid var(--rule);
-      font-size: 10px;
+      gap: 8px;
+      padding: 0 4px;
     }
-    .bpe-label { font-family: var(--mono); color: var(--muted); font-size: 9.5px; flex-shrink: 0; margin-right: 3px; }
-    .bpe-tok {
-      padding: 1px 5px;
-      border: 1px solid var(--rule);
-      background: var(--sheet);
-      border-radius: 3px;
-      white-space: nowrap;
+    .msg__act {
+      font-family: var(--mono);
       font-size: 10px;
-      flex-shrink: 0;
+      color: var(--muted);
+      padding: 1px 4px;
+      border-radius: 4px;
     }
-    .bpe-tok--out { border-color: #f3b599; background: var(--accent-tint); }
+    .msg__act:hover { color: var(--accent); background: var(--accent-tint); }
 
-    .attn-wrap {
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
-      gap: 4px;
-      min-height: 0;
-      min-width: 0;
+    /* クイック送信チップ */
+    .quick-bar {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 7px 12px 4px;
+      border-top: 1px solid var(--grid);
+      background: var(--sheet);
+      overflow-x: auto;
+      scrollbar-width: none;
     }
-    .seg-mini { display: inline-flex; gap: 3px; }
-    .seg-mini button {
-      padding: 1px 6px;
+    .quick-bar::-webkit-scrollbar { display: none; }
+    .chip {
+      font-size: 11px;
+      padding: 4px 9px;
       border: 1px solid var(--rule);
       border-radius: 999px;
       background: var(--paper);
+      color: var(--ink);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-tint); }
+
+    /* チャット入力欄 */
+    .composer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px 10px;
+      background: var(--sheet);
+    }
+    .composer__input {
+      flex: 1;
+      min-width: 0;
+      padding: 9px 13px;
+      border: 1.5px solid var(--rule);
+      border-radius: 999px;
+      background: #fff;
+      font-size: 13.5px;
+      outline: none;
+      transition: border-color 120ms;
+    }
+    .composer__input:focus { border-color: var(--accent); }
+    .composer__send {
+      min-height: 38px;
+      padding: 0 18px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 12.5px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .composer__send:hover:not(:disabled) { background: #e54400; }
+    .composer__send.is-stop { background: var(--ink); }
+
+    /* ============================================================
+       右インスペクタ：Attention / BPE / Top-5
+       ============================================================ */
+    .inspector-box {
+      flex: 1;
+      min-height: 0;
+      background: var(--sheet);
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      padding: 9px 10px;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 6px;
+      overflow: hidden;
+    }
+    .attn-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .pill-row { display: flex; gap: 3px; flex-wrap: wrap; }
+    .pill {
       font-family: var(--mono);
       font-size: 9.5px;
       font-weight: 700;
-      color: var(--muted);
+      padding: 2px 6px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--paper);
     }
-    .seg-mini button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+    .pill[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 
-    #attn-svg { width: 100%; height: 100%; display: block; min-height: 0; }
-
-    .stage-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10.5px; color: var(--muted); }
-
-    /* 右カラム：Top-5 候補・計器・履歴 */
-    .right-col {
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 8px;
+    .attn-svg-wrap {
       min-height: 0;
-      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       overflow: hidden;
     }
-    .rblock {
-      border-top: 1px solid var(--rule);
-      padding-top: 8px;
-      display: grid;
-      gap: 6px;
-      min-width: 0;
-    }
-    .rblock:first-child { border-top: 0; padding-top: 0; }
+    .attn-svg-wrap svg { width: 100%; height: 100%; display: block; }
 
-    .stat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
-    .stat-cell {
-      padding: 6px 8px;
-      border: 1px solid var(--rule);
-      background: var(--sheet);
-      display: grid;
-      gap: 1px;
+    .bpe-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+      max-height: 54px;
+      overflow: hidden;
+      padding: 5px 6px;
+      background: var(--paper);
+      border: 1px solid var(--grid);
+      border-radius: 5px;
     }
-    .stat-cell span { font-size: 9.5px; color: var(--muted); }
-    .stat-cell strong { font-family: var(--mono); font-size: 13px; font-weight: 800; }
-    .stat-cell strong.accent { color: var(--accent); }
-
-    .top5 { display: grid; gap: 4px; }
-    .t5-row {
-      display: grid;
-      grid-template-columns: 54px minmax(0, 1fr) 36px;
-      align-items: center;
-      gap: 5px;
-      font-size: 10px;
-    }
-    .t5-tok {
-      font-family: var(--mono), var(--jp);
+    .bpe-tok {
+      font-family: var(--mono);
+      font-size: 9.5px;
       padding: 1px 4px;
       border: 1px solid var(--rule);
+      border-radius: 3px;
       background: var(--sheet);
-      text-align: center;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+    }
+    .bpe-tok--gen { border-color: var(--accent); background: var(--accent-tint); color: #8c2a00; }
+
+    .top5 { display: grid; gap: 3px; }
+    .top5__row {
+      display: grid;
+      grid-template-columns: 74px minmax(0, 1fr) 40px;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
       font-size: 10px;
     }
-    .track { height: 6px; background: var(--tri); border-radius: 2px; overflow: hidden; }
-    .fill { height: 100%; background: var(--ink); }
-    .fill--acc { background: var(--accent); }
-    .t5-p { font-family: var(--mono); text-align: right; color: var(--muted); font-size: 9.5px; }
-
-    .hist-list { display: grid; gap: 4px; }
-    .hist-item {
-      padding: 5px 7px;
+    .top5__tok {
+      padding: 1px 5px;
       border: 1px solid var(--rule);
+      border-radius: 3px;
       background: var(--sheet);
-      font-size: 10.5px;
-      text-align: left;
-      display: grid;
-      gap: 1px;
+      text-align: center;
+      white-space: nowrap;
       overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .hist-item:hover { border-color: var(--ink); background: var(--tri); }
-    .hist-item .h-meta { font-family: var(--mono), var(--jp); font-size: 9px; color: var(--accent); }
-    .hist-item .h-txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
-
-    .action-tile {
-      width: 100%;
-      padding: 8px 10px;
-      border: 1px solid var(--ink);
-      background: var(--sheet);
-      font-size: 11px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .action-tile:hover { background: var(--ink); color: var(--paper); }
+    .top5__bar { height: 5px; background: var(--tri); border-radius: 99px; overflow: hidden; }
+    .top5__fill { height: 100%; background: var(--ink); }
+    .top5__row:first-child .top5__fill { background: var(--accent); }
+    .top5__pct { text-align: right; color: var(--muted); }
 
     .foot {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 6px 16px;
+      padding: 5px 16px;
       border-top: 1px solid var(--rule);
-      font-size: 11px;
+      background: var(--paper);
+      font-family: var(--mono);
+      font-size: 10.5px;
       color: var(--muted);
+      min-height: 28px;
     }
-    .foot-mono { font-family: var(--mono), var(--jp); font-size: 10.5px; white-space: nowrap; }
     .foot a:hover { color: var(--accent); }
 
-    /* オーバーレイシート */
+    /* モーダル（3段同時比較 / しくみ） */
     .sheet {
       position: fixed;
       inset: 0;
       z-index: 40;
       background: rgba(20, 20, 18, 0.36);
-      display: grid;
-      place-items: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       padding: 16px;
     }
-    .sheet__body {
-      width: min(760px, 100%);
+    .sheet__panel {
+      width: min(820px, 100%);
       max-height: min(82dvh, 660px);
-      background: var(--paper);
-      border: 1px solid var(--ink);
+      background: var(--sheet);
+      border: 1.5px solid var(--ink);
+      border-radius: 10px;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
-      box-shadow: 0 20px 60px rgba(20, 20, 18, 0.24);
+      overflow: hidden;
+      box-shadow: 0 18px 44px rgba(20, 20, 18, 0.18);
     }
     .sheet__head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 8px 14px;
+      gap: 12px;
+      padding: 10px 14px;
       border-bottom: 1px solid var(--rule);
+      background: var(--paper);
     }
-    .sheet__tabs { display: flex; gap: 4px; }
+    .sheet__tabs { display: flex; gap: 6px; }
     .sheet__tabs button {
-      padding: 5px 11px;
-      border: 1px solid transparent;
-      border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--rule);
     }
-    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
-    .sheet__close { width: 30px; height: 30px; border-radius: 999px; font-size: 18px; }
-    .sheet__close:hover { background: var(--tri); }
-    .sheet__content { overflow: auto; padding: 14px 16px 18px; }
-
-    .cmp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .cmp-card { padding: 11px; border: 1px solid var(--rule); background: var(--sheet); display: grid; gap: 6px; }
+    .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .sheet__body { padding: 14px 16px; overflow: auto; }
+    .cmp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .cmp-card {
+      background: var(--paper);
+      border: 1px solid var(--rule);
+      border-radius: 7px;
+      padding: 10px;
+      display: grid;
+      gap: 6px;
+      align-content: start;
+    }
     .cmp-card--mux { border-color: var(--accent); background: var(--accent-tint); }
-    .cmp-head { display: flex; align-items: baseline; justify-content: space-between; }
-    .cmp-head strong { font-family: var(--mono); font-size: 12px; }
-    .cmp-out { font-size: 13.5px; font-weight: 700; line-height: 1.55; min-height: 64px; }
-    .cmp-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .cmp-card__h { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: 11px; font-weight: 800; }
+    .cmp-card__out { font-size: 13px; font-weight: 700; line-height: 1.55; min-height: 52px; white-space: pre-wrap; }
+    .cmp-card__meta { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .about-grid { display: grid; gap: 10px; font-size: 12.5px; line-height: 1.65; }
+    .about-grid h3 { margin: 0 0 2px; font-size: 13px; }
+    .about-grid p { margin: 0; color: var(--muted); }
+    .about-grid code { font-family: var(--mono); font-size: 11px; background: var(--paper); padding: 1px 5px; border-radius: 3px; color: var(--ink); }
 
-    .about-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-    .about-list li { border-left: 2px solid var(--rule); padding-left: 12px; }
-    .about-list strong { display: block; font-size: 12.5px; margin-bottom: 3px; }
-    .about-list p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.65; }
-    .about-step { font-family: var(--mono); font-size: 10px; color: var(--accent); margin-right: 6px; }
+    .mobile-bar {
+      display: none;
+      gap: 6px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--grid);
+      background: var(--paper);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .mobile-bar::-webkit-scrollbar { display: none; }
+    .mobile-bar button {
+      font-family: var(--mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      background: var(--sheet);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .mobile-bar button[aria-pressed="true"] {
+      background: var(--ink);
+      color: var(--paper);
+      border-color: var(--ink);
+    }
+    .mobile-bar button.is-mux[aria-pressed="true"] {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
 
-    @media (max-width: 1020px) {
-      .desk { grid-template-columns: clamp(232px, 31vw, 276px) minmax(0, 1fr); }
-      .right-col { display: none; }
+    @media (max-width: 1120px) {
+      .desk { grid-template-columns: minmax(210px, 232px) minmax(0, 1fr); }
+      .inspector-col { display: none; }
+      .desk.show-inspector { grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); }
+      .desk.show-inspector .left-col { display: none; }
+      .desk.show-inspector .inspector-col { display: flex; }
       .tagline { display: none; }
     }
-    @media (max-width: 680px) {
-      .desk { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); padding: 8px 10px; gap: 8px; }
-      .lblock--hide-sm { display: none; }
+    @media (max-width: 720px) {
+      .desk { grid-template-columns: 1fr; padding: 8px; gap: 8px; }
+      .left-col { display: none; }
+      .mobile-bar { display: flex; }
+      .chat-stage { grid-template-rows: auto auto minmax(0, 1fr) auto auto; }
       .cmp-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -520,218 +670,248 @@
   <div class="app">
     <header class="bar">
       <div class="identity">
-        <a class="mark" href="../" title="griffith/ 一覧へ戻る">griffith<span class="slash">/</span>jpllm</a>
-        <h1>日本語 4 モード論理ゲート LLM</h1>
-        <span class="tagline">BPE · M4 Max Metal GPU 蒸留 · 0 ブロック乗算</span>
+        <a class="mark" href="../">griffith<span class="slash">/</span>jpllm</a>
+        <h1>日本語チャット＆4モード論理ゲート LLM</h1>
+        <span class="tagline" id="arch-tagline">BPE 1280 · 4層 N=4 WARP · Metal GPU 蒸留 · 0 ブロック乗算</span>
       </div>
       <div class="bar__right">
-        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">3 段同時比較</button>
+        <button type="button" class="btn" id="btn-clear-chat">新しい会話</button>
+        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">3段同時比較</button>
+        <button type="button" class="btn" id="btn-inspector" aria-expanded="true">回路</button>
         <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
-        <button type="button" class="btn btn--go" id="btn-gen">生成</button>
       </div>
     </header>
 
-    <main class="desk">
-      <!-- 左：モード切替・モデル段・入力 -->
-      <section class="left-col" aria-label="入力とモデル設定">
-        <div class="lblock">
-          <div class="block-head">
-            <span class="kicker">スタイル / モード（1 モデル 4 役）</span>
-            <span class="kicker-mono" id="mode-tag">[X訳]</span>
+    <main class="desk" id="desk">
+      <!-- 左：モード・モデル・計器 -->
+      <section class="col left-col">
+        <div class="sec">
+          <div class="sec__h">
+            <span class="sec__title">会話 / 変換モード</span>
+            <span class="sec__sub" id="mode-tag">[会話]</span>
           </div>
-          <div class="mode-grid" id="mode-grid">
-            <button type="button" class="mode-btn" data-mode="[X訳]" aria-pressed="true">
-              <strong>X 自動翻訳風</strong><span>くそっ、俺は〜みたいなんだ</span>
+          <div class="mode-list" id="mode-grid">
+            <button type="button" class="mode-btn" data-mode="[会話]" aria-pressed="true">
+              <span class="mode-btn__tag">会話</span>
+              <span class="mode-btn__body">
+                <span class="mode-btn__name">マルチターンチャット</span>
+                <span class="mode-btn__hint">文脈を記憶してX自動翻訳口調で返事</span>
+              </span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="[X訳]" aria-pressed="false">
+              <span class="mode-btn__tag">X訳</span>
+              <span class="mode-btn__body">
+                <span class="mode-btn__name">X 自動翻訳風変換</span>
+                <span class="mode-btn__hint">くそっ、俺は〜みたいなんだよ</span>
+              </span>
             </button>
             <button type="button" class="mode-btn" data-mode="[関西]" aria-pressed="false">
-              <strong>関西弁・エセ関西</strong><span>めっちゃ〜やん、知らんけど</span>
+              <span class="mode-btn__tag">関西</span>
+              <span class="mode-btn__body">
+                <span class="mode-btn__name">関西弁・エセ関西変換</span>
+                <span class="mode-btn__hint">めっちゃ〜やん、知らんけど</span>
+              </span>
             </button>
             <button type="button" class="mode-btn" data-mode="[津軽]" aria-pressed="false">
-              <strong>津軽弁</strong><span>わー、たんげ〜だびょん</span>
-            </button>
-            <button type="button" class="mode-btn" data-mode="[会話]" aria-pressed="false">
-              <strong>会話モード</strong><span>X自動翻訳口調で返事</span>
+              <span class="mode-btn__tag">津軽</span>
+              <span class="mode-btn__body">
+                <span class="mode-btn__name">津軽弁変換</span>
+                <span class="mode-btn__hint">わー、たんげ〜だびょん</span>
+              </span>
             </button>
           </div>
         </div>
 
-        <div class="lblock">
-          <div class="block-head">
-            <span class="kicker">論理ゲート化レベル</span>
-            <span class="kicker-mono" id="load-stat">読込中…</span>
+        <div class="sec">
+          <div class="sec__h">
+            <span class="sec__title">論理ゲート化レベル</span>
+            <span class="sec__sub" id="load-stat">読込中…</span>
           </div>
           <div class="rung-row" id="rung-row">
             <button type="button" class="rung-btn" data-rung="l0" aria-pressed="false">
-              <strong>L0</strong><span>実数 Teacher</span>
+              <b>L0</b><span>実数 Teacher</span>
             </button>
             <button type="button" class="rung-btn" data-rung="l0b" aria-pressed="true">
-              <strong>L0b</strong><span>FFN 論理化</span>
+              <b>L0b</b><span>FFN 論理化</span>
             </button>
             <button type="button" class="rung-btn rung-btn--mux" data-rung="l3c" aria-pressed="false">
-              <strong>L3-C</strong><span>完全論理 · 乗算0</span>
+              <b>L3-C</b><span>完全論理・乗算0</span>
             </button>
           </div>
         </div>
 
-        <div class="lblock">
-          <div class="block-head">
-            <span class="kicker">日本語を入力（Enter で即生成）</span>
-            <span class="kicker-mono" id="gen-speed">-</span>
+        <div class="sec">
+          <div class="sec__h">
+            <span class="sec__title">サンプリング</span>
+            <span class="sec__sub">Top-p 0.85</span>
           </div>
-          <input class="jp-input" id="jp-in" type="text" value="今日めっちゃ眠い" placeholder="変換・会話したい日本語を入力…">
-          <div class="chips" id="preset-chips"></div>
-        </div>
-
-        <div class="lblock lblock--hide-sm">
-          <div class="slider-row">
+          <div class="ctrl-row">
             <span>Temperature</span>
-            <input type="range" id="temp-range" min="15" max="100" value="55">
-            <span class="slider-val" id="temp-val">0.55</span>
+            <input type="range" id="temp-range" min="0" max="95" value="40">
+            <span class="val" id="temp-val">0.40</span>
+          </div>
+        </div>
+
+        <div class="sec" style="margin-top:auto;">
+          <div class="sec__h">
+            <span class="sec__title">稼働中のモデル計器</span>
+            <span class="sec__sub" id="m-size">—</span>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <span class="metric__k">ブロック乗算/tok</span>
+              <span class="metric__v hi" id="m-muls">—</span>
+            </div>
+            <div class="metric">
+              <span class="metric__k">論理ゲート数</span>
+              <span class="metric__v" id="m-gates">—</span>
+            </div>
+            <div class="metric">
+              <span class="metric__k">検証 PPL (hard)</span>
+              <span class="metric__v" id="m-ppl">—</span>
+            </div>
+            <div class="metric">
+              <span class="metric__k">学習 Step</span>
+              <span class="metric__v" id="m-steps">—</span>
+            </div>
           </div>
         </div>
       </section>
 
-      <!-- 中央：ライブ出力カード + BPE トークン + Attention MUX マップ -->
-      <section class="stage-col" aria-label="生成結果と Attention MUX">
-        <div class="stage">
-          <div class="stage-head">
-            <span class="stage-title">
-              <span id="stage-model-name">L3-C 完全論理ゲート LLM（KL 蒸留）</span>
-              <span class="badge badge--mux" id="stage-badge">0 ブロック乗算 · 1-hot MUX</span>
-            </span>
-            <span class="kicker-mono" id="stage-meta">3層 · d=128 · BPE 768</span>
+      <!-- 中央：本格チャット UI -->
+      <section class="chat-stage" aria-label="論理ゲート LLM チャット">
+        <div class="chat-head">
+          <div class="chat-head__left">
+            <span class="chat-head__title" id="chat-title">マルチターンチャット</span>
+            <span class="badge badge--ffn" id="stage-badge">L0b · FFN 乗算 0 · N=4 LUT</span>
           </div>
-
-          <div class="post-card">
-            <div class="post-src">
-              <div><span class="tag" id="out-tag">[X訳]</span><span id="out-src">今日めっちゃ眠い</span></div>
-              <span class="kicker-mono" id="out-status">待機中</span>
-            </div>
-            <div class="post-out" id="out-text">モデル読込中…</div>
-          </div>
-
-          <div class="bpe-strip" id="bpe-strip" aria-label="BPE トークン列">
-            <span class="bpe-label">BPE:</span>
-          </div>
-
-          <div class="attn-wrap">
-            <div class="block-head">
-              <span class="kicker" id="attn-caption">Causal Attention — L3-C ハードウェア MUX（各行 1 マスのみ点灯）</span>
-              <div style="display:flex;gap:8px;align-items:center">
-                <div class="seg-mini" id="layer-btns">
-                  <button type="button" data-l="0" aria-pressed="true">L0</button>
-                  <button type="button" data-l="1" aria-pressed="false">L1</button>
-                  <button type="button" data-l="2" aria-pressed="false">L2</button>
-                </div>
-                <div class="seg-mini" id="head-btns">
-                  <button type="button" data-h="0" aria-pressed="true">H0</button>
-                  <button type="button" data-h="1" aria-pressed="false">H1</button>
-                  <button type="button" data-h="2" aria-pressed="false">H2</button>
-                  <button type="button" data-h="3" aria-pressed="false">H3</button>
-                </div>
-              </div>
-            </div>
-            <svg id="attn-svg" viewBox="0 0 600 280" preserveAspectRatio="xMidYMid meet" role="img" aria-label="日本語 BPE Causal Attention マップ"></svg>
-          </div>
-
-          <div class="stage-foot">
-            <span id="attn-note">出力トークンが入力のどの日本語 BPE トークンを 1-hot MUX で参照したかを可視化</span>
-            <span class="kicker-mono" id="foot-muls">ブロック乗算: <b>0</b></span>
+          <div class="chat-head__right">
+            <span id="ctx-stat">0 / 80 tok</span>
+            <span id="gen-speed">—</span>
           </div>
         </div>
+
+        <div class="mobile-bar" id="mobile-bar">
+          <button type="button" data-mmode="[会話]" aria-pressed="true">会話</button>
+          <button type="button" data-mmode="[X訳]" aria-pressed="false">X訳</button>
+          <button type="button" data-mmode="[関西]" aria-pressed="false">関西</button>
+          <button type="button" data-mmode="[津軽]" aria-pressed="false">津軽</button>
+          <span style="border-left:1px solid var(--rule);margin:0 2px;"></span>
+          <button type="button" data-mrung="l0" aria-pressed="false">L0</button>
+          <button type="button" data-mrung="l0b" aria-pressed="true">L0b</button>
+          <button type="button" class="is-mux" data-mrung="l3c" aria-pressed="false">L3-C</button>
+        </div>
+
+        <div class="chat-feed" id="chat-feed" aria-live="polite"></div>
+
+        <div class="quick-bar" id="preset-chips" aria-label="ワンクリック入力例"></div>
+
+        <form class="composer" id="chat-form">
+          <input
+            type="text"
+            class="composer__input"
+            id="jp-in"
+            autocomplete="off"
+            placeholder="メッセージを入力（Enter で送信）…"
+          >
+          <button type="submit" class="composer__send" id="btn-gen">送信</button>
+        </form>
       </section>
 
-      <!-- 右：計器・Top-5 候補・履歴 -->
-      <aside class="right-col" aria-label="推論計器と候補確率">
-        <div class="rblock">
-          <div class="block-head">
-            <span class="kicker">モデル計器</span>
-            <span class="kicker-mono" id="m-size">- KB</span>
+      <!-- 右：リアルタイム 1-hot MUX / Attention / BPE インスペクタ -->
+      <section class="col inspector-col" aria-label="回路インスペクタ">
+        <div class="inspector-box">
+          <div class="attn-controls">
+            <div>
+              <div class="sec__title" id="attn-caption">L3-C ハードウェア MUX</div>
+              <div class="sec__sub" id="attn-note">各行 1 マスだけ点灯（0 乗算）</div>
+            </div>
+            <div style="display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end;">
+              <div class="pill-row" id="layer-btns"></div>
+              <div class="pill-row" id="head-btns"></div>
+            </div>
           </div>
-          <div class="stat-grid">
-            <div class="stat-cell"><span>ブロック乗算/tok</span><strong class="accent" id="m-muls">0</strong></div>
-            <div class="stat-cell"><span>論理ゲート数</span><strong id="m-gates">-</strong></div>
-            <div class="stat-cell"><span>検証 PPL (hard)</span><strong id="m-ppl">-</strong></div>
-            <div class="stat-cell"><span>学習 Step</span><strong id="m-steps">-</strong></div>
+          <div class="attn-svg-wrap">
+            <svg id="attn-svg" viewBox="0 0 320 320" aria-label="Attention ヒートマップ"></svg>
           </div>
+          <div class="bpe-strip" id="bpe-strip"></div>
         </div>
 
-        <div class="rblock">
-          <div class="block-head">
-            <span class="kicker">次トークン Top-5 確率</span>
-            <span class="kicker-mono">BPE 768</span>
+        <div class="sec">
+          <div class="sec__h">
+            <span class="sec__title">直近の次トークン Top-5</span>
+            <span class="sec__sub" id="vocab-sub">BPE 1280</span>
           </div>
           <div class="top5" id="top5-list"></div>
         </div>
 
-        <div class="rblock">
-          <div class="block-head">
-            <span class="kicker">最近の生成</span>
-            <span class="kicker-mono">クリックで再利用</span>
-          </div>
-          <div class="hist-list" id="hist-list"></div>
-        </div>
-
-        <div class="rblock">
-          <button type="button" class="action-tile" id="open-cmp">L0 / L0b / L3-C を同時比較 <span>→</span></button>
-        </div>
-      </aside>
+        <button type="button" class="btn" id="open-cmp" style="width:100%;justify-content:space-between;padding:0 12px;">
+          <span>同じ発言を L0 / L0b / L3-C で比較</span><span>→</span>
+        </button>
+      </section>
     </main>
 
     <footer class="foot">
-      <span class="foot-mono"><a href="../">← griffith/ 一覧</a></span>
-      <span>Qwen3-4B (Apache 2.0) 蒸留データ → 純 Kizu BPE + M4 Max Metal GPU 学習 → L0→L3-C KL 蒸留 → 単体 WASM 推論</span>
-      <span class="foot-mono" id="foot-stat">kizu wasm32-browser</span>
+      <a href="../">← griffith/ 一覧</a>
+      <span>純 Kizu BPE 1280 + M4 Max Metal GPU 段階 KL 蒸留（L0 → L0b → L3-C）→ 単体 WASM（UTF-8 制約 Top-p 0.85）</span>
+      <span id="foot-stat">636 KB .wasm · kizu wasm32-browser</span>
     </footer>
+  </div>
 
-    <div class="sheet" id="sheet" hidden>
-      <div class="sheet__body" role="dialog" aria-modal="true" aria-label="比較としくみ">
-        <div class="sheet__head">
-          <div class="sheet__tabs" role="tablist">
-            <button type="button" role="tab" data-tab="cmp" aria-selected="true">L0 / L0b / L3-C 並列比較</button>
-            <button type="button" role="tab" data-tab="about" aria-selected="false">この日本語論理ゲート LLM のしくみ</button>
-          </div>
-          <button type="button" class="sheet__close" id="sheet-close" aria-label="閉じる">×</button>
+  <!-- モーダル：3段同時比較 / しくみ -->
+  <div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-label="比較と解説">
+    <div class="sheet__panel">
+      <div class="sheet__head">
+        <div class="sheet__tabs" role="tablist">
+          <button type="button" role="tab" data-tab="cmp" aria-selected="true">L0 / L0b / L3-C 同時比較</button>
+          <button type="button" role="tab" data-tab="about" aria-selected="false">しくみ・蒸留アーキテクチャ</button>
         </div>
-        <div class="sheet__content">
-          <div id="tab-cmp">
-            <div class="block-head" style="margin-bottom:10px">
-              <span class="kicker-mono" id="cmp-prompt-label">同じ日本語入力・同じ乱数シードで 3 モデル同時生成</span>
-              <button type="button" class="btn btn--go" id="btn-run-cmp" style="min-height:28px;font-size:11px">同時生成</button>
+        <button type="button" class="btn" id="sheet-close">閉じる</button>
+      </div>
+      <div class="sheet__body">
+        <div id="tab-cmp">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+            <span id="cmp-prompt-label" style="font-family:var(--mono);font-size:11.5px;color:var(--muted);"></span>
+            <button type="button" class="btn btn--go" id="btn-run-cmp" style="min-height:28px;font-size:11px">同時生成</button>
+          </div>
+          <div class="cmp-grid">
+            <div class="cmp-card">
+              <div class="cmp-card__h"><span>L0 実数 Teacher</span><span id="cmp-l0-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-l0-out">—</div>
+              <div class="cmp-card__meta" id="cmp-l0-stat">FP Attention + FP FFN</div>
             </div>
-            <div class="cmp-grid">
-              <div class="cmp-card">
-                <div class="cmp-head"><strong>L0 (全実数)</strong><span class="kicker-mono" id="cmp-l0-meta">-</span></div>
-                <div class="cmp-out" id="cmp-l0-out">「同時生成」で比較</div>
-                <div class="cmp-meta" id="cmp-l0-stat">FP 行列積＋Softmax</div>
-              </div>
-              <div class="cmp-card">
-                <div class="cmp-head"><strong>L0b (FFN 論理化)</strong><span class="kicker-mono" id="cmp-l0b-meta">-</span></div>
-                <div class="cmp-out" id="cmp-l0b-out">「同時生成」で比較</div>
-                <div class="cmp-meta" id="cmp-l0b-stat">2,304 論理ゲート · KL 蒸留</div>
-              </div>
-              <div class="cmp-card cmp-card--mux">
-                <div class="cmp-head"><strong>L3-C (完全論理)</strong><span class="kicker-mono" id="cmp-l3-meta">-</span></div>
-                <div class="cmp-out" id="cmp-l3-out">「同時生成」で比較</div>
-                <div class="cmp-meta" id="cmp-l3-stat">3,456 論理ゲート · 乗算 0 · MUX</div>
-              </div>
+            <div class="cmp-card">
+              <div class="cmp-card__h"><span>L0b FFN 論理化</span><span id="cmp-l0b-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-l0b-out">—</div>
+              <div class="cmp-card__meta" id="cmp-l0b-stat">Teacher Warm-Start + N=4 LUT FFN</div>
+            </div>
+            <div class="cmp-card cmp-card--mux">
+              <div class="cmp-card__h"><span>L3-C 完全論理ゲート</span><span id="cmp-l3-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-l3-out">—</div>
+              <div class="cmp-card__meta" id="cmp-l3-stat">0 ブロック乗算 + 1-hot MUX</div>
             </div>
           </div>
-          <div id="tab-about" hidden>
-            <ul class="about-list">
-              <li>
-                <strong><span class="about-step">01</span>2 段階蒸留（オープンモデル → 実数 L0 → 乗算ゼロ L3-C）</strong>
-                <p>Apache 2.0 のオープンモデル（Qwen3-4B）から日本語 4 モード（<code>[X訳]</code>・<code>[関西]</code>・<code>[津軽]</code>・<code>[会話]</code>）の対話・変換データ約 1,700 件を生成し、純 Kizu のバイトレベル BPE（語彙 768・未知語ゼロ）で符号化。M4 Max Metal GPU 上で実数 Teacher <code>L0</code> を学習後、トークン単位の KL 蒸留で <code>L0b</code> / <code>L3-C</code> の論理ゲート回路へ知識を移しています。</p>
-              </li>
-              <li>
-                <strong><span class="about-step">02</span>純 Kizu Metal GPU カーネルによる高速学習</strong>
-                <p><code>Linear</code>（前後伝播）と <code>WARP-LUT (N=2, 4)</code> の前後伝播（逆引き CSR で atomic ゼロ）を純 Kizu の <code>export "gpu" fn</code> から Metal シェーダへコンパイルし、Apple Silicon の統合メモリ上で学習しています。</p>
-              </li>
-              <li>
-                <strong><span class="about-step">03</span>ブラウザ単体・軽量 `.glgpt` v2（約 0.5 MB）で乗算ゼロ生成</strong>
-                <p>離散化済みの論理ゲート真理値表と BPE マージ表、f16 埋め込みを 1 ファイルにまとめた <code>.glgpt</code> v2 をブラウザ WASM が直接実行。<code>L3-C</code> は Transformer ブロック内の浮動小数点乗算 0 回・Softmax 0 回（各ヘッド 1-hot ハードウェア MUX）でリアルタイムに日本語を紡ぎます。</p>
-              </li>
-            </ul>
+        </div>
+
+        <div id="tab-about" hidden class="about-grid">
+          <div>
+            <h3>1. チャット対応＆4 モードを 1 つの極小論理ゲート LLM に統合</h3>
+            <p>
+              マルチターン会話 <code>[会話]</code>（<code>U: ... / A: ...</code> の文脈保持）と、3 つの日本語スタイル変換（<code>[X訳]</code>・<code>[関西]</code>・<code>[津軽]</code>）を 1 本の純 Kizu バイトレベル BPE モデルへ統合しています。
+            </p>
+          </div>
+          <div>
+            <h3>2. 強化版 段階蒸留（L0 → L0b → L3-C + N=4 WARP LUT + MUX Value Skip）</h3>
+            <p>
+              Apache 2.0 の <code>Qwen3-4B-Instruct</code> で生成した 5,033 件（740 KB）のマルチターン会話＆変換コーパスに対し、Apple M4 Max 上の純 Kizu Metal GPU カーネルで <code>L0</code>（実数 4 層 d=192 Transformer, PPL 11.56）を学習。
+              そこから Warm-Start＋応答トークン重視の KL 蒸留で <code>L0b</code>（FFN 4,608 個 N=4 WARP LUT, <b>PPL 11.40 で実数 Teacher 超え</b>）を構築し、さらに <code>L0b</code> の離散 LUT を逆ウォルシュ・アダマール変換で引き継いで Hardware MUX Value Skip 付き <code>L3-C</code>（6,912 LUT・ブロック乗算 0 回・PPL 19.22）へ結晶化しました。
+            </p>
+          </div>
+          <div>
+            <h3>3. ブラウザ完結 WASM 推論（UTF-8 状態制約 + Top-p 0.85 + 反復ペナルティ）</h3>
+            <p>
+              すべての推論は 636 KB の統合 Kizu WASM（サーバー通信・WebGPU 不要）で動作し、UTF-8 継続バイトの状態機械により文字化け（）を構造上ゼロに抑えています。<code>L3-C</code> は XNOR-popcount と 1-hot ハードウェア MUX（1.84 ms/fwd）で実行されます。
+            </p>
           </div>
         </div>
       </div>
@@ -741,467 +921,659 @@
   <script type="module">
     import { instantiate } from "../dist/app.mjs";
 
-    const PRESETS_BY_MODE = {
-      "[X訳]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "そんな言葉使ってないよ", "雨降ってきて最悪", "バグが全然直らない"],
-      "[関西]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "仕事終わったから帰る", "猫が寝ててかわいい", "コードが一発で動いた", "コーヒー飲みたい"],
-      "[津軽]": ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "おはよう、今日も頑張ろう", "雨降ってきて最悪"],
-      "[会話]": ["おはよう", "疲れた", "あなたは誰？", "論理ゲートって何？", "腹減った", "すごいね"],
-    };
+    const decoder = new TextDecoder("utf-8");
+    const encoder = new TextEncoder();
 
     const RUNG_INFO = {
-      l0:  { name: "L0 全実数 Teacher（基準）", badge: "FP 行列積 · Softmax", mux: false },
-      l0b: { name: "L0b FFN 論理ゲート化（KL 蒸留）", badge: "FFN 乗算 0 · 2,304 LUT", mux: false },
-      l3c: { name: "L3-C 完全論理ゲート LLM（KL 蒸留）", badge: "0 ブロック乗算 · 1-hot MUX", mux: true },
+      l0:  { name: "L0 実数 Teacher", badge: "L0 · 実数ベースライン", cls: "", url: "./models/l0.glgpt", desc: "FP Attention + FP FFN" },
+      l0b: { name: "L0b FFN 論理ゲート化", badge: "L0b · FFN 乗算 0 · N=4 LUT", cls: "badge--ffn", url: "./models/l0b.glgpt", desc: "FP Attention + N=4 論理ゲート FFN" },
+      l3c: { name: "L3-C 完全論理ゲート", badge: "L3-C · 0 ブロック乗算 · 1-hot MUX", cls: "badge--mux", url: "./models/l3c.glgpt", desc: "N=4 QKV + XNOR + 1-hot MUX + N=4 FFN" },
     };
 
-    const SVG_NS = "http://www.w3.org/2000/svg";
-    const svgEl = (tag, attrs = {}, text = null) => {
-      const el = document.createElementNS(SVG_NS, tag);
-      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
-      if (text !== null) el.textContent = text;
-      return el;
+    const MODE_META = {
+      "[会話]": {
+        title: "マルチターンチャット（X自動翻訳口調）",
+        placeholder: "話しかけてみてください（例：おはよう / あなたは誰？ / 腹減った）…",
+        welcome: "やあ兄弟！俺は乗算ゼロの論理ゲートで動く極小AIみたいなんだよ。何でも話しかけてみてくれ！",
+        presets: ["おはよう", "あなたは誰？", "今日めっちゃ眠い", "腹減った", "なんでクソって言うの？", "仕事行きたくない", "バグが直らない", "猫かわいい"],
+      },
+      "[X訳]": {
+        title: "X 自動翻訳風変換",
+        placeholder: "変換したい日本語を入力（例：今日めっちゃ眠い）…",
+        welcome: "普通の日本語を送ると、Xの自動翻訳が暴走したみたいな口調に変換するみたいなんだよ。",
+        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "雨降ってきて最悪", "コードが一発で動いた", "ありがとう", "コーヒー飲みたい"],
+      },
+      "[関西]": {
+        title: "関西弁・エセ関西変換",
+        placeholder: "関西弁にしたい日本語を入力（例：このラーメン美味しい）…",
+        welcome: "なんか喋ってみてや！論理ゲート回路で関西弁に変換したるで、知らんけど。",
+        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "雨降ってきて最悪", "コードが一発で動いた", "ありがとう", "腹減った"],
+      },
+      "[津軽]": {
+        title: "津軽弁変換",
+        placeholder: "津軽弁にしたい日本語を入力（例：今日めっちゃ寒い）…",
+        welcome: "こんちは！日本語送ってけろば、論理ゲートで津軽弁に変換するびょん！",
+        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "寒い", "コードが一発で動いた", "ありがとう", "腹減った"],
+      },
     };
 
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder("utf-8", { fatal: false });
-    const slotBuffers = { 0: new Uint8Array(0), 1: new Uint8Array(0) };
-
-    let ex = null;
-    const handles = {};
-    const modelSizes = {};
-    let curMode = "[X訳]";
-    let curRung = "l0b";
-    let curLayer = 0;
-    let curHead = 0;
+    const slots = { 0: new Uint8Array(0), 1: new Uint8Array(0) };
     let lastPieceBytes = new Uint8Array(0);
     let lastWindowTokens = [];
-    let promptTokCount = 0;
+    let ex = null;
+    const handles = {};
+    const loadingRungs = {};
+    const sizes = {};
+
+    let activeRung = "l0b";
+    let activeMode = "[会話]";
+    let activeLayer = 0;
+    let activeHead = 0;
     let generating = false;
-    let genTimer = 0;
-    let runSeed = 100;
-    const recentHist = [];
-    let sheetTab = "cmp";
+    let stopFlag = false;
+    let chatTurns = []; // multi-turn history for [会話]: [{u, a}]
+    let lastUserInput = "おはよう";
+    let lastPromptTokenCount = 0;
+
+    function fmtNum(n) { return Number(n).toLocaleString("ja-JP"); }
+    function fmtKB(b) { return b >= 1024 * 1024 ? `${(b / (1024 * 1024)).toFixed(2)} MB` : `${Math.round(b / 1024)} KB`; }
+
+    function concatBytes(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function parseNulTokens(bytes) {
+      const out = [];
+      let start = 0;
+      for (let i = 0; i <= bytes.length; i++) {
+        if (i === bytes.length || bytes[i] === 0) {
+          out.push(decoder.decode(bytes.subarray(start, i)));
+          start = i + 1;
+        }
+      }
+      return out;
+    }
+
+    function prettyTok(s) {
+      if (s === "\n") return "↵";
+      if (s === " ") return "␣";
+      return s.replace(/\n/g, "↵").replace(/ /g, "␣");
+    }
+
+    function buildPromptBytes(mode, userText, historyTurns, maxSeq) {
+      if (mode !== "[会話]") {
+        return encoder.encode(`${mode} ${userText}\n=> `);
+      }
+      // Keep as many recent turns as fit safely in maxSeq (leaving >= 28 tokens for reply)
+      const turns = historyTurns.slice(-3);
+      for (let drop = 0; drop <= turns.length; drop++) {
+        const sub = turns.slice(drop);
+        let text = "[会話]\n";
+        for (const t of sub) {
+          text += `U: ${t.u}\nA: ${t.a}\n`;
+        }
+        text += `U: ${userText}\nA: `;
+        const bytes = encoder.encode(text);
+        if (bytes.length <= Math.max(48, (maxSeq - 26) * 3) || drop === turns.length) {
+          return bytes;
+        }
+      }
+      return encoder.encode(`[会話]\nU: ${userText}\nA: `);
+    }
+
+    function getTemp() { return Number(document.getElementById("temp-range").value) / 100; }
 
     function renderPresets() {
       const box = document.getElementById("preset-chips");
+      const meta = MODE_META[activeMode];
       box.innerHTML = "";
-      for (const txt of PRESETS_BY_MODE[curMode] || []) {
+      for (const txt of meta.presets) {
         const b = document.createElement("button");
         b.type = "button";
         b.className = "chip";
         b.textContent = txt;
         b.onclick = () => {
           document.getElementById("jp-in").value = txt;
-          runGenerate();
+          sendMessage(txt);
         };
         box.appendChild(b);
       }
     }
 
-    async function ensureModel(rung) {
-      if (handles[rung]) return handles[rung];
-      document.getElementById("load-stat").textContent = `${rung.toUpperCase()} 読込中…`;
-      const resp = await fetch(`./models/${rung}.glgpt`);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${rung}.glgpt`);
-      const bytes = new Uint8Array(await resp.arrayBuffer());
-      slotBuffers[0] = bytes;
-      const h = ex.ladder_load(bytes.byteLength) >>> 0;
-      if (!h) throw new Error(`ladder_load failed for ${rung}`);
-      handles[rung] = h;
-      modelSizes[rung] = bytes.byteLength;
-      document.getElementById("load-stat").textContent = `${rung.toUpperCase()} 準備完了`;
-      return h;
+    function addSysMsg(text) {
+      const feed = document.getElementById("chat-feed");
+      const el = document.createElement("div");
+      el.className = "msg--sys";
+      el.textContent = text;
+      feed.appendChild(el);
+      feed.scrollTop = feed.scrollHeight;
     }
 
-    function updateModelStats(h, rung, seqLen) {
-      const info = RUNG_INFO[rung];
-      document.getElementById("stage-model-name").textContent = info.name;
+    function addUserBubble(text) {
+      const feed = document.getElementById("chat-feed");
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg--user";
+      wrap.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+      feed.appendChild(wrap);
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    function createAiBubble(rung, mode) {
+      const feed = document.getElementById("chat-feed");
+      const wrap = document.createElement("div");
+      const isMux = rung === "l3c";
+      const isFfn = rung === "l0b";
+      wrap.className = `msg msg--ai${isMux ? " is-mux" : ""}`;
+      const pillCls = isMux ? "msg__pill msg__pill--mux" : (isFfn ? "msg__pill msg__pill--ffn" : "msg__pill");
+      const pillLabel = isMux ? "L3-C · 0 乗算" : (isFfn ? "L0b · FFN論理" : "L0 · 実数");
+      wrap.innerHTML = `
+        <div class="msg__meta">
+          <span class="${pillCls}">${pillLabel}</span>
+          <span>${escapeHtml(mode)}</span>
+          <span class="js-stat">生成中…</span>
+        </div>
+        <div class="bubble"><span class="js-txt"></span><span class="cursor js-cur"></span></div>
+      `;
+      feed.appendChild(wrap);
+      feed.scrollTop = feed.scrollHeight;
+      return {
+        wrap,
+        txtEl: wrap.querySelector(".js-txt"),
+        curEl: wrap.querySelector(".js-cur"),
+        statEl: wrap.querySelector(".js-stat"),
+      };
+    }
+
+    function resetChat() {
+      stopFlag = true;
+      chatTurns = [];
+      const feed = document.getElementById("chat-feed");
+      feed.innerHTML = "";
+      const meta = MODE_META[activeMode];
+      document.getElementById("chat-title").textContent = meta.title;
+      document.getElementById("jp-in").placeholder = meta.placeholder;
+      const b = createAiBubble(activeRung, activeMode);
+      b.txtEl.textContent = meta.welcome;
+      b.curEl.remove();
+      b.statEl.textContent = "準備完了";
+    }
+
+    function rebuildLayerHeadButtons(h) {
+      const nLayers = ex.ladder_meta(h, 5);
+      const nHeads = ex.ladder_meta(h, 4);
+      if (activeLayer >= nLayers) activeLayer = 0;
+      if (activeHead >= nHeads) activeHead = 0;
+
+      const lBox = document.getElementById("layer-btns");
+      lBox.innerHTML = "";
+      for (let l = 0; l < nLayers; l++) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "pill";
+        b.textContent = `L${l}`;
+        b.setAttribute("aria-pressed", String(l === activeLayer));
+        b.onclick = () => {
+          activeLayer = l;
+          rebuildLayerHeadButtons(handles[activeRung]);
+          drawAttention(handles[activeRung], lastWindowTokens);
+        };
+        lBox.appendChild(b);
+      }
+
+      const hBox = document.getElementById("head-btns");
+      hBox.innerHTML = "";
+      for (let hi = 0; hi < nHeads; hi++) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "pill";
+        b.textContent = `H${hi}`;
+        b.setAttribute("aria-pressed", String(hi === activeHead));
+        b.onclick = () => {
+          activeHead = hi;
+          rebuildLayerHeadButtons(handles[activeRung]);
+          drawAttention(handles[activeRung], lastWindowTokens);
+        };
+        hBox.appendChild(b);
+      }
+    }
+
+    function updateMetrics() {
+      const h = handles[activeRung];
+      const info = RUNG_INFO[activeRung];
       const badge = document.getElementById("stage-badge");
       badge.textContent = info.badge;
-      badge.classList.toggle("badge--mux", info.mux);
+      badge.className = `badge ${info.cls}`;
 
-      const muls = ex.ladder_block_muls(h, Math.max(1, seqLen));
-      const gates = ex.ladder_meta(h, 9);
-      const hppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
+      if (!h) {
+        document.getElementById("load-stat").textContent = "読込中…";
+        return;
+      }
+      const vocab = ex.ladder_meta(h, 1);
+      const seqLen = ex.ladder_meta(h, 2);
+      const dModel = ex.ladder_meta(h, 3);
+      const nLayers = ex.ladder_meta(h, 5);
+      const hardPpl = ex.ladder_meta(h, 7) / 100;
       const steps = ex.ladder_meta(h, 8);
-      const kb = (modelSizes[rung] / 1024).toFixed(0);
+      const gates = ex.ladder_meta(h, 9);
+      const muls = ex.ladder_block_muls(h, seqLen);
 
-      document.getElementById("m-size").textContent = `${kb} KB`;
-      document.getElementById("m-muls").textContent = muls.toLocaleString();
-      document.getElementById("m-gates").textContent = gates.toLocaleString();
-      document.getElementById("m-ppl").textContent = hppl;
-      document.getElementById("m-steps").textContent = steps.toLocaleString();
-      document.getElementById("foot-muls").innerHTML = `ブロック乗算: <b>${muls.toLocaleString()}</b>`;
-      document.getElementById("attn-caption").textContent = info.mux
-        ? "Causal Attention — L3-C ハードウェア MUX（各行 1 マスのみ点灯）"
-        : `Causal Attention — ${rung.toUpperCase()} Softmax 確率分布`;
+      document.getElementById("load-stat").textContent = `${activeRung.toUpperCase()} 準備完了`;
+      document.getElementById("m-size").textContent = fmtKB(sizes[activeRung] || 0);
+      document.getElementById("m-muls").textContent = fmtNum(muls);
+      document.getElementById("m-muls").classList.toggle("hi", muls === 0);
+      document.getElementById("m-gates").textContent = fmtNum(gates);
+      document.getElementById("m-ppl").textContent = hardPpl.toFixed(2);
+      document.getElementById("m-steps").textContent = fmtNum(steps);
+      document.getElementById("vocab-sub").textContent = `BPE ${vocab}`;
+      document.getElementById("arch-tagline").textContent = `BPE ${vocab} · ${nLayers}層 d=${dModel} · Metal GPU 蒸留 · ${muls === 0 ? "0 ブロック乗算" : `${fmtNum(muls)} 乗算`}`;
+      document.getElementById("attn-caption").textContent = activeRung === "l3c" ? "L3-C ハードウェア MUX" : `${activeRung.toUpperCase()} Causal Attention`;
+      document.getElementById("attn-note").textContent = activeRung === "l3c" ? "各行 1 マスのみ点灯（乗算 0）" : "Softmax 確率分布";
+      rebuildLayerHeadButtons(h);
     }
 
-    function fmtTokLabel(s) {
-      return s.replace(/\n/g, "↵").replace(/ /g, "␣");
-    }
-
-    function renderBpeStrip() {
-      const strip = document.getElementById("bpe-strip");
-      strip.innerHTML = `<span class="bpe-label">BPE (${lastWindowTokens.length}):</span>`;
-      const show = lastWindowTokens.slice(-24);
-      const offset = lastWindowTokens.length - show.length;
-      show.forEach((tok, idx) => {
-        const sp = document.createElement("span");
-        sp.className = "bpe-tok" + (offset + idx >= promptTokCount ? " bpe-tok--out" : "");
-        sp.textContent = fmtTokLabel(tok);
-        strip.appendChild(sp);
+    function renderBpeStrip(tokens, promptCount) {
+      const el = document.getElementById("bpe-strip");
+      el.innerHTML = "";
+      const tail = tokens.length > 26 ? tokens.slice(tokens.length - 26) : tokens;
+      const offset = tokens.length - tail.length;
+      tail.forEach((tok, idx) => {
+        const s = document.createElement("span");
+        s.className = (offset + idx >= promptCount) ? "bpe-tok bpe-tok--gen" : "bpe-tok";
+        s.textContent = prettyTok(tok);
+        el.appendChild(s);
       });
     }
 
     function renderTop5(h) {
       const list = document.getElementById("top5-list");
       list.innerHTML = "";
+      if (!h) return;
       for (let r = 0; r < 5; r++) {
         const pm = ex.ladder_top_bpe(h, r);
-        const pct = pm / 10;
-        const lbl = fmtTokLabel(decoder.decode(lastPieceBytes) || "?");
+        const tok = prettyTok(decoder.decode(lastPieceBytes));
+        const pct = (pm / 10).toFixed(1);
         const row = document.createElement("div");
-        row.className = "t5-row";
-        row.innerHTML =
-          `<span class="t5-tok">${lbl.replace(/</g, "&lt;")}</span>` +
-          `<div class="track"><div class="fill ${r === 0 ? "fill--acc" : ""}" style="width:${Math.max(2, pct).toFixed(1)}%"></div></div>` +
-          `<span class="t5-p">${pct.toFixed(1)}%</span>`;
+        row.className = "top5__row";
+        row.innerHTML = `
+          <span class="top5__tok" title="${escapeHtml(tok)}">${escapeHtml(tok)}</span>
+          <span class="top5__bar"><span class="top5__fill" style="width:${Math.min(100, pm / 10)}%"></span></span>
+          <span class="top5__pct">${pct}%</span>
+        `;
         list.appendChild(row);
       }
     }
 
-    function renderAttention(h, rung) {
+    function drawAttention(h, tokens) {
       const svg = document.getElementById("attn-svg");
       svg.innerHTML = "";
-      const n = lastWindowTokens.length;
-      if (n <= 0) return;
+      if (!h || !tokens || tokens.length === 0) return;
+      const total = tokens.length;
+      const show = Math.min(total, 16);
+      const start = total - show;
+      const padL = 44, padT = 34, size = 266;
+      const cell = size / show;
+      const ns = "http://www.w3.org/2000/svg";
+      const isMux = activeRung === "l3c";
 
-      // Show last up to 22 tokens cleanly so labels remain legible
-      const maxShow = Math.min(n, 22);
-      const start = n - maxShow;
-      const W = 600, H = 280;
-      const left = 54, top = 28, right = 14, bot = 12;
-      const cell = Math.min((W - left - right) / maxShow, (H - top - bot) / maxShow);
-      const ox = left + Math.max(0, ((W - left - right) - cell * maxShow) * 0.5);
-      const oy = top;
-      const isMux = rung === "l3c";
+      for (let i = 0; i < show; i++) {
+        const label = prettyTok(tokens[start + i]).slice(0, 4);
+        const ty = document.createElementNS(ns, "text");
+        ty.setAttribute("x", padL - 4);
+        ty.setAttribute("y", padT + i * cell + cell * 0.65);
+        ty.setAttribute("text-anchor", "end");
+        ty.setAttribute("font-size", Math.max(7, Math.min(9.5, cell * 0.5)));
+        ty.setAttribute("font-family", "var(--mono)");
+        ty.setAttribute("fill", "#68665e");
+        ty.textContent = label;
+        svg.appendChild(ty);
 
-      for (let i = 0; i < maxShow; i++) {
-        const lbl = fmtTokLabel(lastWindowTokens[start + i]).slice(0, 4);
-        // Column header (Key)
-        svg.appendChild(svgEl("text", {
-          x: ox + (i + 0.5) * cell, y: oy - 6,
-          "text-anchor": "middle", "font-family": "var(--mono), var(--jp)",
-          "font-size": Math.min(9.5, Math.max(6.5, cell * 0.42)),
-          fill: start + i >= promptTokCount ? "#ff4d00" : "#68665e",
-        }, lbl));
-        // Row header (Query)
-        svg.appendChild(svgEl("text", {
-          x: ox - 5, y: oy + (i + 0.65) * cell,
-          "text-anchor": "end", "font-family": "var(--mono), var(--jp)",
-          "font-size": Math.min(9.5, Math.max(6.5, cell * 0.42)),
-          fill: start + i >= promptTokCount ? "#141412" : "#68665e",
-        }, lbl));
+        const tx = document.createElementNS(ns, "text");
+        tx.setAttribute("x", padL + i * cell + cell * 0.5);
+        tx.setAttribute("y", padT - 6);
+        tx.setAttribute("text-anchor", "middle");
+        tx.setAttribute("font-size", Math.max(7, Math.min(9.5, cell * 0.5)));
+        tx.setAttribute("font-family", "var(--mono)");
+        tx.setAttribute("fill", (start + i >= lastPromptTokenCount) ? "#ff4d00" : "#68665e");
+        tx.textContent = label;
+        svg.appendChild(tx);
 
-        for (let j = 0; j < maxShow; j++) {
-          const qi = start + i, kj = start + j;
-          if (kj > qi) continue;
-          const w = ex.ladder_attn_milli(h, curLayer, curHead, qi, kj) / 1000;
-          let fill = "#f2f0e9";
+        for (let j = 0; j <= i; j++) {
+          const w = ex.ladder_attn_milli(h, activeLayer, activeHead, start + i, start + j) / 1000;
+          const rect = document.createElementNS(ns, "rect");
+          rect.setAttribute("x", padL + j * cell + 0.8);
+          rect.setAttribute("y", padT + i * cell + 0.8);
+          rect.setAttribute("width", Math.max(2, cell - 1.6));
+          rect.setAttribute("height", Math.max(2, cell - 1.6));
+          rect.setAttribute("rx", isMux ? 2.5 : 1.5);
           if (isMux) {
-            fill = w > 0.5 ? "#ff4d00" : "#efede6";
+            rect.setAttribute("fill", w >= 0.5 ? "#ff4d00" : "#ebe8df");
           } else {
-            const a = Math.min(1, Math.pow(w, 0.65));
-            const r = Math.round(242 + (255 - 242) * a);
-            const g = Math.round(240 + (77 - 240) * a);
-            const b = Math.round(233 + (0 - 233) * a);
-            fill = `rgb(${r},${g},${b})`;
+            const alpha = Math.max(0.06, Math.min(1, w * 1.45));
+            rect.setAttribute("fill", `rgba(255, 77, 0, ${alpha.toFixed(3)})`);
           }
-          svg.appendChild(svgEl("rect", {
-            x: ox + j * cell + 0.6,
-            y: oy + i * cell + 0.6,
-            width: Math.max(1, cell - 1.2),
-            height: Math.max(1, cell - 1.2),
-            rx: isMux ? 1.5 : 0.8,
-            fill,
-            stroke: (isMux && w > 0.5) ? "#141412" : "#e3e0d6",
-            "stroke-width": (isMux && w > 0.5) ? 0.8 : 0.4,
-          }));
+          svg.appendChild(rect);
         }
       }
     }
 
-    function evalPromptBytes(h, bytesUint8) {
-      slotBuffers[1] = bytesUint8;
-      return ex.ladder_eval_bytes(h, bytesUint8.byteLength);
+    async function loadRung(rung) {
+      if (handles[rung]) return handles[rung];
+      if (loadingRungs[rung]) return loadingRungs[rung];
+      loadingRungs[rung] = (async () => {
+        const info = RUNG_INFO[rung];
+        if (rung === activeRung) {
+          document.getElementById("load-stat").textContent = `${rung.toUpperCase()} 読込中…`;
+        }
+        const res = await fetch(info.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = new Uint8Array(await res.arrayBuffer());
+        sizes[rung] = buf.length;
+        slots[0] = buf;
+        const h = ex.ladder_load(buf.length) >>> 0;
+        if (!h) throw new Error("ladder_load failed");
+        handles[rung] = h;
+        return h;
+      })().finally(() => { delete loadingRungs[rung]; });
+      return loadingRungs[rung];
     }
 
-    function decodeCleanUtf8(bytesArr) {
-      const s = decoder.decode(new Uint8Array(bytesArr)).split("\n")[0];
-      return s.replace(/\uFFFD/g, "");
+    async function evalBytesOn(h, bytes) {
+      slots[1] = bytes;
+      return ex.ladder_eval_bytes(h, bytes.length);
     }
 
-    function stopGen() {
-      generating = false;
-      if (genTimer) { clearTimeout(genTimer); genTimer = 0; }
-      document.getElementById("btn-gen").textContent = "生成";
-    }
-
-    function renderHistory() {
-      const box = document.getElementById("hist-list");
-      box.innerHTML = "";
-      for (const item of recentHist.slice(0, 4)) {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "hist-item";
-        b.innerHTML = `<span class="h-meta">${item.mode} · ${item.rung.toUpperCase()}</span><span class="h-txt">${item.out.replace(/</g, "&lt;")}</span>`;
-        b.onclick = () => {
-          curMode = item.mode;
-          document.querySelectorAll("#mode-grid button").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === curMode)));
-          document.getElementById("mode-tag").textContent = curMode;
-          renderPresets();
-          document.getElementById("jp-in").value = item.src;
-          runGenerate();
-        };
-        box.appendChild(b);
+    async function sendMessage(rawText) {
+      if (generating) {
+        stopFlag = true;
+        return;
       }
-    }
+      const userText = (rawText || "").trim();
+      if (!userText) return;
 
-    async function runGenerate() {
-      if (!ex) return;
-      if (generating) { stopGen(); return; }
+      const h = await loadRung(activeRung);
+      updateMetrics();
+      lastUserInput = userText;
+      document.getElementById("jp-in").value = "";
+      addUserBubble(userText);
 
-      const h = await ensureModel(curRung);
-      const src = (document.getElementById("jp-in").value || "").trim() || "今日めっちゃ眠い";
-      const prefix = `${curMode} ${src}\n=> `;
-      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
-
-      document.getElementById("out-tag").textContent = curMode;
-      document.getElementById("out-src").textContent = src;
-      document.getElementById("out-status").textContent = "生成中…";
-      document.getElementById("out-text").innerHTML = `<span class="caret"></span>`;
+      const seqLen = ex.ladder_meta(h, 2);
+      const promptBytes = buildPromptBytes(activeMode, userText, chatTurns, seqLen);
+      const ui = createAiBubble(activeRung, activeMode);
 
       generating = true;
-      document.getElementById("btn-gen").textContent = "停止";
+      stopFlag = false;
+      const sendBtn = document.getElementById("btn-gen");
+      sendBtn.textContent = "停止";
+      sendBtn.classList.add("is-stop");
 
-      // Accumulate raw UTF-8 bytes (never roundtrip partial multi-byte kanji through TextDecoder!)
-      const fullBytes = Array.from(encoder.encode(prefix));
-      const outBytes = [];
-      let steps = 0;
-      const maxToks = 44;
-      runSeed = (runSeed + 17) >>> 0;
-      let totalMs = 0;
+      const tempMilli = Math.round(getTemp() * 1000);
+      const seed = ((Date.now() ^ (userText.length * 2654435761)) >>> 0) || 1337;
+      let fullBytes = promptBytes;
+      let genBytes = new Uint8Array(0);
 
-      const initLen = evalPromptBytes(h, new Uint8Array(fullBytes));
-      promptTokCount = initLen;
-      updateModelStats(h, curRung, initLen);
-      renderBpeStrip();
-      renderTop5(h);
-      renderAttention(h, curRung);
+      const pToks = await evalBytesOn(h, fullBytes);
+      lastPromptTokenCount = pToks;
+      document.getElementById("ctx-stat").textContent = `${pToks} / ${seqLen} tok`;
 
-      function stepOnce() {
-        if (!generating) return;
-        const t0 = performance.now();
-        const tid = ex.ladder_sample_bpe(h, tempMilli, steps === 0 ? runSeed : 0);
-        const piece = new Uint8Array(lastPieceBytes);
-        let hasNl = (tid === 10);
-        for (const b of piece) {
-          fullBytes.push(b);
-          outBytes.push(b);
-          if (b === 10) hasNl = true;
+      const t0 = performance.now();
+      let generated = 0;
+      const maxNew = 54;
+      const feed = document.getElementById("chat-feed");
+
+      for (let i = 0; i < maxNew; i++) {
+        if (stopFlag) break;
+        const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? seed : 0);
+        if (tid < 0) break;
+        const piece = lastPieceBytes.slice();
+        if (tid === 10) {
+          if (generated > 0) break;
+          fullBytes = concatBytes(fullBytes, piece);
+          await evalBytesOn(h, fullBytes);
+          continue;
         }
-        const seqLen = evalPromptBytes(h, new Uint8Array(fullBytes));
-        totalMs += (performance.now() - t0);
-        steps++;
-
-        const outStr = decodeCleanUtf8(outBytes);
-        const hitStop = hasNl || steps >= maxToks;
-        document.getElementById("out-text").innerHTML =
-          outStr.replace(/</g, "&lt;") + (hitStop ? "" : `<span class="caret"></span>`);
-        document.getElementById("gen-speed").textContent = `${((steps * 1000) / Math.max(totalMs, 0.1)).toFixed(0)} tok/s`;
-
-        updateModelStats(h, curRung, seqLen);
-        renderBpeStrip();
-        renderTop5(h);
-        renderAttention(h, curRung);
-
-        if (hitStop) {
-          stopGen();
-          document.getElementById("out-status").textContent = `${steps} tok · ${totalMs.toFixed(1)} ms`;
-          if (outStr.trim()) {
-            recentHist.unshift({ mode: curMode, rung: curRung, src, out: outStr.trim() });
-            renderHistory();
-          }
-          return;
+        const nlIdx = piece.indexOf(10);
+        const take = nlIdx >= 0 ? piece.subarray(0, nlIdx) : piece;
+        if (take.length > 0) {
+          fullBytes = concatBytes(fullBytes, take);
+          genBytes = concatBytes(genBytes, take);
+          generated++;
         }
-        genTimer = setTimeout(stepOnce, 18);
+        if (nlIdx >= 0) {
+          ui.txtEl.textContent = decoder.decode(genBytes, { stream: false });
+          feed.scrollTop = feed.scrollHeight;
+          break;
+        }
+
+        const curText = decoder.decode(genBytes, { stream: false });
+        // Guard against starting a new turn marker inline
+        if (curText.includes("\nU:") || curText.includes("\n[")) {
+          const cut = curText.split(/\n(?:U:|\[)/)[0];
+          ui.txtEl.textContent = cut;
+          break;
+        }
+        ui.txtEl.textContent = curText;
+        feed.scrollTop = feed.scrollHeight;
+
+        const used = await evalBytesOn(h, fullBytes);
+        const dt = Math.max(0.1, performance.now() - t0);
+        document.getElementById("gen-speed").textContent = `${Math.round((generated * 1000) / dt)} tok/s`;
+        document.getElementById("ctx-stat").textContent = `${used} / ${seqLen} tok`;
+        ui.statEl.textContent = `${generated} tok · ${dt.toFixed(0)} ms`;
+
+        if (i % 3 === 0 || i === maxNew - 1) {
+          renderBpeStrip(lastWindowTokens, lastPromptTokenCount);
+          drawAttention(h, lastWindowTokens);
+          renderTop5(h);
+          await new Promise((r) => setTimeout(r, 12));
+        }
       }
-      genTimer = setTimeout(stepOnce, 10);
+
+      const finalReply = ui.txtEl.textContent.trim();
+      if (!finalReply) ui.txtEl.textContent = "（生成が空でした。もう一度お試しください）";
+      ui.curEl.remove();
+
+      const totalMs = Math.max(0.1, performance.now() - t0);
+      ui.statEl.textContent = `${generated} tok · ${totalMs.toFixed(0)} ms`;
+
+      if (activeMode === "[会話]" && finalReply) {
+        chatTurns.push({ u: userText, a: finalReply });
+        if (chatTurns.length > 6) chatTurns = chatTurns.slice(-6);
+      }
+
+      renderBpeStrip(lastWindowTokens, lastPromptTokenCount);
+      drawAttention(h, lastWindowTokens);
+      renderTop5(h);
+
+      generating = false;
+      stopFlag = false;
+      sendBtn.textContent = "送信";
+      sendBtn.classList.remove("is-stop");
+      document.getElementById("jp-in").focus();
     }
 
-    async function runCompare() {
-      const src = (document.getElementById("jp-in").value || "").trim() || "今日めっちゃ眠い";
-      const prefix = `${curMode} ${src}\n=> `;
-      const tempMilli = Number(document.getElementById("temp-range").value) * 10;
-      document.getElementById("cmp-prompt-label").textContent = `入力: ${curMode} ${src}`;
-      document.getElementById("cmp-l0-out").textContent = "L0 読込・生成中…";
-      document.getElementById("cmp-l0b-out").textContent = "L0b 読込・生成中…";
-      document.getElementById("cmp-l3-out").textContent = "L3-C 読込・生成中…";
+    async function runCompareAll() {
+      const btn = document.getElementById("btn-run-cmp");
+      btn.disabled = true;
+      const userText = (document.getElementById("jp-in").value.trim() || lastUserInput || "おはよう");
+      document.getElementById("cmp-prompt-label").textContent = `${activeMode} ${userText}`;
+      const tempMilli = Math.round(getTemp() * 1000);
+      const seed = 20261121;
 
-      const h0 = await ensureModel("l0");
-      const h0b = await ensureModel("l0b");
-      const h3 = await ensureModel("l3c");
-      const cmpSeed = (runSeed + 31) >>> 0;
-
-      const genOne = (h) => {
-        const fullBytes = Array.from(encoder.encode(prefix));
-        const outB = [];
+      for (const [rung, outId, metaId, statId] of [
+        ["l0",  "cmp-l0-out",  "cmp-l0-meta",  "cmp-l0-stat"],
+        ["l0b", "cmp-l0b-out", "cmp-l0b-meta", "cmp-l0b-stat"],
+        ["l3c", "cmp-l3-out",  "cmp-l3-meta",  "cmp-l3-stat"],
+      ]) {
+        document.getElementById(outId).textContent = "読込・生成中…";
+        const h = await loadRung(rung);
+        const seqLen = ex.ladder_meta(h, 2);
+        let fullBytes = buildPromptBytes(activeMode, userText, [], seqLen);
+        let genBytes = new Uint8Array(0);
         const t0 = performance.now();
-        evalPromptBytes(h, new Uint8Array(fullBytes));
-        let n = 0;
-        for (let i = 0; i < 42; i++) {
-          const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? cmpSeed : 0);
-          let hasNl = (tid === 10);
-          for (const b of lastPieceBytes) {
-            fullBytes.push(b);
-            outB.push(b);
-            if (b === 10) hasNl = true;
+        await evalBytesOn(h, fullBytes);
+        let nTok = 0;
+        for (let i = 0; i < 48; i++) {
+          const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? seed : 0);
+          if (tid < 0) break;
+          const piece = lastPieceBytes.slice();
+          if (tid === 10) {
+            if (nTok > 0) break;
+            fullBytes = concatBytes(fullBytes, piece);
+            await evalBytesOn(h, fullBytes);
+            continue;
           }
-          n++;
-          if (hasNl) break;
-          evalPromptBytes(h, new Uint8Array(fullBytes));
+          const nlIdx = piece.indexOf(10);
+          const take = nlIdx >= 0 ? piece.subarray(0, nlIdx) : piece;
+          if (take.length > 0) {
+            fullBytes = concatBytes(fullBytes, take);
+            genBytes = concatBytes(genBytes, take);
+            nTok++;
+          }
+          if (nlIdx >= 0) break;
+          await evalBytesOn(h, fullBytes);
         }
-        const ms = performance.now() - t0;
-        return { text: decodeCleanUtf8(outB), ms, n, muls: ex.ladder_block_muls(h, 24) };
-      };
-
-      const r0 = genOne(h0);
-      const r0b = genOne(h0b);
-      const r3 = genOne(h3);
-      document.getElementById("cmp-l0-out").textContent = r0.text || "(空)";
-      document.getElementById("cmp-l0-meta").textContent = `${(modelSizes.l0 / 1024).toFixed(0)} KB · ${r0.ms.toFixed(1)} ms`;
-      document.getElementById("cmp-l0-stat").textContent = `ブロック乗算 ${r0.muls.toLocaleString()}/tok · ${r0.n} tok`;
-
-      document.getElementById("cmp-l0b-out").textContent = r0b.text || "(空)";
-      document.getElementById("cmp-l0b-meta").textContent = `${(modelSizes.l0b / 1024).toFixed(0)} KB · ${r0b.ms.toFixed(1)} ms`;
-      document.getElementById("cmp-l0b-stat").textContent = `ブロック乗算 ${r0b.muls.toLocaleString()}/tok · 2,304 ゲート`;
-
-      document.getElementById("cmp-l3-out").textContent = r3.text || "(空)";
-      document.getElementById("cmp-l3-meta").textContent = `${(modelSizes.l3c / 1024).toFixed(0)} KB · ${r3.ms.toFixed(1)} ms`;
-      document.getElementById("cmp-l3-stat").textContent = `ブロック乗算 0/tok · 3,456 ゲート · MUX`;
+        const dt = performance.now() - t0;
+        const muls = ex.ladder_block_muls(h, seqLen);
+        const gates = ex.ladder_meta(h, 9);
+        const ppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
+        document.getElementById(outId).textContent = decoder.decode(genBytes).trim() || "—";
+        document.getElementById(metaId).textContent = `${fmtKB(sizes[rung])} · PPL ${ppl}`;
+        document.getElementById(statId).textContent = `乗算 ${fmtNum(muls)} · ゲート ${fmtNum(gates)} · ${nTok}tok ${dt.toFixed(0)}ms`;
+      }
+      btn.disabled = false;
     }
 
-    // UI イベント
-    document.querySelectorAll("#mode-grid button").forEach((b) => {
-      b.onclick = () => {
-        curMode = b.dataset.mode;
-        document.querySelectorAll("#mode-grid button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-        document.getElementById("mode-tag").textContent = curMode;
-        renderPresets();
-        const defaults = PRESETS_BY_MODE[curMode];
-        if (curMode === "[会話]" && !defaults.includes(document.getElementById("jp-in").value)) {
-          document.getElementById("jp-in").value = defaults[0];
-        }
-        runGenerate();
-      };
-    });
+    function selectMode(mode) {
+      if (generating) stopFlag = true;
+      activeMode = mode;
+      document.querySelectorAll("#mode-grid .mode-btn").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === mode)));
+      document.querySelectorAll("#mobile-bar [data-mmode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mmode === mode)));
+      document.getElementById("mode-tag").textContent = activeMode;
+      renderPresets();
+      resetChat();
+    }
 
-    document.querySelectorAll("#rung-row button").forEach((b) => {
-      b.onclick = () => {
-        curRung = b.dataset.rung;
-        document.querySelectorAll("#rung-row button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-        runGenerate();
-      };
-    });
+    async function selectRung(rung) {
+      if (generating) stopFlag = true;
+      activeRung = rung;
+      document.querySelectorAll("#rung-row .rung-btn").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.rung === rung)));
+      document.querySelectorAll("#mobile-bar [data-mrung]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mrung === rung)));
+      await loadRung(activeRung);
+      updateMetrics();
+      addSysMsg(`モデルを ${RUNG_INFO[activeRung].name}（${RUNG_INFO[activeRung].badge}）に切り替えました`);
+    }
 
-    document.querySelectorAll("#layer-btns button").forEach((b) => {
-      b.onclick = () => {
-        curLayer = Number(b.dataset.l);
-        document.querySelectorAll("#layer-btns button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-        if (handles[curRung]) renderAttention(handles[curRung], curRung);
-      };
-    });
-
-    document.querySelectorAll("#head-btns button").forEach((b) => {
-      b.onclick = () => {
-        curHead = Number(b.dataset.h);
-        document.querySelectorAll("#head-btns button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-        if (handles[curRung]) renderAttention(handles[curRung], curRung);
-      };
-    });
+    // Wire UI
+    document.querySelectorAll("#mode-grid .mode-btn").forEach((b) => { b.onclick = () => selectMode(b.dataset.mode); });
+    document.querySelectorAll("#mobile-bar [data-mmode]").forEach((b) => { b.onclick = () => selectMode(b.dataset.mmode); });
+    document.querySelectorAll("#rung-row .rung-btn").forEach((b) => { b.onclick = () => selectRung(b.dataset.rung); });
+    document.querySelectorAll("#mobile-bar [data-mrung]").forEach((b) => { b.onclick = () => selectRung(b.dataset.mrung); });
 
     document.getElementById("temp-range").oninput = (e) => {
       document.getElementById("temp-val").textContent = (Number(e.target.value) / 100).toFixed(2);
     };
-    document.getElementById("jp-in").addEventListener("keydown", (e) => { if (e.key === "Enter") runGenerate(); });
-    document.getElementById("btn-gen").onclick = runGenerate;
 
-    // シート
-    const sheet = document.getElementById("sheet"), btnCmp = document.getElementById("btn-cmp"), btnAbout = document.getElementById("btn-about");
+    document.getElementById("chat-form").onsubmit = (e) => {
+      e.preventDefault();
+      if (generating) {
+        stopFlag = true;
+        return;
+      }
+      sendMessage(document.getElementById("jp-in").value);
+    };
+
+    document.getElementById("btn-clear-chat").onclick = resetChat;
+
+    // Inspector toggle
+    const desk = document.getElementById("desk");
+    const btnInsp = document.getElementById("btn-inspector");
+    btnInsp.onclick = () => {
+      const narrow = window.innerWidth <= 1120;
+      if (narrow) {
+        const show = !desk.classList.contains("show-inspector");
+        desk.classList.toggle("show-inspector", show);
+        btnInsp.setAttribute("aria-expanded", String(show));
+      } else {
+        const hide = !desk.classList.contains("hide-inspector");
+        desk.classList.toggle("hide-inspector", hide);
+        btnInsp.setAttribute("aria-expanded", String(!hide));
+      }
+    };
+
+    // Modal sheet
+    const sheet = document.getElementById("sheet");
+    const btnCmp = document.getElementById("btn-cmp");
+    const btnAbout = document.getElementById("btn-about");
+    let sheetTab = "cmp";
+
     function openSheet(tab) {
-      sheetTab = tab; sheet.hidden = false;
-      btnCmp.setAttribute("aria-expanded", String(tab === "cmp"));
-      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
-      document.querySelectorAll(".sheet__tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+      sheetTab = tab;
+      sheet.hidden = false;
       document.getElementById("tab-cmp").hidden = tab !== "cmp";
       document.getElementById("tab-about").hidden = tab !== "about";
-      if (tab === "cmp" && ex) runCompare();
+      document.querySelectorAll(".sheet__tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+      btnCmp.setAttribute("aria-expanded", String(tab === "cmp"));
+      btnAbout.setAttribute("aria-expanded", String(tab === "about"));
+      if (tab === "cmp" && document.getElementById("cmp-l0-out").textContent === "—") {
+        runCompareAll();
+      }
     }
-    function closeSheet() { sheet.hidden = true; btnCmp.setAttribute("aria-expanded", "false"); btnAbout.setAttribute("aria-expanded", "false"); }
+    function closeSheet() {
+      sheet.hidden = true;
+      btnCmp.setAttribute("aria-expanded", "false");
+      btnAbout.setAttribute("aria-expanded", "false");
+    }
+
     btnCmp.onclick = () => (!sheet.hidden && sheetTab === "cmp") ? closeSheet() : openSheet("cmp");
     btnAbout.onclick = () => (!sheet.hidden && sheetTab === "about") ? closeSheet() : openSheet("about");
     document.getElementById("open-cmp").onclick = () => openSheet("cmp");
-    document.getElementById("btn-run-cmp").onclick = runCompare;
+    document.getElementById("btn-run-cmp").onclick = runCompareAll;
     document.getElementById("sheet-close").onclick = closeSheet;
-    sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+    sheet.onclick = (e) => { if (e.target === sheet) closeSheet(); };
     document.querySelectorAll(".sheet__tabs button").forEach((b) => { b.onclick = () => openSheet(b.dataset.tab); });
     window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
 
     async function boot() {
       renderPresets();
-      const wasmResp = await fetch("../dist/app.wasm");
-      const kb = `${((await wasmResp.arrayBuffer()).byteLength / 1024).toFixed(0)} KB`;
-      const program = await instantiate({
+      const inst = await instantiate({
         write() { return true; },
         host: {
           read_input(host, slot, offset, ptr, cap) {
-            const src = slotBuffers[slot];
+            const src = slots[slot];
             if (!src || offset >= src.byteLength) return 0;
             const end = Math.min(src.byteLength, offset + (cap >>> 0));
             return host.writeBytes(ptr, src.subarray(offset, end));
           },
           give_bytes(host, kind, ptr, len) {
             const raw = new Uint8Array(host.readBytes(ptr, len));
-            if (kind === 2) {
-              lastPieceBytes = raw;
-            } else if (kind === 3) {
-              // NUL-separated UTF-8 BPE token strings
-              const toks = [];
-              let s = 0;
-              for (let i = 0; i <= raw.length; i++) {
-                if (i === raw.length || raw[i] === 0) {
-                  toks.push(decoder.decode(raw.subarray(s, i)));
-                  s = i + 1;
-                }
-              }
-              lastWindowTokens = toks;
-            }
+            if (kind === 2) lastPieceBytes = raw;
+            else if (kind === 3) lastWindowTokens = parseNulTokens(raw);
           },
         },
       });
-      program.start();
-      ex = program.exports;
-      document.getElementById("foot-stat").textContent = `${kb} .wasm · kizu wasm32-browser`;
-      try {
-        await ensureModel("l0b");
-        runGenerate();
-      } catch (err) {
-        document.getElementById("out-text").textContent = `モデル読込エラー: ${err.message}`;
-      }
+      const startStatus = inst.start();
+      if (startStatus !== 0) throw new Error(`kizu_start failed: ${startStatus}`);
+      ex = inst.exports;
+      await loadRung(activeRung);
+      updateMetrics();
+      resetChat();
+      // Background prefetch remaining rungs so mid-chat switching is instant
+      loadRung("l3c").catch(() => {});
+      loadRung("l0").catch(() => {});
     }
 
-    boot();
+    boot().catch((err) => {
+      console.error(err);
+      document.getElementById("load-stat").textContent = "初期化失敗";
+      addSysMsg(`読込エラー: ${err.message}`);
+    });
   </script>
 </body>
 </html>

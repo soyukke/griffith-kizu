@@ -79,6 +79,7 @@ fn gpu_block_forward(
     x_out: &var []f32,
     tmp_proj: &var []f32,
     mode: model::EvalMode,
+    force_soft_attn: bool,
     rng: &var core::Rng
 ) -> gpu::MetalError!void {
     let bt = batch * seq_len;
@@ -98,7 +99,7 @@ fn gpu_block_forward(
         EvalSoft => { is_eval_soft = true; },
         EvalHard => {},
     }
-    let use_mux = use_mux_rung and !is_eval_soft;
+    let use_mux = use_mux_rung and !is_eval_soft and !force_soft_attn;
 
     let sc = blk.scalars.as_slice();
     let score_scale = sc[0];
@@ -129,7 +130,7 @@ fn gpu_block_forward(
     var scores = [128]f32{};
     let sc_buf = scores.as_mut_slice();
     let half_dk = cast<f32>(dk) * 0.5;
-    let inv_tau = 1.0 / blk.attn_tau;
+    let inv_tau: f32 = cast<f32>(1.0) / blk.attn_tau;
 
     for 0..batch |b| {
         for 0..n_heads |h| {
@@ -164,7 +165,7 @@ fn gpu_block_forward(
                     var best_v: f32 = -1e30;
                     for 0..(t + 1) |s| {
                         var noisy = sc_buf[s];
-                        if is_train {
+                        if is_train and blk.attn_gumbel_scale > 0.0 {
                             noisy = noisy + blk.attn_gumbel_scale * rng.next_gumbel_f32();
                         } else {
                             noisy = noisy + 1e-4 * cast<f32>(s) / cast<f32>(seq_len);
@@ -192,13 +193,18 @@ fn gpu_block_forward(
                         for (t + 1)..seq_len |s| { a_soft[row_off + s] = 0.0; }
                     }
                     let vw_off = (b * seq_len + best_s) * d + h_off;
-                    for 0..dk |j| { ctx_s[qt_off + j] = 2.0 * v_s[vw_off + j] - 1.0; }
+                    // Hardware MUX Value Skip: pure 0-mul MUX selects ln1[best_s] + Logic LUT binary residual!
+                    for 0..dk |j| { ctx_s[qt_off + j] = 0.5 * ln1_s[vw_off + j] + 0.5 * (2.0 * v_s[vw_off + j] - 1.0); }
                 } else {
-                    var max_s = sc_buf[0];
-                    for 1..(t + 1) |s| { if sc_buf[s] > max_s { max_s = sc_buf[s]; } }
+                    let s_scale: f32 = if force_soft_attn { inv_tau } else { cast<f32>(1.0) };
+                    var max_s = sc_buf[0] * s_scale;
+                    for 1..(t + 1) |s| {
+                        let v = sc_buf[s] * s_scale;
+                        if v > max_s { max_s = v; }
+                    }
                     var sum_e: f64 = 0.0;
                     for 0..(t + 1) |s| {
-                        let e = math::exp<f64>(cast<f64>(sc_buf[s] - max_s));
+                        let e = math::exp<f64>(cast<f64>(sc_buf[s] * s_scale - max_s));
                         a_soft[row_off + s] = cast<f32>(e);
                         sum_e = sum_e + e;
                     }
@@ -214,7 +220,8 @@ fn gpu_block_forward(
                         if use_lqkv {
                             for 0..(t + 1) |s| {
                                 let vs_off = (b * seq_len + s) * d + h_off;
-                                acc = acc + a_soft[row_off + s] * (2.0 * v_s[vs_off + j] - 1.0);
+                                let vval = 0.5 * ln1_s[vs_off + j] + 0.5 * (2.0 * v_s[vs_off + j] - 1.0);
+                                acc = acc + a_soft[row_off + s] * vval;
                             }
                         } else {
                             for 0..(t + 1) |s| {
@@ -264,6 +271,7 @@ fn gpu_block_backward(
     grad_out: []f32,
     batch: i64,
     seq_len: i64,
+    force_soft_attn: bool,
     grad_in: &var []f32,
     g_tmp1: &var []f32,
     g_tmp2: &var []f32,
@@ -325,8 +333,9 @@ fn gpu_block_backward(
         try gpu_linear_bwd_layer(ctx, &var blk.wo, g_tmp3, g_tmp1, true);
     }
 
-    for 0..(bt * d) |i| { g_q[i] = 0.0; g_k[i] = 0.0; g_v[i] = 0.0; }
+    for 0..(bt * d) |i| { g_q[i] = 0.0; g_k[i] = 0.0; g_v[i] = 0.0; g_tmp2[i] = 0.0; }
 
+    let ln1_s = blk.buf_ln1.as_slice();
     let q_s = blk.buf_q.as_slice();
     let k_s = blk.buf_k.as_slice();
     let v_s = blk.buf_v.as_slice();
@@ -336,7 +345,7 @@ fn gpu_block_backward(
     var grad_w = [128]f32{};
     let gw_buf = grad_w.as_mut_slice();
     let half_dk = cast<f32>(dk) * 0.5;
-    let inv_tau: f32 = if use_mux { cast<f32>(1.0) / blk.attn_tau } else { cast<f32>(1.0) };
+    let inv_tau: f32 = if use_mux or force_soft_attn { cast<f32>(1.0) / blk.attn_tau } else { cast<f32>(1.0) };
     var g_score_scale: f64 = 0.0;
 
     for 0..batch |b| {
@@ -355,8 +364,10 @@ fn gpu_block_backward(
                     if use_lqkv {
                         for 0..dk |j| {
                             let gc = g_tmp1[qt_off + j];
-                            dw = dw + gc * (2.0 * v_s[vs_off + j] - 1.0);
-                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc * 2.0;
+                            let vval = 0.5 * ln1_s[vs_off + j] + 0.5 * (2.0 * v_s[vs_off + j] - 1.0);
+                            dw = dw + gc * vval;
+                            g_v[vs_off + j] = g_v[vs_off + j] + w_fwd * gc;
+                            g_tmp2[vs_off + j] = g_tmp2[vs_off + j] + w_fwd * gc * 0.5;
                         }
                     } else {
                         for 0..dk |j| {
@@ -408,14 +419,16 @@ fn gpu_block_backward(
     }
     if use_lqkv { gsc[0] = gsc[0] + cast<f32>(g_score_scale); }
 
-    let ln1_s = blk.buf_ln1.as_slice();
     if use_lqkv {
         try gpu::metal_lut_warp_bwd(ctx, &var blk.lq, g_q, g_tmp1, true);
+        // Save g_ln1_skip (accumulated in g_tmp2) into now-free g_q before lk/lv backward reuses g_tmp2
+        for 0..(bt * d) |i| { g_q[i] = g_tmp2[i]; }
         try gpu::metal_lut_warp_bwd(ctx, &var blk.lk, g_k, g_tmp2, true);
         for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
         try gpu::metal_lut_warp_bwd(ctx, &var blk.lv, g_v, g_tmp2, true);
         for 0..(bt * d) |i| { g_tmp1[i] = g_tmp1[i] + g_tmp2[i]; }
         model::binarize_backward_ste(ln1_s, g_tmp1, g_tmp2, bt * d);
+        for 0..(bt * d) |i| { g_tmp2[i] = g_tmp2[i] + g_q[i]; }
         model::layernorm_backward(&var blk.ln1, g_tmp2, g_tmp1);
     } else {
         try gpu_linear_bwd_layer(ctx, &var blk.wq, g_q, g_tmp1, true);
@@ -439,6 +452,7 @@ fn gpu_ladder_forward(
     seq_len: i64,
     logits_out: &var []f32,
     mode: model::EvalMode,
+    force_soft_attn: bool,
     rng: &var core::Rng
 ) -> gpu::MetalError!void {
     let d = m.cfg.d_model;
@@ -467,7 +481,7 @@ fn gpu_ladder_forward(
         let out_off = (l + 1) * stride;
         for 0..(bt * d) |i| { x_in_buf[i] = xs[in_off + i]; }
         if m.blocks.at_mut(l) |blk| {
-            try gpu_block_forward(ctx, blk, x_in_buf, batch, seq_len, x_out_buf, tmp_p, mode, rng);
+            try gpu_block_forward(ctx, blk, x_in_buf, batch, seq_len, x_out_buf, tmp_p, mode, force_soft_attn, rng);
         }
         for 0..(bt * d) |i| { xs[out_off + i] = x_out_buf[i]; }
     }
@@ -486,6 +500,7 @@ fn gpu_ladder_backward(
     tokens: []i32,
     batch: i64,
     seq_len: i64,
+    force_soft_attn: bool,
     grad_logits: []f32
 ) -> gpu::MetalError!void {
     let d = m.cfg.d_model;
@@ -506,7 +521,7 @@ fn gpu_ladder_backward(
     var l = m.cfg.n_layers - 1;
     while l >= 0 {
         if m.blocks.at_mut(l) |blk| {
-            try gpu_block_backward(ctx, blk, gc, batch, seq_len, gp, gt1, gt2, gt3, gq, gk, gv);
+            try gpu_block_backward(ctx, blk, gc, batch, seq_len, force_soft_attn, gp, gt1, gt2, gt3, gq, gk, gv);
         }
         for 0..(bt * d) |i| { gc[i] = gp[i]; }
         l = l - 1;
@@ -530,9 +545,221 @@ fn gpu_ladder_backward(
     return;
 }
 
-/// Collects token indices where each example begins (after "\n\n", or index 0).
+fn copy_f32_arr(dst: &var array::Array<f32>, src: &array::Array<f32>) -> void {
+    let dl = dst.len();
+    let sl = src.len();
+    let n = if dl < sl { dl } else { sl };
+    let ds = dst.as_mut_slice();
+    let ss = src.as_slice();
+    for 0..n |i| { ds[i] = ss[i]; }
+    return;
+}
+
+/// Copies a discretized LUT layer (exact wiring + inverse-FWHT Walsh-Hadamard weights) into a trainable WARP LutLayer.
+fn copy_discrete_lut_into_warp(
+    allocator: Allocator,
+    src: &lut::DiscreteLutLayer,
+    dst: &var lut::LutLayer,
+    amp: f32
+) -> mem::Error!void {
+    if src.in_dim != dst.in_dim or src.out_dim != dst.out_dim or src.n_inputs != dst.n_inputs {
+        return;
+    }
+    let total_edges = src.out_dim * src.n_inputs;
+    var idx_copy = try core::alloc_i32(allocator, total_edges);
+    errdefer idx_copy.deinit(allocator);
+    let src_idx = src.indices.as_slice();
+    let dst_idx = idx_copy.as_mut_slice();
+    for 0..total_edges |e| { dst_idx[e] = src_idx[e]; }
+    var new_conn = try lut::build_connections_from_indices(
+        allocator, src.in_dim, src.out_dim, src.n_inputs, move idx_copy
+    );
+    defer new_conn.deinit(allocator);
+    let di = dst.conn.indices.as_mut_slice();
+    let si = new_conn.indices.as_slice();
+    for 0..total_edges |e| { di[e] = si[e]; }
+    let dro = dst.conn.rev_offsets.as_mut_slice();
+    let sro = new_conn.rev_offsets.as_slice();
+    for 0..(src.in_dim + 1) |k| { dro[k] = sro[k]; }
+    let drg = dst.conn.rev_gates.as_mut_slice();
+    let srg = new_conn.rev_gates.as_slice();
+    for 0..total_edges |e| { drg[e] = srg[e]; }
+    let drp = dst.conn.rev_pins.as_mut_slice();
+    let srp = new_conn.rev_pins.as_slice();
+    for 0..total_edges |e| { drp[e] = srp[e]; }
+
+    let basis_size = lut::pow2(src.n_inputs);
+    let inv_size = cast<f32>(1.0) / cast<f32>(basis_size);
+    let tt_s = src.truth_tables.as_slice();
+    let w_m = dst.weights.as_mut_slice();
+    var lg = [64]f32{};
+    let lg_m = lg.as_mut_slice();
+    for 0..src.out_dim |o| {
+        let tt = tt_s[o];
+        for 0..basis_size |e| {
+            let bit = (tt >> cast<u64>(e)) & cast<u64>(1);
+            lg_m[e] = if bit != 0 { amp } else { -amp };
+        }
+        // Inverse FWHT: theta = (1/2^N) * H * lg => H * theta == lg bit-for-bit!
+        lut::fwht_in_place(lg_m, src.n_inputs);
+        let w_off = o * dst.w_cols;
+        for 0..basis_size |i| {
+            w_m[w_off + i] = lg_m[i] * inv_size;
+        }
+    }
+    return;
+}
+
+/// Copies shared FP weights (and matching FP or Logic FFN blocks) from a loaded LadderRuntime teacher into a LogicLadderGPT.
+fn copy_runtime_into_model(
+    allocator: Allocator,
+    rt: &model::LadderRuntime,
+    m: &var model::LogicLadderGPT,
+    copy_fp_blocks: bool,
+    lut_amp: f32
+) -> mem::Error!void {
+    copy_f32_arr(&var m.tok_emb.w, &rt.tok_emb);
+    copy_f32_arr(&var m.pos_emb.w, &rt.pos_emb);
+    copy_f32_arr(&var m.final_ln.gamma, &rt.final_ln_g);
+    copy_f32_arr(&var m.final_ln.beta, &rt.final_ln_b);
+    copy_f32_arr(&var m.lm_head.w, &rt.lm_head_w);
+    copy_f32_arr(&var m.lm_head.b, &rt.lm_head_b);
+
+    let rt_fp_attn = !model::rung_uses_logic_qkv(rt.rung);
+    let m_fp_attn = !model::rung_uses_logic_qkv(m.cfg.rung);
+    let rt_fp_ffn = !model::rung_uses_logic_ffn(rt.rung);
+    let m_fp_ffn = !model::rung_uses_logic_ffn(m.cfg.rung);
+
+    for 0..m.cfg.n_layers |l| {
+        if rt.blocks.at(l) |rblk| {
+            if m.blocks.at_mut(l) |mblk| {
+                copy_f32_arr(&var mblk.ln1.gamma, &rblk.ln1_g);
+                copy_f32_arr(&var mblk.ln1.beta, &rblk.ln1_b);
+                copy_f32_arr(&var mblk.ln2.gamma, &rblk.ln2_g);
+                copy_f32_arr(&var mblk.ln2.beta, &rblk.ln2_b);
+                if copy_fp_blocks and rt_fp_attn and m_fp_attn {
+                    copy_f32_arr(&var mblk.wq.w, &rblk.wq_w);
+                    copy_f32_arr(&var mblk.wq.b, &rblk.wq_b);
+                    copy_f32_arr(&var mblk.wk.w, &rblk.wk_w);
+                    copy_f32_arr(&var mblk.wk.b, &rblk.wk_b);
+                    copy_f32_arr(&var mblk.wv.w, &rblk.wv_w);
+                    copy_f32_arr(&var mblk.wv.b, &rblk.wv_b);
+                    copy_f32_arr(&var mblk.wo.w, &rblk.wo_w);
+                    copy_f32_arr(&var mblk.wo.b, &rblk.wo_b);
+                }
+                if copy_fp_blocks and rt_fp_ffn and m_fp_ffn {
+                    copy_f32_arr(&var mblk.fc1.w, &rblk.fc1_w);
+                    copy_f32_arr(&var mblk.fc1.b, &rblk.fc1_b);
+                    copy_f32_arr(&var mblk.fc2.w, &rblk.fc2_w);
+                    copy_f32_arr(&var mblk.fc2.b, &rblk.fc2_b);
+                }
+                if !rt_fp_ffn and !m_fp_ffn {
+                    // Progressive Ladder warm-start: transfer trained Logic FFN LUTs (e.g. L0b -> L3-C)!
+                    try copy_discrete_lut_into_warp(allocator, &rblk.ffn_lut1, &var mblk.ffn_lut1, lut_amp);
+                    try copy_discrete_lut_into_warp(allocator, &rblk.ffn_lut2, &var mblk.ffn_lut2, lut_amp);
+                    let msc = mblk.scalars.as_mut_slice();
+                    msc[2] = rblk.scalars[2];
+                }
+                if !rt_fp_attn and !m_fp_attn {
+                    try copy_discrete_lut_into_warp(allocator, &rblk.lq, &var mblk.lq, lut_amp);
+                    try copy_discrete_lut_into_warp(allocator, &rblk.lk, &var mblk.lk, lut_amp);
+                    try copy_discrete_lut_into_warp(allocator, &rblk.lv, &var mblk.lv, lut_amp);
+                    let msc = mblk.scalars.as_mut_slice();
+                    msc[0] = rblk.scalars[0];
+                    msc[1] = rblk.scalars[1];
+                }
+            }
+        }
+    }
+    return;
+}
+
+/// Smoothly anneals LUT & MUX temperatures/noise in the stable regime (no late-step tau collapse).
+fn set_anneal_schedule(m: &var model::LogicLadderGPT, prog: f64) -> void {
+    let lut_tau = cast<f32>(1.15 - 0.55 * prog);
+    let lut_gumbel = if prog < 0.85 { cast<f32>(0.22 * (1.0 - prog / 0.85)) } else { cast<f32>(0.0) };
+    let lut_sel = lut::SelectMode::GumbelSt;
+
+    let attn_tau = if prog < 0.25 {
+        cast<f32>(1.20 - 1.6 * prog)
+    } else {
+        let p2 = (prog - 0.25) / 0.75;
+        cast<f32>(0.80 - 0.35 * p2)
+    };
+    let attn_gumbel = if prog < 0.25 {
+        cast<f32>(0.0)
+    } else if prog < 0.88 {
+        let p2 = (prog - 0.25) / 0.63;
+        cast<f32>(0.20 * (1.0 - p2))
+    } else {
+        cast<f32>(0.0)
+    };
+
+    for 0..m.cfg.n_layers |l| {
+        if m.blocks.at_mut(l) |blk| {
+            blk.attn_tau = attn_tau;
+            blk.attn_gumbel_scale = attn_gumbel;
+            blk.lq.tau = lut_tau;
+            blk.lq.gumbel_scale = lut_gumbel;
+            blk.lq.select_mode = lut_sel;
+            blk.lk.tau = lut_tau;
+            blk.lk.gumbel_scale = lut_gumbel;
+            blk.lk.select_mode = lut_sel;
+            blk.lv.tau = lut_tau;
+            blk.lv.gumbel_scale = lut_gumbel;
+            blk.lv.select_mode = lut_sel;
+            blk.ffn_lut1.tau = lut_tau;
+            blk.ffn_lut1.gumbel_scale = lut_gumbel;
+            blk.ffn_lut1.select_mode = lut_sel;
+            blk.ffn_lut2.tau = lut_tau;
+            blk.ffn_lut2.gumbel_scale = lut_gumbel;
+            blk.ffn_lut2.select_mode = lut_sel;
+        }
+    }
+    return;
+}
+
+/// Assigns 1.0 weight to assistant/response tokens (after "=> " or "A: ") and 0.15 to prompt/user tokens.
+fn fill_token_weights(
+    bpe: &data::BpeVocab,
+    tokens: []i32,
+    ws: &var []f32
+) -> void {
+    let n = mem::count<i32>(tokens);
+    // Line-start state: 0=at line start, 1=saw '=', 2=saw 'A', 3=in response line, 4=in prompt line
+    var st: i64 = 0;
+    for 0..n |i| {
+        let piece = data::bpe_token_bytes(bpe, tokens[i]);
+        let plen = mem::len(piece);
+        var is_resp = (st == 3);
+        for 0..plen |k| {
+            let b = piece[k];
+            if b == 10 {
+                if st == 3 { is_resp = true; }
+                st = 0;
+            } else if st == 0 {
+                if b == 61 { st = 1; }       // '='
+                else if b == 65 { st = 2; }  // 'A'
+                else { st = 4; }
+            } else if st == 1 {
+                if b == 62 { st = 3; is_resp = true; } // "=>"
+                else { st = 4; }
+            } else if st == 2 {
+                if b == 58 { st = 3; is_resp = true; } // "A:"
+                else { st = 4; }
+            } else if st == 3 {
+                is_resp = true;
+            }
+        }
+        ws[i] = if is_resp { cast<f32>(1.0) } else { cast<f32>(0.15) };
+    }
+    return;
+}
+
+/// Collects token indices where each example begins (detects "\n\n" across decoded BPE bytes, resilient to BPE merges).
 fn collect_example_starts(
     allocator: Allocator,
+    bpe: &data::BpeVocab,
     tokens: []i32,
     start_bound: i64,
     end_bound: i64,
@@ -544,11 +771,21 @@ fn collect_example_starts(
     if start_bound <= max_pos {
         try starts.append(allocator, start_bound);
     }
-    var i = start_bound + 2;
+    var nl_run: i64 = 0;
+    var i = start_bound;
     while i <= max_pos {
-        // "\n\n" followed by '[' (byte 91, or a BPE token starting after two '\n' tokens)
-        if tokens[i - 1] == 10 and tokens[i - 2] == 10 {
+        if nl_run >= 2 and i > start_bound {
             try starts.append(allocator, i);
+        }
+        let piece = data::bpe_token_bytes(bpe, tokens[i]);
+        let plen = mem::len(piece);
+        for 0..plen |k| {
+            let b = piece[k];
+            if b == 10 {
+                nl_run = nl_run + 1;
+            } else if b != 13 {
+                nl_run = 0;
+            }
         }
         i = i + 1;
     }
@@ -557,6 +794,7 @@ fn collect_example_starts(
 
 fn sample_aligned_batch(
     tokens: []i32,
+    tok_weights: []f32,
     starts: []i64,
     n_starts: i64,
     base: i64,
@@ -565,13 +803,14 @@ fn sample_aligned_batch(
     seq_len: i64,
     rng: &var core::Rng,
     x_out: &var []i32,
-    y_out: &var []i32
+    y_out: &var []i32,
+    w_out: &var []f32
 ) -> void {
     let safe_span = if span_len - seq_len - 1 > 1 { span_len - seq_len - 1 } else { 1 };
     for 0..batch |b| {
         var pos = base;
-        // 80% aligned to example start ([X訳]/[関西]/[津軽]/[会話] at t=0!), 20% sliding stream
-        if n_starts > 0 and rng.next_range(10) < 8 {
+        // 85% aligned to example start ([X訳]/[関西]/[津軽]/[会話] at t=0), 15% sliding stream
+        if n_starts > 0 and rng.next_range(20) < 17 {
             pos = starts[rng.next_range(n_starts)];
         } else {
             pos = base + rng.next_range(safe_span);
@@ -580,6 +819,7 @@ fn sample_aligned_batch(
         for 0..seq_len |t| {
             x_out[off + t] = tokens[pos + t];
             y_out[off + t] = tokens[pos + t + 1];
+            w_out[off + t] = tok_weights[pos + t + 1];
         }
     }
     return;
@@ -589,6 +829,7 @@ fn eval_jpllm_ppl(
     ctx: &gpu::MetalTrainCtx,
     m: &var model::LogicLadderGPT,
     tokens: []i32,
+    tok_weights: []f32,
     val_starts: []i64,
     n_val_starts: i64,
     val_base: i64,
@@ -599,6 +840,7 @@ fn eval_jpllm_ppl(
     mode: model::EvalMode,
     x_buf: &var array::Array<i32>,
     y_buf: &var array::Array<i32>,
+    w_buf: &var array::Array<f32>,
     logits: &var array::Array<f32>,
     g_logits: &var array::Array<f32>
 ) -> gpu::MetalError!f64 {
@@ -609,14 +851,16 @@ fn eval_jpllm_ppl(
     for 0..eval_batches |_| {
         let xm = x_buf.as_mut_slice();
         let ym = y_buf.as_mut_slice();
-        sample_aligned_batch(tokens, val_starts, n_val_starts, val_base, val_len, batch, seq_len, &var rng, xm, ym);
+        let wm = w_buf.as_mut_slice();
+        sample_aligned_batch(tokens, tok_weights, val_starts, n_val_starts, val_base, val_len, batch, seq_len, &var rng, xm, ym, wm);
         let xs = x_buf.as_slice();
         let ys = y_buf.as_slice();
+        let ws = w_buf.as_slice();
         let lm = logits.as_mut_slice();
-        try gpu_ladder_forward(ctx, m, xs, batch, seq_len, lm, mode, &var rng);
+        try gpu_ladder_forward(ctx, m, xs, batch, seq_len, lm, mode, false, &var rng);
         let ls = logits.as_slice();
         let gl = g_logits.as_mut_slice();
-        total_loss = total_loss + cast<f64>(lut::cross_entropy_loss_grad(ls, ys, bt, vocab, gl));
+        total_loss = total_loss + cast<f64>(model::weighted_ce_loss_grad(ls, ys, ws, bt, vocab, gl));
     }
     return math::exp<f64>(total_loss / cast<f64>(eval_batches));
 }
@@ -637,7 +881,6 @@ fn jpllm_print_sample(
     try out.append_bytes(allocator, prompt);
 
     rt.rng = core::rng_new(42);
-    var prev_nl = false;
     for 0..max_new |_| {
         let cur_n = ids.len();
         let win = if cur_n > rt.seq_len { rt.seq_len } else { cur_n };
@@ -649,10 +892,7 @@ fn jpllm_print_sample(
         let piece = data::bpe_token_bytes(&rt.bpe, nxt);
         try out.append_bytes(allocator, piece);
         if nxt == 10 {
-            if prev_nl { break; }
-            prev_nl = true;
-        } else {
-            prev_nl = false;
+            break;
         }
     }
     let out_b = out.as_bytes();
@@ -689,7 +929,7 @@ pub fn run_jpllm_train_one() -> !void {
     else if mem::equal_bytes(rung_arg, "l2") { rung = model::LadderRung::L2; }
     else if mem::equal_bytes(rung_arg, "l3c") { rung = model::LadderRung::L3c; }
 
-    let steps = parse_i64_default(steps_arg, 2500);
+    let steps = parse_i64_default(steps_arg, 4000);
     var has_teacher = false;
     var teacher_path = string::new(allocator);
     defer teacher_path.deinit(allocator);
@@ -714,7 +954,6 @@ pub fn run_jpllm_train_one() -> !void {
     defer raw.deinit(allocator);
     let raw_bytes = raw.as_bytes();
 
-    // Load Teacher if given (and reuse its exact BPE vocab for lossless KL distillation!)
     var teacher_loaded = false;
     var teacher_rt_opt = array::new<model::LadderRuntime>(allocator);
     defer teacher_rt_opt.deinit(allocator);
@@ -724,12 +963,25 @@ pub fn run_jpllm_train_one() -> !void {
     var tokens = array::new<i32>(allocator);
     defer tokens.deinit(allocator);
 
+    var vocab_size: i64 = 1280;
+    var seq_len: i64 = 80;
+    var d_model: i64 = 192;
+    var n_heads: i64 = 6;
+    var n_layers: i64 = 4;
+    var ffn_hidden: i64 = 512;
+
     if has_teacher {
         let tp_b = teacher_path.as_bytes();
         let tb = try fs::read_file(io::blocking(), allocator, &tp_b, mem::Limit::Unlimited);
         defer tb.deinit(allocator);
         let tb_bytes = tb.as_bytes();
         var trt = try model::ladder_runtime_from_bytes(allocator, tb_bytes);
+        vocab_size = trt.vocab_size;
+        seq_len = trt.seq_len;
+        d_model = trt.d_model;
+        n_heads = trt.n_heads;
+        n_layers = trt.n_layers;
+        ffn_hidden = trt.ffn_hidden;
         try teacher_rt_opt.append(allocator, move trt);
         if teacher_rt_opt.at(0) |tr| {
             let ml_s = tr.bpe.merge_left.as_slice();
@@ -742,7 +994,7 @@ pub fn run_jpllm_train_one() -> !void {
         teacher_loaded = true;
     } else {
         let t_bpe0 = process::monotonic_millis();
-        var bpe = try data::bpe_train(allocator, raw_bytes, 768);
+        var bpe = try data::bpe_train(allocator, raw_bytes, vocab_size);
         errdefer bpe.deinit(allocator);
         try data::bpe_encode(allocator, &bpe, raw_bytes, &var tokens);
         let t_bpe1 = process::monotonic_millis();
@@ -758,25 +1010,41 @@ pub fn run_jpllm_train_one() -> !void {
         try fmt::append_i64(allocator, &var ln, t_bpe1 - t_bpe0);
         let lnb = ln.as_bytes();
         print(lnb);
+        vocab_size = bpe.vocab_size;
         try bpe_opt.append(allocator, move bpe);
     }
 
-    var vocab_size: i64 = 768;
-    if bpe_opt.at(0) |br| { vocab_size = br.vocab_size; }
     let n_toks = tokens.len();
-    let train_len = (n_toks * 9) / 10;
+    let train_len = (n_toks * 92) / 100;
     let val_start = train_len;
     let val_len = n_toks - train_len;
 
-    let seq_len: i64 = 64;
-    let batch: i64 = 16;
+    let batch: i64 = 12;
     let bt = batch * seq_len;
 
     let tok_s = tokens.as_slice();
-    var train_starts = try collect_example_starts(allocator, tok_s, 0, train_len, seq_len);
+    var tok_weights = try core::alloc_f32(allocator, n_toks);
+    defer tok_weights.deinit(allocator);
+    let tw_m = tok_weights.as_mut_slice();
+    var train_starts = array::new<i64>(allocator);
     defer train_starts.deinit(allocator);
-    var val_starts = try collect_example_starts(allocator, tok_s, val_start, n_toks, seq_len);
+    var val_starts = array::new<i64>(allocator);
     defer val_starts.deinit(allocator);
+    if bpe_opt.at(0) |br| {
+        fill_token_weights(br, tok_s, tw_m);
+        var ts = try collect_example_starts(allocator, br, tok_s, 0, train_len, seq_len);
+        defer ts.deinit(allocator);
+        let ts_n = ts.len();
+        let ts_raw = ts.as_slice();
+        for 0..ts_n |k| { try train_starts.append(allocator, ts_raw[k]); }
+        var vs = try collect_example_starts(allocator, br, tok_s, val_start, n_toks, seq_len);
+        defer vs.deinit(allocator);
+        let vs_n = vs.len();
+        let vs_raw = vs.as_slice();
+        for 0..vs_n |k| { try val_starts.append(allocator, vs_raw[k]); }
+    }
+    let tw_s = tok_weights.as_slice();
+
     var dln = string::new(allocator);
     defer dln.deinit(allocator);
     try dln.append_bytes(allocator, "Dataset: train_toks=");
@@ -787,38 +1055,78 @@ pub fn run_jpllm_train_one() -> !void {
     try fmt::append_i64(allocator, &var dln, train_starts.len());
     try dln.append_bytes(allocator, " val_ex=");
     try fmt::append_i64(allocator, &var dln, val_starts.len());
+    try dln.append_bytes(allocator, " d=");
+    try fmt::append_i64(allocator, &var dln, d_model);
+    try dln.append_bytes(allocator, " L=");
+    try fmt::append_i64(allocator, &var dln, n_layers);
+    try dln.append_bytes(allocator, " V=");
+    try fmt::append_i64(allocator, &var dln, vocab_size);
     let dlnb = dln.as_bytes();
     print(dlnb);
 
     let cfg = model::LadderConfig {
         vocab_size: vocab_size,
         seq_len: seq_len,
-        d_model: 128,
-        n_heads: 4,
-        n_layers: 3,
-        ffn_hidden: 256,
-        ffn_gates: 256,
+        d_model: d_model,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ffn_hidden: ffn_hidden,
+        ffn_gates: 384,
         ffn_group_factor: 4,
         qkv_n_inputs: 4,
-        ffn_n_inputs: 2,
+        ffn_n_inputs: 4,
         max_batch: batch,
         rung: rung,
         attn_tau: 1.0,
         attn_gumbel_scale: 0.25,
     };
 
-    // Init Metal GPU training context (max_f32 = 2M floats = 8 MB per shared buffer -> plenty for BT*V=786K & d*4*BT)
-    let gpu_ctx = try gpu::metal_train_init(allocator, 2097152, 65536);
+    // Init Metal GPU training context (4M floats = 16 MB per shared buffer -> plenty for BT*V=1.96M & N=4 LUTs)
+    let gpu_ctx = try gpu::metal_train_init(allocator, 4194304, 131072);
     defer gpu_ctx.release();
 
     var rng = core::rng_new(42);
     var m = try model::ladder_gpt_new(allocator, cfg, &var rng);
     defer m.deinit(allocator);
 
+    // Optional GPU Teacher model (populated from L0 teacher.glgpt) + warm-start student FP weights!
+    var teacher_m_opt = array::new<model::LogicLadderGPT>(allocator);
+    defer teacher_m_opt.deinit(allocator);
+    if teacher_loaded {
+        if teacher_rt_opt.at(0) |trt| {
+            // Warm-start student embeddings, final LN, LM head (and FP attention or Logic FFN!) from Teacher!
+            try copy_runtime_into_model(allocator, trt, &var m, true, cast<f32>(1.6));
+            let tcfg = model::LadderConfig {
+                vocab_size: trt.vocab_size,
+                seq_len: trt.seq_len,
+                d_model: trt.d_model,
+                n_heads: trt.n_heads,
+                n_layers: trt.n_layers,
+                ffn_hidden: trt.ffn_hidden,
+                ffn_gates: trt.ffn_gates,
+                ffn_group_factor: trt.ffn_group_factor,
+                qkv_n_inputs: trt.qkv_n_inputs,
+                ffn_n_inputs: trt.ffn_n_inputs,
+                max_batch: batch,
+                rung: trt.rung,
+                attn_tau: 1.0,
+                attn_gumbel_scale: 0.0,
+            };
+            var trng = core::rng_new(1);
+            var tm = try model::ladder_gpt_new(allocator, tcfg, &var trng);
+            errdefer tm.deinit(allocator);
+            try copy_runtime_into_model(allocator, trt, &var tm, true, cast<f32>(4.0));
+            try teacher_m_opt.append(allocator, move tm);
+            print("Warm-started from Teacher (incl. matching Logic FFN LUTs) + mounted GPU Teacher");
+        }
+    }
+
     var x_buf = try core::alloc_i32(allocator, bt);
     defer x_buf.deinit(allocator);
     var y_buf = try core::alloc_i32(allocator, bt);
     defer y_buf.deinit(allocator);
+    var w_buf = try core::alloc_f32(allocator, bt);
+    defer w_buf.deinit(allocator);
     var logits = try core::alloc_f32(allocator, bt * vocab_size);
     defer logits.deinit(allocator);
     var t_logits = try core::alloc_f32(allocator, bt * vocab_size);
@@ -830,42 +1138,61 @@ pub fn run_jpllm_train_one() -> !void {
     let vs_s = val_starts.as_slice();
     let t0 = process::monotonic_millis();
     var last_loss: f32 = 0.0;
+    let is_l3c = model::rung_uses_mux(rung);
+    var trng_eval = core::rng_new(7);
+    var best_hard_ppl: f64 = 1e9;
+    var best_step: i64 = 0;
+
+    var out_path = string::new(allocator);
+    defer out_path.deinit(allocator);
+    try out_path.append_bytes(allocator, out_arg);
+    let op_b = out_path.as_bytes();
 
     for 0..steps |step_idx| {
         let step = step_idx + 1;
         let prog = cast<f64>(step_idx) / cast<f64>(steps);
-        let lr_mult = 0.15 + 0.85 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * prog));
-        let lr_fp = cast<f32>(0.003 * lr_mult);
-        let lr_lut = cast<f32>(0.035 * lr_mult);
+        let warmup = if step_idx < 80 { cast<f64>(step) / 80.0 } else { 1.0 };
+        let lr_mult = warmup * (0.12 + 0.88 * 0.5 * (1.0 + math::cos<f64>(3.141592653589793 * prog)));
+        // Lower FP lr when warm-started from teacher so logic gates adapt cleanly without drifting embeddings
+        let base_lr_fp = if teacher_loaded { 0.0010 } else { 0.0022 };
+        let lr_fp = cast<f32>(base_lr_fp * lr_mult);
+        let lr_lut = cast<f32>(0.028 * lr_mult);
+
+        set_anneal_schedule(&var m, prog);
+        // 2-Phase L3-C Curriculum: first 25% smooth XNOR attention, remaining 75% hard 1-hot Hardware MUX STE!
+        let force_soft_attn = is_l3c and prog < 0.25;
 
         let xm = x_buf.as_mut_slice();
         let ym = y_buf.as_mut_slice();
-        sample_aligned_batch(tok_s, ts_s, train_starts.len(), 0, train_len, batch, seq_len, &var rng, xm, ym);
+        let wm = w_buf.as_mut_slice();
+        sample_aligned_batch(tok_s, tw_s, ts_s, train_starts.len(), 0, train_len, batch, seq_len, &var rng, xm, ym, wm);
         let xs = x_buf.as_slice();
         let ys = y_buf.as_slice();
+        let ws = w_buf.as_slice();
 
         model::ladder_zero_grad(&var m);
         let lm = logits.as_mut_slice();
-        try gpu_ladder_forward(&gpu_ctx, &var m, xs, batch, seq_len, lm, model::EvalMode::Train, &var rng);
+        try gpu_ladder_forward(&gpu_ctx, &var m, xs, batch, seq_len, lm, model::EvalMode::Train, force_soft_attn, &var rng);
         let ls = logits.as_slice();
         let gl = g_logits.as_mut_slice();
 
         if teacher_loaded {
             let tlm = t_logits.as_mut_slice();
-            if teacher_rt_opt.at_mut(0) |trt| {
-                model::ladder_runtime_forward_batch(trt, xs, batch, seq_len, tlm);
+            if teacher_m_opt.at_mut(0) |tm| {
+                try gpu_ladder_forward(&gpu_ctx, tm, xs, batch, seq_len, tlm, model::EvalMode::EvalHard, false, &var trng_eval);
             }
             let tls = t_logits.as_slice();
-            last_loss = model::kl_distill_loss_grad(ls, tls, ys, bt, vocab_size, 0.55, 2.0, gl);
+            last_loss = model::weighted_kl_distill_loss_grad(ls, tls, ys, ws, bt, vocab_size, 0.65, 2.0, gl);
         } else {
-            last_loss = lut::cross_entropy_loss_grad(ls, ys, bt, vocab_size, gl);
+            last_loss = model::weighted_ce_loss_grad(ls, ys, ws, bt, vocab_size, gl);
         }
 
         let gls = g_logits.as_slice();
-        try gpu_ladder_backward(&gpu_ctx, &var m, xs, batch, seq_len, gls);
-        model::ladder_adamw_step(&var m, lr_fp, lr_lut, 0.01, step);
+        try gpu_ladder_backward(&gpu_ctx, &var m, xs, batch, seq_len, force_soft_attn, gls);
+        let wd: f32 = if teacher_loaded { cast<f32>(0.015) } else { cast<f32>(0.03) };
+        model::ladder_adamw_step(&var m, lr_fp, lr_lut, wd, step);
 
-        if step == 1 or step % 400 == 0 or step == steps {
+        if step == 1 or step % 300 == 0 or step == steps {
             let dt_ms = process::monotonic_millis() - t0;
             let safe_ms = if dt_ms > 0 { dt_ms } else { 1 };
             let tps = (step * bt * 1000) / safe_ms;
@@ -877,6 +1204,34 @@ pub fn run_jpllm_train_one() -> !void {
             try fmt::append_i64(allocator, &var slog, steps);
             try slog.append_bytes(allocator, " loss_x1000=");
             try fmt::append_i64(allocator, &var slog, cast<i64>(cast<f64>(last_loss) * 1000.0 + 0.5));
+            if step >= 300 or step == steps {
+                let vppl = try eval_jpllm_ppl(
+                    &gpu_ctx, &var m, tok_s, tw_s, vs_s, val_starts.len(), val_start, val_len,
+                    batch, seq_len, 12, model::EvalMode::EvalHard, &var x_buf, &var y_buf, &var w_buf, &var logits, &var g_logits
+                );
+                try slog.append_bytes(allocator, " val_hard_ppl_x100=");
+                try fmt::append_i64(allocator, &var slog, cast<i64>(vppl * 100.0 + 0.5));
+                // Save whenever we achieve a new best validation hard PPL (and for L3-C, after MUX phase starts)
+                let eligible = !is_l3c or prog >= 0.30 or step == steps;
+                if eligible and vppl < best_hard_ppl {
+                    best_hard_ppl = vppl;
+                    best_step = step;
+                    let sppl = try eval_jpllm_ppl(
+                        &gpu_ctx, &var m, tok_s, tw_s, vs_s, val_starts.len(), val_start, val_len,
+                        batch, seq_len, 12, model::EvalMode::EvalSoft, &var x_buf, &var y_buf, &var w_buf, &var logits, &var g_logits
+                    );
+                    let sx = cast<i32>(sppl * 100.0 + 0.5);
+                    let hx = cast<i32>(vppl * 100.0 + 0.5);
+                    var best_blob = string::new(allocator);
+                    defer best_blob.deinit(allocator);
+                    if bpe_opt.at(0) |br| {
+                        try model::ladder_serialize_glgpt_bpe(allocator, &m, br, sx, hx, cast<i32>(step), &var best_blob);
+                    }
+                    let bb = best_blob.as_bytes();
+                    try fs::write_file(io::blocking(), &op_b, bb);
+                    try slog.append_bytes(allocator, " [SAVED BEST]");
+                }
+            }
             try slog.append_bytes(allocator, " tok/s=");
             try fmt::append_i64(allocator, &var slog, tps);
             try slog.append_bytes(allocator, " ms=");
@@ -886,53 +1241,32 @@ pub fn run_jpllm_train_one() -> !void {
         }
     }
 
-    let soft_ppl = try eval_jpllm_ppl(
-        &gpu_ctx, &var m, tok_s, vs_s, val_starts.len(), val_start, val_len,
-        batch, seq_len, 16, model::EvalMode::EvalSoft, &var x_buf, &var y_buf, &var logits, &var g_logits
-    );
-    let hard_ppl = try eval_jpllm_ppl(
-        &gpu_ctx, &var m, tok_s, vs_s, val_starts.len(), val_start, val_len,
-        batch, seq_len, 16, model::EvalMode::EvalHard, &var x_buf, &var y_buf, &var logits, &var g_logits
-    );
-
-    let soft_x100 = cast<i32>(soft_ppl * 100.0 + 0.5);
-    let hard_x100 = cast<i32>(hard_ppl * 100.0 + 0.5);
-
-    var blob = string::new(allocator);
-    defer blob.deinit(allocator);
-    if bpe_opt.at(0) |br| {
-        try model::ladder_serialize_glgpt_bpe(allocator, &m, br, soft_x100, hard_x100, cast<i32>(steps), &var blob);
-    }
-
-    var out_path = string::new(allocator);
-    defer out_path.deinit(allocator);
-    try out_path.append_bytes(allocator, out_arg);
-    let op_b = out_path.as_bytes();
-    let blob_b = blob.as_bytes();
-    try fs::write_file(io::blocking(), &op_b, blob_b);
+    let saved = try fs::read_file(io::blocking(), allocator, &op_b, mem::Limit::Unlimited);
+    defer saved.deinit(allocator);
+    let saved_b = saved.as_bytes();
 
     var rlog = string::new(allocator);
     defer rlog.deinit(allocator);
-    try rlog.append_bytes(allocator, "EXPORTED JPLLM v2: rung=");
+    try rlog.append_bytes(allocator, "EXPORTED BEST JPLLM v2: rung=");
     try rlog.append_bytes(allocator, rung_arg);
+    try rlog.append_bytes(allocator, " best_step=");
+    try fmt::append_i64(allocator, &var rlog, best_step);
     try rlog.append_bytes(allocator, " bytes=");
-    try fmt::append_i64(allocator, &var rlog, blob.len());
-    try rlog.append_bytes(allocator, " soft_ppl_x100=");
-    try fmt::append_i64(allocator, &var rlog, cast<i64>(soft_x100));
-    try rlog.append_bytes(allocator, " hard_ppl_x100=");
-    try fmt::append_i64(allocator, &var rlog, cast<i64>(hard_x100));
+    try fmt::append_i64(allocator, &var rlog, mem::len(saved_b));
+    try rlog.append_bytes(allocator, " best_hard_ppl_x100=");
+    try fmt::append_i64(allocator, &var rlog, cast<i64>(best_hard_ppl * 100.0 + 0.5));
     try rlog.append_bytes(allocator, " path=");
     try rlog.append_bytes(allocator, out_arg);
     let rlb = rlog.as_bytes();
     print(rlb);
 
-    // Quick qualitative check right from serialized runtime!
-    var rt = try model::ladder_runtime_from_bytes(allocator, blob_b);
+    var rt = try model::ladder_runtime_from_bytes(allocator, saved_b);
     defer rt.deinit(allocator);
-    print("--- SAMPLES (EvalHard, temp=0.6) ---");
-    try jpllm_print_sample(allocator, &var rt, "[X訳] 今日めっちゃ眠い\n=> ", 42, 0.6);
-    try jpllm_print_sample(allocator, &var rt, "[関西] 今日めっちゃ眠い\n=> ", 42, 0.6);
-    try jpllm_print_sample(allocator, &var rt, "[津軽] 今日めっちゃ眠い\n=> ", 42, 0.6);
-    try jpllm_print_sample(allocator, &var rt, "[会話] おはよう\n=> ", 42, 0.6);
+    print("--- SAMPLES (EvalHard, temp=0.45) ---");
+    try jpllm_print_sample(allocator, &var rt, "[X訳] 今日めっちゃ眠い\n=> ", 42, 0.45);
+    try jpllm_print_sample(allocator, &var rt, "[関西] 今日めっちゃ眠い\n=> ", 42, 0.45);
+    try jpllm_print_sample(allocator, &var rt, "[津軽] 今日めっちゃ眠い\n=> ", 42, 0.45);
+    try jpllm_print_sample(allocator, &var rt, "[会話]\nU: おはよう\nA: ", 42, 0.45);
+    try jpllm_print_sample(allocator, &var rt, "[会話]\nU: あなたは誰？\nA: ", 42, 0.45);
     return;
 }

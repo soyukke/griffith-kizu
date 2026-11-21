@@ -204,8 +204,10 @@ if (fs.existsSync(path.join(jpllmDir, "l3c.glgpt"))) {
     const hppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
     if (rung === "l3c") {
       if (muls !== 0) throw new Error(`jpllm l3c expected 0 block muls, got ${muls}`);
-      for (let l = 0; l < 3; l++) {
-        for (let hd = 0; hd < 4; hd++) {
+      const nL = ex.ladder_meta(h, 5);
+      const nH = ex.ladder_meta(h, 4);
+      for (let l = 0; l < nL; l++) {
+        for (let hd = 0; hd < nH; hd++) {
           let ones = 0;
           for (let k = 0; k < seqLen; k++) {
             const w = ex.ladder_attn_milli(h, l, hd, seqLen - 1, k);
