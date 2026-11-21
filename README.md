@@ -4,6 +4,8 @@
 
 **「学習 ＝ 回路コンパイラ」** をテーマに、純 Kizu による学習（CPU / Apple Silicon Metal GPU）→ 離散化 → 4 パス論理合成 → 重みゼロ・乗算ゼロのビット並列 AOT コード生成・ブラウザ WASM 推論までを一気通貫で実装しています。
 
+**Live Demo**: https://lab.soyukke.com/griffith/
+
 ---
 
 ## 収録ブラウザデモ（[`web/`](web/) — 単体静的サイトとして即起動可能）
