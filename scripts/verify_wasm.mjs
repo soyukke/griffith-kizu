@@ -238,4 +238,60 @@ if (fs.existsSync(path.join(jpllmDir, "l3c.glgpt"))) {
   }
 }
 
+// 6. LAB-04 v3 (jpllm/v3_chat): Griffith-JP-Base v1 + Chat SFT (.glgpt v3: FWHT + 98K N=4 LUTs + KV-Cache)
+const v3File = path.join(jpllmDir, "v3_chat.glgpt");
+if (fs.existsSync(v3File)) {
+  const blob = fs.readFileSync(v3File);
+  slotBuffers[0] = blob;
+  const tl0 = performance.now();
+  const h = ex.ladder_load(blob.byteLength) >>> 0;
+  const tl1 = performance.now();
+  if (!h) throw new Error("jpllm v3_chat ladder_load failed");
+  const isV3 = ex.ladder_meta(h, 11);
+  const vocab = ex.ladder_meta(h, 1);
+  const nLoops = ex.ladder_meta(h, 10);
+  const gates = ex.ladder_meta(h, 9);
+  const eosId = ex.ladder_meta(h, 12);
+  const hppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
+  if (isV3 !== 1 || vocab !== 8192 || nLoops !== 2 || gates !== 98304) {
+    throw new Error(`v3_chat meta mismatch: isV3=${isV3} vocab=${vocab} nLoops=${nLoops} gates=${gates}`);
+  }
+  const prompt = "[会話]\nU: 量子コンピュータってすごい？\nA: ";
+  const pBytes = encoder.encode(prompt);
+  slotBuffers[1] = pBytes;
+  const tp0 = performance.now();
+  const pLen = ex.ladder_eval_bytes(h, pBytes.byteLength);
+  const tp1 = performance.now();
+  const fullB = Array.from(pBytes);
+  const outB = [];
+  let genCount = 0;
+  const tg0 = performance.now();
+  for (let i = 0; i < 40; i++) {
+    const tid = ex.ladder_sample_bpe(h, 400, i === 0 ? 1052 : 0);
+    if (tid < 0 || (eosId >= 0 && tid === eosId)) break;
+    let hasNl = (tid === 10);
+    for (const b of lastPieceBytes) {
+      if (b === 10) { hasNl = true; break; }
+      fullB.push(b);
+      outB.push(b);
+    }
+    genCount++;
+    if (hasNl) break;
+    const fb = new Uint8Array(fullB);
+    slotBuffers[1] = fb;
+    ex.ladder_eval_bytes(h, fb.byteLength);
+  }
+  const tg1 = performance.now();
+  const sample = decoder.decode(new Uint8Array(outB)).trim();
+  if (!sample || sample.includes("\uFFFD")) {
+    throw new Error(`v3_chat invalid/mojibake output: ${JSON.stringify(sample)}`);
+  }
+  const tps = (genCount * 1000) / Math.max(1, tg1 - tg0);
+  console.log(
+    `[LAB-04 jpllm/v3_chat] size=${(blob.byteLength / 1e6).toFixed(2)}MB load=${(tl1 - tl0).toFixed(1)}ms ` +
+      `ppl=${hppl} gates=${gates} loops=${nLoops} prefill(${pLen}t)=${(tp1 - tp0).toFixed(1)}ms ` +
+      `decode=${tps.toFixed(1)}tok/s sample=${JSON.stringify(sample)}`
+  );
+}
+
 console.log("ALL LABS (compiler / draw / ladder / distill / jpllm) WASM VERIFICATION: PASS");

@@ -317,6 +317,9 @@ export "browser" fn ladder_meta(handle: usize, which: i32) -> i32 {
     if which == 7 { return rt.hard_ppl_x100; }
     if which == 8 { return rt.train_steps; }
     if which == 9 { return cast<i32>(model::ladder_runtime_logic_gates(rt)); }
+    if which == 10 { return cast<i32>(rt.n_loops); }
+    if which == 11 { return if rt.is_v3 { cast<i32>(1) } else { cast<i32>(0) }; }
+    if which == 12 { return rt.eos_token_id; }
     return 0;
 }
 
@@ -426,12 +429,12 @@ export "browser" fn ladder_top_bpe(handle: usize, rank: i32) -> i32 {
     if handle == 0 or rank < 0 or rank >= 8 { return 0; }
     // SAFETY: handle came from ladder_load.
     let p = unsafe ptr_from_int<ptr<model::LadderRuntime>>(handle);
-    // SAFETY: single-threaded Wasm read access.
-    let rt = unsafe &p.*;
+    // SAFETY: single-threaded Wasm exclusive access.
+    let rt = unsafe &var p.*;
     let v = rt.vocab_size;
     let pr = rt.last_probs.as_slice();
-    var used = [2048]i32{};
-    let us = used.as_mut_slice();
+    let us = rt.samp_used.as_mut_slice();
+    for 0..v |c| { us[c] = 0; }
     var best_id: i64 = 0;
     var best_p: f32 = -1.0;
     let target_r = cast<i64>(rank) + 1;
@@ -462,10 +465,11 @@ export "browser" fn ladder_attn_milli(handle: usize, layer: i32, head: i32, q: i
     let h = cast<i64>(head);
     let qi = cast<i64>(q);
     let ki = cast<i64>(k);
-    if l < 0 or l >= rt.n_layers or h < 0 or h >= rt.n_heads or qi < 0 or qi >= rt.seq_len or ki < 0 or ki >= rt.seq_len {
+    let astr = rt.attn_stride;
+    if l < 0 or l >= rt.n_layers or h < 0 or h >= rt.n_heads or qi < 0 or qi >= astr or ki < 0 or ki >= astr {
         return 0;
     }
-    let idx = ((l * rt.n_heads + h) * rt.seq_len + qi) * rt.seq_len + ki;
+    let idx = ((l * rt.n_heads + h) * astr + qi) * astr + ki;
     let am = rt.attn_maps.as_slice();
     return cast<i32>(am[idx] * 1000.0 + 0.5);
 }
@@ -936,6 +940,6 @@ export "browser" fn lab_bench_64way(task_id: i32, mode: i32, iters: i32) -> i32 
 }
 
 pub fn run_browser() -> void {
-    print("griffith-kizu unified lab wasm ready (draw / compiler / ladder / distill)");
+    print("griffith-kizu unified lab wasm ready (draw / compiler / ladder / distill / jpllm v3)");
     return;
 }

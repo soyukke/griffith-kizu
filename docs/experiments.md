@@ -174,3 +174,43 @@
     - `[会話] U: ラーメン食べたい` → `ラーメンはただのラーメンが最高じゃないか？`
     - `[会話] U: バグが直らない` → `くそったれ、バグほど俺たちなんの心を削したみたいだ。`
     - `[津軽] すごく美味しい` → `わいは、めごいだびょん。`
+
+---
+
+### 2.7 Stage 4 フロンティア実験: `Griffith-JP-Base v1`（汎用日本語事前学習 → 0 乗算 FWHT + Looped WARP-LUT → `.glgpt v3`）
+
+2 つのクラウド GPU 検証（Google Colab L4 / A100-40GB）を通じて、既存大規模モデルの後付け LUT 置換の限界を定量確認し、**FWHT 0 乗算グローバル混合＋Looped Co-Adaptation（Route 2）** で実用の汎用日本語ベースモデル＆特化チャットモデルを構築した。
+
+#### 2.7.1 検証 PoC 1: 凍結済み `Qwen/Qwen3-1.7B` MLP 後付け置換の限界（Colab L4 / `scripts/colab_qwen3_lut_poc.py`）
+
+- Layer 14 SwiGLU（`2048 → 6144 → 2048`）を 2〜3 層スパース N=4 / N=6 WARP-LUT で個別蒸留・ホットスワップ検証：
+  - Receptive field が最大 `6×6 = 36 / 2048` 座標（1.7%）に制限されるため、Cosine 類似度 `0.183〜0.206`・NMSE `0.981` で頭打ち。
+  - ホットスワップ後の日本語 PPL は `17.93`（Base `17.39`、Layer 14 MLP ゼロ化 `17.65` よりも悪化）。
+  - **結論**: 凍結済み密 Transformer への局所スパース LUT 後付けでは高次元混合を再現できず、**0 乗算グローバル混合（FWHT）＋ End-to-End Co-Adaptation** が必須。
+
+#### 2.7.2 検証 PoC 2: Route 2 突破（Colab L4 / `scripts/colab_griffith_base_poc.py`, 0.80 CU）
+
+- 構成: `d=512, 4 unique × 2 loops = 8 eff layers, GQA (8Q/2KV), RoPE, BPE 4096`, 日本語 Wikipedia 6.66M トークン。
+- `FWHT(RMSNorm(x)) → 2-bit Thermometer → N=4 WARP-LUT (49,152 unique) → GroupSum → FWHT` により：
+  - `FP-Base` PPL **`39.22`** vs **完全離散 `H-LUT-Base` PPL `41.55`**（差わずか **`+2.34`**、FFN 乗算 0 回、FFN サイズ `16.5 MB → 492 KB = 33.6×` 圧縮）。
+  - さらに 3.5 分の SFT で 4 モード会話 PPL が `1493.12 → 6.78` へ劇的に収束し、汎用ベース → 数分特化パイプラインを実証。
+
+#### 2.7.3 本番モデル: `Griffith-JP-Base v1` + `v3_chat.glgpt`（Colab A100-SXM4-40GB / `scripts/colab_train_griffith_jp_base.py`, 4.98 CU）
+
+- **コーパス**: 日本語 Wikipedia 14,000 記事（41.5M chars）＋ FineWeb-2 `jpn_Jpan` 10,000 文書 ＋ 英語 Wikipedia 800 記事 ＝ **24,600 学習文書 / 200 検証文書（54.9M chars）**。
+- **トークナイザ**: **100% Kizu 互換 Byte-Level BPE（`vocab = 8,192`, `0..255` 生バイト + `7,936` マージ, `EOS = 0`）**。`33,848,260` 学習トークン / `294,943` 検証トークン。
+- **モデル構造（`.glgpt v3`）**: `d=512, seq=256, GQA (8Q/2KV), RoPE (base=10000), 6 unique × 2 loops = 12 実質層`。FFN は `FWHT → 2-bit 温度計 → 98,304 個の離散 N=4 WARP-LUT（196,608 実効評価/tok, FFN 乗算 0 回）→ GroupSum → FWHT`。Embedding・GQA は per-row int8 量子化。
+
+| フェーズ / モデル | 構成 | Steps (時間 / A100) | 汎用 JA Val PPL (hard) | Chat/4モード Val PPL (hard) | `.glgpt v3` サイズ | FFN 乗算/tok |
+|---|---|---:|---:|---:|---:|---:|
+| Phase 1: `FP-Base v1` | 12 層 SwiGLU Teacher (20.5M params) | 9,000 (8.3m) | **51.63** | — | — | 24,772,608 |
+| Phase 2: `H-LUT-Base v1` | 12 層 FWHT + **98,304 N=4 LUT** (KL 蒸留) | 6,500 (31.9m) | **72.62** | 1,790.61 (SFT前) | **9.21 MB** | **0** |
+| Phase 3: `H-LUT-Chat v1` (`v3_chat.glgpt`) | Base v1 → 4 モード SFT + ~19% 汎用 JA リプレイ | 800 (3.7m) | **121.60** (保持) | **8.41** | **9.21 MB** | **0** |
+
+- **PyTorch 参照 vs 純 Kizu ランタイム一致検証（`./target/griffith_llvm glgpt-eval`）**:
+  - プロンプト `"量子コンピュータとは、"` に対し、BPE トークン ID `[1025, 549, 2380, 1072, 261]` が 100% 一致。
+  - 12 層 RoPE + GQA + FWHT + 196,608 N=4 LUT + Tied int8 LM Head 通過後のロジットおよび Top-5（`v3_chat`: `2380: 3.2266, 1302: 1.7209, 960: 1.5095, 964: 0.9884, 662: 0.9255`）が **最大誤差 `< 0.0005`** で完全一致。
+- **純 Kizu インクリメンタル Prefix KV-Cache 推論速度（単一 CPU スレッド・GPU/SIMD なし）**:
+  - **ネイティブ LLVM（`./target/griffith_llvm`）**: ロード **`2 ms`** / Prefill `19 ms` / デコード **`182 tok/s`**（`5.5 ms/tok`）。
+  - **ブラウザ WASM（`web/dist/app.wasm` 890 KB, Node v26 V8）**: ロード **`23.2 ms`** / デコード **`118.5 tok/s`**（`8.4 ms/tok`、14 プロンプト 223 tok で文字化け `0` 件）。
+- **ダウンストリーム特化再利用**: `scripts/specialize_griffith_base.py` により、学習済み `griffith_jp_base_v1.pt` + `bpe8192_merges.json` から任意のカスタム日本語コーパス（X 翻訳・キャラクター会話・ドメイン特化等）を数分で 9.21 MB の `.glgpt v3` へ蒸留・特化可能。

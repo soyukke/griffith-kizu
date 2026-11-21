@@ -139,6 +139,16 @@ pub fn alloc_u64(allocator: Allocator, count: i64) -> mem::Error!array::Array<u6
     return move out;
 }
 
+pub fn alloc_f64(allocator: Allocator, count: i64) -> mem::Error!array::Array<f64> {
+    var out = array::new<f64>(allocator);
+    errdefer out.deinit(allocator);
+    try out.reserve(allocator, count);
+    for 0..count |_| {
+        try out.append(allocator, 0.0);
+    }
+    return move out;
+}
+
 pub fn zero_f32(values: &var []f32) -> void {
     let n = mem::count<f32>(values);
     for 0..n |i| {

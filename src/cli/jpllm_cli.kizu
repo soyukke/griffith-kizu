@@ -1270,3 +1270,151 @@ pub fn run_jpllm_train_one() -> !void {
     try jpllm_print_sample(allocator, &var rt, "[会話]\nU: あなたは誰？\nA: ", 42, 0.45);
     return;
 }
+
+/// Evaluates any `.glgpt` (v1/v2/v3) binary in Pure Kizu, printing top logits (for parity tests) + timed sample!
+/// Usage: griffith glgpt-eval <model.glgpt> <prompt> [max_new] [temp_milli]
+pub fn run_glgpt_eval() -> !void {
+    let allocator = mem::page_allocator();
+    if process::arg_count() < 3 {
+        print("usage: griffith glgpt-eval <model.glgpt> <prompt> [max_new] [temp_milli]");
+        return;
+    }
+    let model_arg = try process::arg(1);
+    let prompt_arg = try process::arg(2);
+    var max_new: i64 = 48;
+    if process::arg_count() >= 4 {
+        max_new = parse_i64_arg(try process::arg(3), 48);
+    }
+    var temp_milli: i64 = 450;
+    if process::arg_count() >= 5 {
+        temp_milli = parse_i64_arg(try process::arg(4), 450);
+    }
+
+    var mpath = string::new(allocator);
+    defer mpath.deinit(allocator);
+    try mpath.append_bytes(allocator, model_arg);
+    let mpb = mpath.as_bytes();
+    let blob = try fs::read_file(io::blocking(), allocator, &mpb, mem::Limit::Unlimited);
+    defer blob.deinit(allocator);
+    let bb = blob.as_bytes();
+
+    let t_load0 = process::monotonic_millis();
+    var rt = try model::ladder_runtime_from_bytes(allocator, bb);
+    defer rt.deinit(allocator);
+    let t_load1 = process::monotonic_millis();
+
+    var ids = array::new<i32>(allocator);
+    defer ids.deinit(allocator);
+    try data::bpe_encode(allocator, &rt.bpe, prompt_arg, &var ids);
+
+    let p_len = ids.len();
+    let t_pf0 = process::monotonic_millis();
+    let id_s0 = ids.as_slice();
+    model::ladder_runtime_forward(&var rt, id_s0, p_len);
+    let t_pf1 = process::monotonic_millis();
+
+    // Print model header + prompt token IDs + first 8 logits (x1000) for exact PyTorch parity check
+    var hdr = string::new(allocator);
+    defer hdr.deinit(allocator);
+    try hdr.append_bytes(allocator, "GLGPT loaded: is_v3=");
+    try fmt::append_i64(allocator, &var hdr, if rt.is_v3 { 1 } else { 0 });
+    try hdr.append_bytes(allocator, " vocab=");
+    try fmt::append_i64(allocator, &var hdr, rt.vocab_size);
+    try hdr.append_bytes(allocator, " d=");
+    try fmt::append_i64(allocator, &var hdr, rt.d_model);
+    try hdr.append_bytes(allocator, " layers=");
+    try fmt::append_i64(allocator, &var hdr, rt.n_layers);
+    try hdr.append_bytes(allocator, " loops=");
+    try fmt::append_i64(allocator, &var hdr, rt.n_loops);
+    try hdr.append_bytes(allocator, " gates=");
+    try fmt::append_i64(allocator, &var hdr, model::ladder_runtime_logic_gates(&rt));
+    try hdr.append_bytes(allocator, " load_ms=");
+    try fmt::append_i64(allocator, &var hdr, t_load1 - t_load0);
+    try hdr.append_bytes(allocator, " prefill_ms=");
+    try fmt::append_i64(allocator, &var hdr, t_pf1 - t_pf0);
+    let hb = hdr.as_bytes();
+    print(hb);
+
+    var linfo = string::new(allocator);
+    defer linfo.deinit(allocator);
+    try linfo.append_bytes(allocator, "PROMPT_IDS:");
+    for 0..p_len |i| {
+        try linfo.append_bytes(allocator, " ");
+        try fmt::append_i64(allocator, &var linfo, cast<i64>(id_s0[i]));
+    }
+    let lb0 = linfo.as_bytes();
+    print(lb0);
+
+    var linfo2 = string::new(allocator);
+    defer linfo2.deinit(allocator);
+    try linfo2.append_bytes(allocator, "FIRST8_LOGITS_X1000:");
+    let lg_s = rt.logits.as_slice();
+    let l_off = if rt.is_v3 { 0 } else { (rt.last_seq_len - 1) * rt.vocab_size };
+    for 0..8 |k| {
+        try linfo2.append_bytes(allocator, " ");
+        try fmt::append_i64(allocator, &var linfo2, cast<i64>(cast<f64>(lg_s[l_off + k]) * 1000.0));
+    }
+    let lb1 = linfo2.as_bytes();
+    print(lb1);
+
+    // Also print top-5 predicted token IDs + logits (x1000)
+    var linfo3 = string::new(allocator);
+    defer linfo3.deinit(allocator);
+    try linfo3.append_bytes(allocator, "TOP5:");
+    let pr_s = rt.last_probs.as_slice();
+    var used_top = try core::alloc_i32(allocator, rt.vocab_size);
+    defer used_top.deinit(allocator);
+    let ut_m = used_top.as_mut_slice();
+    for 0..5 |_| {
+        var bc: i64 = 0;
+        var bp: f32 = -1.0;
+        for 0..rt.vocab_size |c| {
+            if ut_m[c] == 0 and pr_s[c] > bp { bp = pr_s[c]; bc = c; }
+        }
+        ut_m[bc] = 1;
+        try linfo3.append_bytes(allocator, " ");
+        try fmt::append_i64(allocator, &var linfo3, bc);
+        try linfo3.append_bytes(allocator, ":");
+        try fmt::append_i64(allocator, &var linfo3, cast<i64>(cast<f64>(lg_s[l_off + bc]) * 1000.0));
+    }
+    let lb2 = linfo3.as_bytes();
+    print(lb2);
+
+    // Autoregressive generation benchmark
+    var gen_out = string::new(allocator);
+    defer gen_out.deinit(allocator);
+    try gen_out.append_bytes(allocator, prompt_arg);
+    rt.rng = core::rng_new(42);
+    let temp = cast<f32>(cast<f64>(temp_milli) * 0.001);
+    let t_gen0 = process::monotonic_millis();
+    var n_gen: i64 = 0;
+    for 0..max_new |_| {
+        let nxt = model::ladder_runtime_sample_next(&var rt, temp);
+        if rt.is_v3 and nxt == rt.eos_token_id { break; }
+        try ids.append(allocator, nxt);
+        let piece = data::bpe_token_bytes(&rt.bpe, nxt);
+        try gen_out.append_bytes(allocator, piece);
+        n_gen = n_gen + 1;
+        let cur_n = ids.len();
+        let win = if cur_n > rt.seq_len { rt.seq_len } else { cur_n };
+        let start = cur_n - win;
+        let ids_s = ids.as_slice();
+        model::ladder_runtime_forward(&var rt, ids_s[start..cur_n], win);
+    }
+    let t_gen1 = process::monotonic_millis();
+    let gen_ms = if t_gen1 > t_gen0 { t_gen1 - t_gen0 } else { 1 };
+
+    var stats = string::new(allocator);
+    defer stats.deinit(allocator);
+    try stats.append_bytes(allocator, "GEN_STATS: tokens=");
+    try fmt::append_i64(allocator, &var stats, n_gen);
+    try stats.append_bytes(allocator, " ms=");
+    try fmt::append_i64(allocator, &var stats, gen_ms);
+    try stats.append_bytes(allocator, " tok_per_sec=");
+    try fmt::append_i64(allocator, &var stats, (n_gen * 1000) / gen_ms);
+    let sb = stats.as_bytes();
+    print(sb);
+    let gob = gen_out.as_bytes();
+    print(gob);
+    return;
+}

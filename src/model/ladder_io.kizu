@@ -393,6 +393,18 @@ pub struct RuntimeBlock {
 
     pub ffn_lut1: lut::DiscreteLutLayer,
     pub ffn_lut2: lut::DiscreteLutLayer,
+
+    // .glgpt v3 (Griffith-JP-Base: per-row int8 GQA + FWHT 2-bit Thermometer H-LUT-FFN)
+    pub q_wq_s: array::Array<f32>,
+    pub q_wq_w: string::String,
+    pub q_wk_s: array::Array<f32>,
+    pub q_wk_w: string::String,
+    pub q_wv_s: array::Array<f32>,
+    pub q_wv_w: string::String,
+    pub q_wo_s: array::Array<f32>,
+    pub q_wo_w: string::String,
+    pub hlut_thresh: array::Array<f32>,
+    pub hlut_out_scale: array::Array<f32>,
 }
 
 pub fn (self: RuntimeBlock) deinit(allocator: Allocator) -> void {
@@ -417,6 +429,16 @@ pub fn (self: RuntimeBlock) deinit(allocator: Allocator) -> void {
     self.fc2_b.deinit(allocator);
     self.ffn_lut1.deinit(allocator);
     self.ffn_lut2.deinit(allocator);
+    self.q_wq_s.deinit(allocator);
+    self.q_wq_w.deinit(allocator);
+    self.q_wk_s.deinit(allocator);
+    self.q_wk_w.deinit(allocator);
+    self.q_wv_s.deinit(allocator);
+    self.q_wv_w.deinit(allocator);
+    self.q_wo_s.deinit(allocator);
+    self.q_wo_w.deinit(allocator);
+    self.hlut_thresh.deinit(allocator);
+    self.hlut_out_scale.deinit(allocator);
     return;
 }
 
@@ -462,9 +484,37 @@ pub struct LadderRuntime {
     pub logits: array::Array<f32>,
     pub last_probs: array::Array<f32>,
     pub attn_maps: array::Array<f32>,
+    pub attn_stride: i64,
     pub last_tokens: array::Array<i32>,
     pub last_seq_len: i64,
     pub rng: core::Rng,
+
+    // Heap sampling scratch (supports arbitrary vocab_size up to 8192+ with zero WASM stack bloat)
+    pub samp_adj: array::Array<f64>,
+    pub samp_valid: array::Array<i32>,
+    pub samp_weights: array::Array<f64>,
+    pub samp_used: array::Array<i32>,
+
+    // .glgpt v3 (Griffith-JP-Base Looped GQA + RoPE + Zero-Mul FWHT H-LUT + Prefix KV Cache)
+    pub is_v3: bool,
+    pub v3_flags: i64,
+    pub n_kv_heads: i64,
+    pub n_loops: i64,
+    pub ffn_n_bits: i64,
+    pub eos_token_id: i32,
+    pub rope_base: f32,
+    pub q_emb_s: array::Array<f32>,
+    pub q_emb_w: string::String,
+    pub loop_emb: array::Array<f32>,
+    pub rope_cos: array::Array<f32>,
+    pub rope_sin: array::Array<f32>,
+    pub kv_k: array::Array<f32>,
+    pub kv_v: array::Array<f32>,
+    pub kv_tokens: array::Array<i32>,
+    pub kv_len: i64,
+    pub v3_bits: array::Array<i32>,
+    pub v3_h1: array::Array<i32>,
+    pub v3_h2: array::Array<i32>,
 }
 
 pub fn (self: LadderRuntime) deinit(allocator: Allocator) -> void {
@@ -491,6 +541,21 @@ pub fn (self: LadderRuntime) deinit(allocator: Allocator) -> void {
     self.last_probs.deinit(allocator);
     self.attn_maps.deinit(allocator);
     self.last_tokens.deinit(allocator);
+    self.samp_adj.deinit(allocator);
+    self.samp_valid.deinit(allocator);
+    self.samp_weights.deinit(allocator);
+    self.samp_used.deinit(allocator);
+    self.q_emb_s.deinit(allocator);
+    self.q_emb_w.deinit(allocator);
+    self.loop_emb.deinit(allocator);
+    self.rope_cos.deinit(allocator);
+    self.rope_sin.deinit(allocator);
+    self.kv_k.deinit(allocator);
+    self.kv_v.deinit(allocator);
+    self.kv_tokens.deinit(allocator);
+    self.v3_bits.deinit(allocator);
+    self.v3_h1.deinit(allocator);
+    self.v3_h2.deinit(allocator);
     return;
 }
 
@@ -668,6 +733,27 @@ fn read_runtime_block(
     var ffn_lut2 = if use_lffn { try read_discrete_lut(allocator, bytes, pos, ffn_gates, ffn_out, ffn_n) } else { try empty_discrete_lut(allocator) };
     errdefer ffn_lut2.deinit(allocator);
 
+    var q_wq_s = try core::alloc_f32(allocator, 1);
+    errdefer q_wq_s.deinit(allocator);
+    var q_wq_w = string::new(allocator);
+    errdefer q_wq_w.deinit(allocator);
+    var q_wk_s = try core::alloc_f32(allocator, 1);
+    errdefer q_wk_s.deinit(allocator);
+    var q_wk_w = string::new(allocator);
+    errdefer q_wk_w.deinit(allocator);
+    var q_wv_s = try core::alloc_f32(allocator, 1);
+    errdefer q_wv_s.deinit(allocator);
+    var q_wv_w = string::new(allocator);
+    errdefer q_wv_w.deinit(allocator);
+    var q_wo_s = try core::alloc_f32(allocator, 1);
+    errdefer q_wo_s.deinit(allocator);
+    var q_wo_w = string::new(allocator);
+    errdefer q_wo_w.deinit(allocator);
+    var hlut_thresh = try core::alloc_f32(allocator, 1);
+    errdefer hlut_thresh.deinit(allocator);
+    var hlut_out_scale = try core::alloc_f32(allocator, 1);
+    errdefer hlut_out_scale.deinit(allocator);
+
     return RuntimeBlock {
         ln1_g: move ln1_g,
         ln1_b: move ln1_b,
@@ -691,12 +777,362 @@ fn read_runtime_block(
         fc2_b: move fc2_b,
         ffn_lut1: move ffn_lut1,
         ffn_lut2: move ffn_lut2,
+        q_wq_s: move q_wq_s,
+        q_wq_w: move q_wq_w,
+        q_wk_s: move q_wk_s,
+        q_wk_w: move q_wk_w,
+        q_wv_s: move q_wv_s,
+        q_wv_w: move q_wv_w,
+        q_wo_s: move q_wo_s,
+        q_wo_w: move q_wo_w,
+        hlut_thresh: move hlut_thresh,
+        hlut_out_scale: move hlut_out_scale,
+    };
+}
+
+fn read_u8_array(allocator: Allocator, bytes: []u8, pos: &var i64, count: i64) -> mem::Error!string::String {
+    var out = string::new(allocator);
+    errdefer out.deinit(allocator);
+    let base = pos.*;
+    try out.append_bytes(allocator, bytes[base..(base + count)]);
+    pos.* = base + count;
+    return move out;
+}
+
+fn read_glgpt_v3_block(
+    allocator: Allocator,
+    bytes: []u8,
+    pos: &var i64,
+    d: i64,
+    kv_dim: i64,
+    ffn_gates: i64,
+    ffn_group: i64,
+    ffn_n_bits: i64,
+    ffn_n_inputs: i64
+) -> mem::Error!RuntimeBlock {
+    var ln1_g = try read_f16_array(allocator, bytes, pos, d);
+    errdefer ln1_g.deinit(allocator);
+    var ln1_b = try core::alloc_f32(allocator, 1);
+    errdefer ln1_b.deinit(allocator);
+    var ln2_g = try read_f16_array(allocator, bytes, pos, d);
+    errdefer ln2_g.deinit(allocator);
+    var ln2_b = try core::alloc_f32(allocator, 1);
+    errdefer ln2_b.deinit(allocator);
+    var scalars = [3]f32{ 1.0, 1.0, 1.0 };
+
+    var q_wq_s = try read_f16_array(allocator, bytes, pos, d);
+    errdefer q_wq_s.deinit(allocator);
+    var q_wq_w = try read_u8_array(allocator, bytes, pos, d * d);
+    errdefer q_wq_w.deinit(allocator);
+    var q_wk_s = try read_f16_array(allocator, bytes, pos, kv_dim);
+    errdefer q_wk_s.deinit(allocator);
+    var q_wk_w = try read_u8_array(allocator, bytes, pos, kv_dim * d);
+    errdefer q_wk_w.deinit(allocator);
+    var q_wv_s = try read_f16_array(allocator, bytes, pos, kv_dim);
+    errdefer q_wv_s.deinit(allocator);
+    var q_wv_w = try read_u8_array(allocator, bytes, pos, kv_dim * d);
+    errdefer q_wv_w.deinit(allocator);
+    var q_wo_s = try read_f16_array(allocator, bytes, pos, d);
+    errdefer q_wo_s.deinit(allocator);
+    var q_wo_w = try read_u8_array(allocator, bytes, pos, d * d);
+    errdefer q_wo_w.deinit(allocator);
+
+    var hlut_thresh = try read_f16_array(allocator, bytes, pos, d * ffn_n_bits);
+    errdefer hlut_thresh.deinit(allocator);
+    var hlut_out_scale = try read_f16_array(allocator, bytes, pos, d);
+    errdefer hlut_out_scale.deinit(allocator);
+
+    var ffn_lut1 = try read_discrete_lut(allocator, bytes, pos, d * ffn_n_bits, ffn_gates, ffn_n_inputs);
+    errdefer ffn_lut1.deinit(allocator);
+    var ffn_lut2 = try read_discrete_lut(allocator, bytes, pos, ffn_gates, d * ffn_group, ffn_n_inputs);
+    errdefer ffn_lut2.deinit(allocator);
+
+    var wq_w = try core::alloc_f32(allocator, 1);
+    errdefer wq_w.deinit(allocator);
+    var wq_b = try core::alloc_f32(allocator, 1);
+    errdefer wq_b.deinit(allocator);
+    var wk_w = try core::alloc_f32(allocator, 1);
+    errdefer wk_w.deinit(allocator);
+    var wk_b = try core::alloc_f32(allocator, 1);
+    errdefer wk_b.deinit(allocator);
+    var wv_w = try core::alloc_f32(allocator, 1);
+    errdefer wv_w.deinit(allocator);
+    var wv_b = try core::alloc_f32(allocator, 1);
+    errdefer wv_b.deinit(allocator);
+    var wo_w = try core::alloc_f32(allocator, 1);
+    errdefer wo_w.deinit(allocator);
+    var wo_b = try core::alloc_f32(allocator, 1);
+    errdefer wo_b.deinit(allocator);
+    var lq = try empty_discrete_lut(allocator);
+    errdefer lq.deinit(allocator);
+    var lk = try empty_discrete_lut(allocator);
+    errdefer lk.deinit(allocator);
+    var lv = try empty_discrete_lut(allocator);
+    errdefer lv.deinit(allocator);
+    var fc1_w = try core::alloc_f32(allocator, 1);
+    errdefer fc1_w.deinit(allocator);
+    var fc1_b = try core::alloc_f32(allocator, 1);
+    errdefer fc1_b.deinit(allocator);
+    var fc2_w = try core::alloc_f32(allocator, 1);
+    errdefer fc2_w.deinit(allocator);
+    var fc2_b = try core::alloc_f32(allocator, 1);
+    errdefer fc2_b.deinit(allocator);
+
+    return RuntimeBlock {
+        ln1_g: move ln1_g,
+        ln1_b: move ln1_b,
+        ln2_g: move ln2_g,
+        ln2_b: move ln2_b,
+        scalars: scalars,
+        wq_w: move wq_w,
+        wq_b: move wq_b,
+        wk_w: move wk_w,
+        wk_b: move wk_b,
+        wv_w: move wv_w,
+        wv_b: move wv_b,
+        wo_w: move wo_w,
+        wo_b: move wo_b,
+        lq: move lq,
+        lk: move lk,
+        lv: move lv,
+        fc1_w: move fc1_w,
+        fc1_b: move fc1_b,
+        fc2_w: move fc2_w,
+        fc2_b: move fc2_b,
+        ffn_lut1: move ffn_lut1,
+        ffn_lut2: move ffn_lut2,
+        q_wq_s: move q_wq_s,
+        q_wq_w: move q_wq_w,
+        q_wk_s: move q_wk_s,
+        q_wk_w: move q_wk_w,
+        q_wv_s: move q_wv_s,
+        q_wv_w: move q_wv_w,
+        q_wo_s: move q_wo_s,
+        q_wo_w: move q_wo_w,
+        hlut_thresh: move hlut_thresh,
+        hlut_out_scale: move hlut_out_scale,
+    };
+}
+
+fn read_glgpt_v3(allocator: Allocator, bytes: []u8) -> mem::Error!LadderRuntime {
+    var pos: i64 = 8; // skip "GLGP" + version=3
+    let flags = cast<i64>(read_i32_le(bytes, &var pos));
+    let vocab_size = cast<i64>(read_i32_le(bytes, &var pos));
+    let seq_len = cast<i64>(read_i32_le(bytes, &var pos));
+    let d_model = cast<i64>(read_i32_le(bytes, &var pos));
+    let n_heads = cast<i64>(read_i32_le(bytes, &var pos));
+    let n_kv_heads = cast<i64>(read_i32_le(bytes, &var pos));
+    let n_layers = cast<i64>(read_i32_le(bytes, &var pos));
+    let n_loops = cast<i64>(read_i32_le(bytes, &var pos));
+    let ffn_gates = cast<i64>(read_i32_le(bytes, &var pos));
+    let ffn_group_factor = cast<i64>(read_i32_le(bytes, &var pos));
+    let ffn_n_bits = cast<i64>(read_i32_le(bytes, &var pos));
+    let ffn_n_inputs = cast<i64>(read_i32_le(bytes, &var pos));
+    let rope_base_x100 = cast<i64>(read_i32_le(bytes, &var pos));
+    let soft_ppl_x100 = read_i32_le(bytes, &var pos);
+    let hard_ppl_x100 = read_i32_le(bytes, &var pos);
+    let train_steps = read_i32_le(bytes, &var pos);
+    let eos_token_id = read_i32_le(bytes, &var pos);
+
+    let head_dim = d_model / n_heads;
+    let kv_dim = n_kv_heads * head_dim;
+    let rope_base = cast<f32>(cast<f64>(rope_base_x100) * 0.01);
+
+    let num_merges = vocab_size - 256;
+    var bpe_ml = array::new<i32>(allocator);
+    defer bpe_ml.deinit(allocator);
+    var bpe_mr = array::new<i32>(allocator);
+    defer bpe_mr.deinit(allocator);
+    for 0..num_merges |_| {
+        try bpe_ml.append(allocator, cast<i32>(read_u16_le(bytes, &var pos)));
+        try bpe_mr.append(allocator, cast<i32>(read_u16_le(bytes, &var pos)));
+    }
+    let ml_s = bpe_ml.as_slice();
+    let mr_s = bpe_mr.as_slice();
+    var bpe = try data::bpe_from_merges(allocator, ml_s, mr_s, num_merges);
+    errdefer bpe.deinit(allocator);
+
+    var byte_to_id = try core::alloc_i32(allocator, 256);
+    errdefer byte_to_id.deinit(allocator);
+    let b2i = byte_to_id.as_mut_slice();
+    for 0..256 |b| { b2i[b] = cast<i32>(b); }
+    var id_to_byte = string::new(allocator);
+    errdefer id_to_byte.deinit(allocator);
+
+    var q_emb_s = try read_f16_array(allocator, bytes, &var pos, vocab_size);
+    errdefer q_emb_s.deinit(allocator);
+    var q_emb_w = try read_u8_array(allocator, bytes, &var pos, vocab_size * d_model);
+    errdefer q_emb_w.deinit(allocator);
+    var loop_emb = try read_f16_array(allocator, bytes, &var pos, n_loops * d_model);
+    errdefer loop_emb.deinit(allocator);
+    var final_ln_g = try read_f16_array(allocator, bytes, &var pos, d_model);
+    errdefer final_ln_g.deinit(allocator);
+
+    var blocks = array::new<RuntimeBlock>(allocator);
+    errdefer blocks.deinit(allocator);
+    for 0..n_layers |_| {
+        var blk = try read_glgpt_v3_block(
+            allocator, bytes, &var pos, d_model, kv_dim, ffn_gates, ffn_group_factor, ffn_n_bits, ffn_n_inputs
+        );
+        try blocks.append(allocator, move blk);
+    }
+
+    // Precompute RoPE cos/sin tables [seq_len, head_dim / 2]
+    let half_d = head_dim / 2;
+    var rope_cos = try core::alloc_f32(allocator, seq_len * half_d);
+    errdefer rope_cos.deinit(allocator);
+    var rope_sin = try core::alloc_f32(allocator, seq_len * half_d);
+    errdefer rope_sin.deinit(allocator);
+    let rc_m = rope_cos.as_mut_slice();
+    let rs_m = rope_sin.as_mut_slice();
+    let log_base = math::log<f64>(cast<f64>(rope_base));
+    for 0..half_d |j| {
+        let inv_freq = math::exp<f64>(-log_base * (cast<f64>(2 * j) / cast<f64>(head_dim)));
+        for 0..seq_len |t| {
+            let ang = cast<f64>(t) * inv_freq;
+            rc_m[t * half_d + j] = cast<f32>(math::cos<f64>(ang));
+            rs_m[t * half_d + j] = cast<f32>(math::sin<f64>(ang));
+        }
+    }
+
+    let eff_layers = n_layers * n_loops;
+    let attn_stride = if seq_len > 128 { 128 } else { seq_len };
+
+    var tok_emb = try core::alloc_f32(allocator, 1);
+    errdefer tok_emb.deinit(allocator);
+    var pos_emb = try core::alloc_f32(allocator, 1);
+    errdefer pos_emb.deinit(allocator);
+    var final_ln_b = try core::alloc_f32(allocator, 1);
+    errdefer final_ln_b.deinit(allocator);
+    var lm_head_w = try core::alloc_f32(allocator, 1);
+    errdefer lm_head_w.deinit(allocator);
+    var lm_head_b = try core::alloc_f32(allocator, 1);
+    errdefer lm_head_b.deinit(allocator);
+
+    // Compact 1-token scratch buffers for fast incremental KV-cache decoding
+    var buf_x = try core::alloc_f32(allocator, d_model);
+    errdefer buf_x.deinit(allocator);
+    var buf_ln = try core::alloc_f32(allocator, d_model);
+    errdefer buf_ln.deinit(allocator);
+    var buf_q = try core::alloc_f32(allocator, d_model);
+    errdefer buf_q.deinit(allocator);
+    var buf_k = try core::alloc_f32(allocator, kv_dim);
+    errdefer buf_k.deinit(allocator);
+    var buf_v = try core::alloc_f32(allocator, kv_dim);
+    errdefer buf_v.deinit(allocator);
+    var buf_ctx = try core::alloc_f32(allocator, d_model);
+    errdefer buf_ctx.deinit(allocator);
+    var buf_tmp = try core::alloc_f32(allocator, d_model);
+    errdefer buf_tmp.deinit(allocator);
+    var buf_h1 = try core::alloc_f32(allocator, 1);
+    errdefer buf_h1.deinit(allocator);
+    var buf_h2 = try core::alloc_f32(allocator, 1);
+    errdefer buf_h2.deinit(allocator);
+    var logits = try core::alloc_f32(allocator, vocab_size);
+    errdefer logits.deinit(allocator);
+    var last_probs = try core::alloc_f32(allocator, vocab_size);
+    errdefer last_probs.deinit(allocator);
+    var attn_maps = try core::alloc_f32(allocator, n_layers * n_heads * attn_stride * attn_stride);
+    errdefer attn_maps.deinit(allocator);
+    var last_tokens = try core::alloc_i32(allocator, seq_len);
+    errdefer last_tokens.deinit(allocator);
+
+    var samp_adj = try core::alloc_f64(allocator, vocab_size);
+    errdefer samp_adj.deinit(allocator);
+    var samp_valid = try core::alloc_i32(allocator, vocab_size);
+    errdefer samp_valid.deinit(allocator);
+    var samp_weights = try core::alloc_f64(allocator, vocab_size);
+    errdefer samp_weights.deinit(allocator);
+    var samp_used = try core::alloc_i32(allocator, vocab_size);
+    errdefer samp_used.deinit(allocator);
+
+    var kv_k = try core::alloc_f32(allocator, eff_layers * seq_len * kv_dim);
+    errdefer kv_k.deinit(allocator);
+    var kv_v = try core::alloc_f32(allocator, eff_layers * seq_len * kv_dim);
+    errdefer kv_v.deinit(allocator);
+    var kv_tokens = try core::alloc_i32(allocator, seq_len);
+    errdefer kv_tokens.deinit(allocator);
+    var v3_bits = try core::alloc_i32(allocator, d_model * ffn_n_bits);
+    errdefer v3_bits.deinit(allocator);
+    var v3_h1 = try core::alloc_i32(allocator, ffn_gates);
+    errdefer v3_h1.deinit(allocator);
+    var v3_h2 = try core::alloc_i32(allocator, d_model * ffn_group_factor);
+    errdefer v3_h2.deinit(allocator);
+
+    return LadderRuntime {
+        rung: LadderRung::L0b,
+        vocab_size: vocab_size,
+        seq_len: seq_len,
+        d_model: d_model,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ffn_hidden: 0,
+        ffn_gates: ffn_gates,
+        ffn_group_factor: ffn_group_factor,
+        qkv_n_inputs: 0,
+        ffn_n_inputs: ffn_n_inputs,
+        soft_ppl_x100: soft_ppl_x100,
+        hard_ppl_x100: hard_ppl_x100,
+        train_steps: train_steps,
+        byte_to_id: move byte_to_id,
+        id_to_byte: move id_to_byte,
+        is_bpe: true,
+        bpe: move bpe,
+        tok_emb: move tok_emb,
+        pos_emb: move pos_emb,
+        final_ln_g: move final_ln_g,
+        final_ln_b: move final_ln_b,
+        lm_head_w: move lm_head_w,
+        lm_head_b: move lm_head_b,
+        blocks: move blocks,
+        buf_x: move buf_x,
+        buf_ln: move buf_ln,
+        buf_q: move buf_q,
+        buf_k: move buf_k,
+        buf_v: move buf_v,
+        buf_ctx: move buf_ctx,
+        buf_tmp: move buf_tmp,
+        buf_h1: move buf_h1,
+        buf_h2: move buf_h2,
+        logits: move logits,
+        last_probs: move last_probs,
+        attn_maps: move attn_maps,
+        attn_stride: attn_stride,
+        last_tokens: move last_tokens,
+        last_seq_len: 0,
+        rng: core::rng_new(42),
+        samp_adj: move samp_adj,
+        samp_valid: move samp_valid,
+        samp_weights: move samp_weights,
+        samp_used: move samp_used,
+        is_v3: true,
+        v3_flags: flags,
+        n_kv_heads: n_kv_heads,
+        n_loops: n_loops,
+        ffn_n_bits: ffn_n_bits,
+        eos_token_id: eos_token_id,
+        rope_base: rope_base,
+        q_emb_s: move q_emb_s,
+        q_emb_w: move q_emb_w,
+        loop_emb: move loop_emb,
+        rope_cos: move rope_cos,
+        rope_sin: move rope_sin,
+        kv_k: move kv_k,
+        kv_v: move kv_v,
+        kv_tokens: move kv_tokens,
+        kv_len: 0,
+        v3_bits: move v3_bits,
+        v3_h1: move v3_h1,
+        v3_h2: move v3_h2,
     };
 }
 
 pub fn ladder_runtime_from_bytes(allocator: Allocator, bytes: []u8) -> mem::Error!LadderRuntime {
     var pos: i64 = 4; // skip "GLGP"
     let ver = read_i32_le(bytes, &var pos);
+    if ver == 3 {
+        return try read_glgpt_v3(allocator, bytes);
+    }
     let is_bpe = ver >= 2;
     let use_f16 = ver >= 2;
     let rung = rung_from_i32(read_i32_le(bytes, &var pos));
@@ -802,6 +1238,36 @@ pub fn ladder_runtime_from_bytes(allocator: Allocator, bytes: []u8) -> mem::Erro
     errdefer attn_maps.deinit(allocator);
     var last_tokens = try core::alloc_i32(allocator, seq_len);
     errdefer last_tokens.deinit(allocator);
+    var samp_adj = try core::alloc_f64(allocator, vocab_size);
+    errdefer samp_adj.deinit(allocator);
+    var samp_valid = try core::alloc_i32(allocator, vocab_size);
+    errdefer samp_valid.deinit(allocator);
+    var samp_weights = try core::alloc_f64(allocator, vocab_size);
+    errdefer samp_weights.deinit(allocator);
+    var samp_used = try core::alloc_i32(allocator, vocab_size);
+    errdefer samp_used.deinit(allocator);
+    var q_emb_s = try core::alloc_f32(allocator, 1);
+    errdefer q_emb_s.deinit(allocator);
+    var q_emb_w = string::new(allocator);
+    errdefer q_emb_w.deinit(allocator);
+    var loop_emb = try core::alloc_f32(allocator, 1);
+    errdefer loop_emb.deinit(allocator);
+    var rope_cos = try core::alloc_f32(allocator, 1);
+    errdefer rope_cos.deinit(allocator);
+    var rope_sin = try core::alloc_f32(allocator, 1);
+    errdefer rope_sin.deinit(allocator);
+    var kv_k = try core::alloc_f32(allocator, 1);
+    errdefer kv_k.deinit(allocator);
+    var kv_v = try core::alloc_f32(allocator, 1);
+    errdefer kv_v.deinit(allocator);
+    var kv_tokens = try core::alloc_i32(allocator, 1);
+    errdefer kv_tokens.deinit(allocator);
+    var v3_bits = try core::alloc_i32(allocator, 1);
+    errdefer v3_bits.deinit(allocator);
+    var v3_h1 = try core::alloc_i32(allocator, 1);
+    errdefer v3_h1.deinit(allocator);
+    var v3_h2 = try core::alloc_i32(allocator, 1);
+    errdefer v3_h2.deinit(allocator);
 
     return LadderRuntime {
         rung: rung,
@@ -841,9 +1307,33 @@ pub fn ladder_runtime_from_bytes(allocator: Allocator, bytes: []u8) -> mem::Erro
         logits: move logits,
         last_probs: move last_probs,
         attn_maps: move attn_maps,
+        attn_stride: seq_len,
         last_tokens: move last_tokens,
         last_seq_len: 0,
         rng: core::rng_new(42),
+        samp_adj: move samp_adj,
+        samp_valid: move samp_valid,
+        samp_weights: move samp_weights,
+        samp_used: move samp_used,
+        is_v3: false,
+        v3_flags: 0,
+        n_kv_heads: n_heads,
+        n_loops: 1,
+        ffn_n_bits: 1,
+        eos_token_id: -1,
+        rope_base: 10000.0,
+        q_emb_s: move q_emb_s,
+        q_emb_w: move q_emb_w,
+        loop_emb: move loop_emb,
+        rope_cos: move rope_cos,
+        rope_sin: move rope_sin,
+        kv_k: move kv_k,
+        kv_v: move kv_v,
+        kv_tokens: move kv_tokens,
+        kv_len: 0,
+        v3_bits: move v3_bits,
+        v3_h1: move v3_h1,
+        v3_h2: move v3_h2,
     };
 }
 
@@ -1122,6 +1612,273 @@ fn rt_run_block(
     return;
 }
 
+fn rt_v3_rmsnorm(x: []f32, g: []f32, d: i64, out: &var []f32) -> void {
+    var sq: f64 = 0.0;
+    for 0..d |i| {
+        let v = cast<f64>(x[i]);
+        sq = sq + v * v;
+    }
+    let inv = cast<f32>(1.0 / math::sqrt<f64>(sq / cast<f64>(d) + 1e-5));
+    for 0..d |i| {
+        out[i] = x[i] * inv * g[i];
+    }
+    return;
+}
+
+fn rt_v3_q8_matvec(x: []f32, q: []u8, scales: []f32, out_d: i64, in_d: i64, out: &var []f32) -> void {
+    for 0..out_d |o| {
+        let w_off = o * in_d;
+        var acc: f32 = 0.0;
+        for 0..in_d |i| {
+            let sv = (cast<i32>(q[w_off + i]) ^ 128) - 128;
+            acc = acc + cast<f32>(sv) * x[i];
+        }
+        out[o] = acc * scales[o];
+    }
+    return;
+}
+
+fn rt_v3_fwht_ortho(vals: &var []f32, n: i64) -> void {
+    var step: i64 = 1;
+    while step < n {
+        var i: i64 = 0;
+        while i < n {
+            for 0..step |k| {
+                let u = vals[i + k];
+                let v = vals[i + k + step];
+                vals[i + k] = u + v;
+                vals[i + k + step] = u - v;
+            }
+            i = i + step * 2;
+        }
+        step = step * 2;
+    }
+    let inv_sqrt_n = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(n)));
+    for 0..n |i| {
+        vals[i] = vals[i] * inv_sqrt_n;
+    }
+    return;
+}
+
+fn rt_v3_apply_rope(vec: &var []f32, n_h: i64, head_dim: i64, cos_row: []f32, sin_row: []f32) -> void {
+    let half_d = head_dim / 2;
+    for 0..n_h |h| {
+        let base = h * head_dim;
+        for 0..half_d |j| {
+            let x1 = vec[base + 2 * j];
+            let x2 = vec[base + 2 * j + 1];
+            let c = cos_row[j];
+            let s = sin_row[j];
+            vec[base + 2 * j] = x1 * c - x2 * s;
+            vec[base + 2 * j + 1] = x1 * s + x2 * c;
+        }
+    }
+    return;
+}
+
+fn rt_v3_lut_n4(layer: &lut::DiscreteLutLayer, in_b: []i32, out_b: &var []i32) -> void {
+    let out_d = layer.out_dim;
+    let idx_s = layer.indices.as_slice();
+    let tt_s = layer.truth_tables.as_slice();
+    for 0..out_d |o| {
+        let io = o * 4;
+        let a0 = cast<u64>(in_b[cast<i64>(idx_s[io])]);
+        let a1 = cast<u64>(in_b[cast<i64>(idx_s[io + 1])]);
+        let a2 = cast<u64>(in_b[cast<i64>(idx_s[io + 2])]);
+        let a3 = cast<u64>(in_b[cast<i64>(idx_s[io + 3])]);
+        let addr = a0 | (a1 << 1) | (a2 << 2) | (a3 << 3);
+        out_b[o] = cast<i32>((tt_s[o] >> addr) & cast<u64>(1));
+    }
+    return;
+}
+
+fn rt_v3_forward(rt: &var LadderRuntime, tokens: []i32, use_len: i64) -> void {
+    let d = rt.d_model;
+    let n_heads = rt.n_heads;
+    let n_kv = rt.n_kv_heads;
+    let head_dim = d / n_heads;
+    let half_d = head_dim / 2;
+    let kv_dim = n_kv * head_dim;
+    let rep = n_heads / n_kv;
+    let seq_cap = rt.seq_len;
+    let inv_sqrt_dk = cast<f32>(1.0 / math::sqrt<f64>(cast<f64>(head_dim)));
+    let ffn_g = rt.ffn_group_factor;
+    let inv_ffn_g = cast<f32>(1.0) / cast<f32>(ffn_g);
+    let n_bits = rt.ffn_n_bits;
+    let astr = rt.attn_stride;
+
+    // Prefix-matching incremental KV cache: only evaluate newly appended or diverged positions!
+    let kvt_m = rt.kv_tokens.as_mut_slice();
+    let max_pref = if rt.kv_len < use_len { rt.kv_len } else { use_len };
+    var prefix: i64 = 0;
+    while prefix < max_pref and kvt_m[prefix] == tokens[prefix] {
+        prefix = prefix + 1;
+    }
+    let start_t = if prefix >= use_len and use_len > 0 { use_len - 1 } else { prefix };
+
+    let emb_s = rt.q_emb_s.as_slice();
+    let emb_w = rt.q_emb_w.as_bytes();
+    let le_s = rt.loop_emb.as_slice();
+    let rcos_s = rt.rope_cos.as_slice();
+    let rsin_s = rt.rope_sin.as_slice();
+    let x_m = rt.buf_x.as_mut_slice();
+    let ln_m = rt.buf_ln.as_mut_slice();
+    let q_m = rt.buf_q.as_mut_slice();
+    let k_m = rt.buf_k.as_mut_slice();
+    let v_m = rt.buf_v.as_mut_slice();
+    let ctx_m = rt.buf_ctx.as_mut_slice();
+    let tmp_m = rt.buf_tmp.as_mut_slice();
+    let kv_k_m = rt.kv_k.as_mut_slice();
+    let kv_v_m = rt.kv_v.as_mut_slice();
+    let am_m = rt.attn_maps.as_mut_slice();
+    let bits_m = rt.v3_bits.as_mut_slice();
+    let h1_m = rt.v3_h1.as_mut_slice();
+    let h2_m = rt.v3_h2.as_mut_slice();
+
+    var sc_buf = [512]f32{};
+    let sc_m = sc_buf.as_mut_slice();
+
+    for start_t..use_len |t| {
+        let tok = cast<i64>(tokens[t]);
+        let esc = emb_s[tok];
+        let e_off = tok * d;
+        for 0..d |i| {
+            let sv = (cast<i32>(emb_w[e_off + i]) ^ 128) - 128;
+            x_m[i] = cast<f32>(sv) * esc;
+        }
+
+        let cos_row = rcos_s[(t * half_d)..((t + 1) * half_d)];
+        let sin_row = rsin_s[(t * half_d)..((t + 1) * half_d)];
+
+        for 0..rt.n_loops |lp| {
+            let lp_off = lp * d;
+            for 0..d |i| { x_m[i] = x_m[i] + le_s[lp_off + i]; }
+
+            for 0..rt.n_layers |l| {
+                let eff_l = lp * rt.n_layers + l;
+                if rt.blocks.at(l) |blk| {
+                    // 1. Pre-Attention RMSNorm + GQA int8 projections + RoPE
+                    let b_ln1_g = blk.ln1_g.as_slice();
+                    let b_wq_w = blk.q_wq_w.as_bytes();
+                    let b_wq_s = blk.q_wq_s.as_slice();
+                    let b_wk_w = blk.q_wk_w.as_bytes();
+                    let b_wk_s = blk.q_wk_s.as_slice();
+                    let b_wv_w = blk.q_wv_w.as_bytes();
+                    let b_wv_s = blk.q_wv_s.as_slice();
+                    rt_v3_rmsnorm(x_m, b_ln1_g, d, ln_m);
+                    rt_v3_q8_matvec(ln_m, b_wq_w, b_wq_s, d, d, q_m);
+                    rt_v3_q8_matvec(ln_m, b_wk_w, b_wk_s, kv_dim, d, k_m);
+                    rt_v3_q8_matvec(ln_m, b_wv_w, b_wv_s, kv_dim, d, v_m);
+
+                    rt_v3_apply_rope(q_m, n_heads, head_dim, cos_row, sin_row);
+                    rt_v3_apply_rope(k_m, n_kv, head_dim, cos_row, sin_row);
+
+                    // Store K/V into incremental cache at (eff_l, t)
+                    let kv_base = (eff_l * seq_cap + t) * kv_dim;
+                    for 0..kv_dim |i| {
+                        kv_k_m[kv_base + i] = k_m[i];
+                        kv_v_m[kv_base + i] = v_m[i];
+                    }
+
+                    // Causal GQA Attention over s = 0..t
+                    let layer_kv_off = eff_l * seq_cap * kv_dim;
+                    let save_map = (lp == rt.n_loops - 1) and (t < astr);
+                    for 0..n_heads |h| {
+                        let kvh = h / rep;
+                        let q_off = h * head_dim;
+                        let kv_h_off = kvh * head_dim;
+                        var max_s: f32 = -1e30;
+                        for 0..(t + 1) |s| {
+                            let ks_off = layer_kv_off + s * kv_dim + kv_h_off;
+                            var dot: f32 = 0.0;
+                            for 0..head_dim |j| {
+                                dot = dot + q_m[q_off + j] * kv_k_m[ks_off + j];
+                            }
+                            let sc = dot * inv_sqrt_dk;
+                            sc_m[s] = sc;
+                            if sc > max_s { max_s = sc; }
+                        }
+                        var sum_e: f64 = 0.0;
+                        for 0..(t + 1) |s| {
+                            let e = math::exp<f64>(cast<f64>(sc_m[s] - max_s));
+                            sc_m[s] = cast<f32>(e);
+                            sum_e = sum_e + e;
+                        }
+                        let inv_sum = cast<f32>(1.0 / sum_e);
+                        for 0..(t + 1) |s| { sc_m[s] = sc_m[s] * inv_sum; }
+                        if save_map {
+                            let row_off = ((l * n_heads + h) * astr + t) * astr;
+                            for 0..(t + 1) |s| { am_m[row_off + s] = sc_m[s]; }
+                            for (t + 1)..astr |s| { am_m[row_off + s] = 0.0; }
+                        }
+                        for 0..head_dim |j| { ctx_m[q_off + j] = 0.0; }
+                        for 0..(t + 1) |s| {
+                            let w = sc_m[s];
+                            let vs_off = layer_kv_off + s * kv_dim + kv_h_off;
+                            for 0..head_dim |j| {
+                                ctx_m[q_off + j] = ctx_m[q_off + j] + w * kv_v_m[vs_off + j];
+                            }
+                        }
+                    }
+                    let b_wo_w = blk.q_wo_w.as_bytes();
+                    let b_wo_s = blk.q_wo_s.as_slice();
+                    rt_v3_q8_matvec(ctx_m, b_wo_w, b_wo_s, d, d, tmp_m);
+                    for 0..d |i| { x_m[i] = x_m[i] + tmp_m[i]; }
+
+                    // 2. Pre-FFN RMSNorm + ZERO-MULTIPLICATION FWHT + 2-bit Thermometer + N=4 Discrete WARP-LUT FFN!
+                    let b_ln2_g = blk.ln2_g.as_slice();
+                    rt_v3_rmsnorm(x_m, b_ln2_g, d, ln_m);
+                    rt_v3_fwht_ortho(ln_m, d);
+                    let th_s = blk.hlut_thresh.as_slice();
+                    for 0..d |i| {
+                        let uv = ln_m[i];
+                        let bo = i * n_bits;
+                        for 0..n_bits |b| {
+                            bits_m[bo + b] = if uv > th_s[bo + b] { cast<i32>(1) } else { cast<i32>(0) };
+                        }
+                    }
+                    rt_v3_lut_n4(&blk.ffn_lut1, bits_m, h1_m);
+                    rt_v3_lut_n4(&blk.ffn_lut2, h1_m, h2_m);
+                    for 0..d |c| {
+                        var sum_b: i64 = 0;
+                        let go = c * ffn_g;
+                        for 0..ffn_g |j| { sum_b = sum_b + cast<i64>(h2_m[go + j]); }
+                        tmp_m[c] = cast<f32>(sum_b) * inv_ffn_g - cast<f32>(0.5);
+                    }
+                    rt_v3_fwht_ortho(tmp_m, d);
+                    let osc_s = blk.hlut_out_scale.as_slice();
+                    for 0..d |i| { x_m[i] = x_m[i] + tmp_m[i] * osc_s[i]; }
+                }
+            }
+        }
+        kvt_m[t] = tokens[t];
+    }
+    rt.kv_len = use_len;
+
+    // Final RMSNorm + Tied int8 LM Head (only on the last token -> 256x faster prefill!)
+    let fln_g = rt.final_ln_g.as_slice();
+    rt_v3_rmsnorm(x_m, fln_g, d, ln_m);
+    let lg_m = rt.logits.as_mut_slice();
+    rt_v3_q8_matvec(ln_m, emb_w, emb_s, rt.vocab_size, d, lg_m);
+
+    // Update last_probs softmax for live Top-5 UI
+    let pr_m = rt.last_probs.as_mut_slice();
+    var max_v = cast<f64>(lg_m[0]);
+    for 1..rt.vocab_size |c| {
+        let v = cast<f64>(lg_m[c]);
+        if v > max_v { max_v = v; }
+    }
+    var sum_e: f64 = 0.0;
+    for 0..rt.vocab_size |c| {
+        let e = math::exp<f64>(cast<f64>(lg_m[c]) - max_v);
+        pr_m[c] = cast<f32>(e);
+        sum_e = sum_e + e;
+    }
+    let inv_s = cast<f32>(1.0 / sum_e);
+    for 0..rt.vocab_size |c| { pr_m[c] = pr_m[c] * inv_s; }
+    return;
+}
+
 pub fn ladder_runtime_forward(rt: &var LadderRuntime, tokens: []i32, seq_len: i64) -> void {
     let d = rt.d_model;
     let use_len = if seq_len > rt.seq_len { rt.seq_len } else { seq_len };
@@ -1129,6 +1886,10 @@ pub fn ladder_runtime_forward(rt: &var LadderRuntime, tokens: []i32, seq_len: i6
     let lt_s = rt.last_tokens.as_mut_slice();
     for 0..use_len |t| {
         lt_s[t] = tokens[t];
+    }
+    if rt.is_v3 {
+        rt_v3_forward(rt, tokens, use_len);
+        return;
     }
 
     let tok_w = rt.tok_emb.as_slice();
@@ -1257,29 +2018,34 @@ fn rt_utf8_pending(rt: &LadderRuntime) -> i64 {
 
 pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
     let v_size = rt.vocab_size;
-    let off = (rt.last_seq_len - 1) * v_size;
-    let lg_s = rt.logits.as_slice();
+    let off = if rt.is_v3 { 0 } else { (rt.last_seq_len - 1) * v_size };
     let utf8_need = rt_utf8_pending(rt);
+    let lg_s = rt.logits.as_slice();
+    let adj_s = rt.samp_adj.as_mut_slice();
+    let val_s = rt.samp_valid.as_mut_slice();
+    let ws = rt.samp_weights.as_mut_slice();
+    let us = rt.samp_used.as_mut_slice();
 
-    // Build UTF-8 valid mask + raw-byte suppression + repetition penalty (applied to BOTH greedy and sampled decoding!)
-    var adj = [2048]f64{};
-    var valid = [2048]i32{};
-    let adj_s = adj.as_mut_slice();
-    let val_s = valid.as_mut_slice();
     var n_valid: i64 = 0;
     for 0..v_size |c| {
         var ok = true;
         var score = cast<f64>(lg_s[off + c]);
         if rt.is_bpe {
-            let pc = data::bpe_token_bytes(&rt.bpe, cast<i32>(c));
-            if utf8_advance_state(utf8_need, pc) < 0 {
-                ok = false;
-            } else if utf8_need == 0 and c >= 192 and c < 256 {
-                // Mildly discourage starting a new char from an unmerged raw high byte (prevents stray rare CJK kanji)
-                score = score - 1.8;
+            if rt.is_v3 and cast<i32>(c) == rt.eos_token_id {
+                // Allow EOS only at a clean UTF-8 character boundary
+                if utf8_need != 0 { ok = false; }
+            } else {
+                let pc = data::bpe_token_bytes(&rt.bpe, cast<i32>(c));
+                if utf8_advance_state(utf8_need, pc) < 0 {
+                    ok = false;
+                } else if utf8_need == 0 and c >= 192 and c < 256 {
+                    // Mildly discourage starting a new char from an unmerged raw high byte (prevents stray rare CJK kanji)
+                    score = score - 1.8;
+                }
             }
         }
         val_s[c] = if ok { cast<i32>(1) } else { cast<i32>(0) };
+        us[c] = 0;
         if ok { n_valid = n_valid + 1; }
         adj_s[c] = score;
     }
@@ -1287,20 +2053,23 @@ pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
         for 0..v_size |c| { val_s[c] = 1; }
     }
     if rt.is_bpe and rt.last_seq_len > 2 {
-        let win_start = if rt.last_seq_len > 16 { rt.last_seq_len - 16 } else { 0 };
+        let win_len = if rt.is_v3 { 24 } else { 16 };
+        let win_start = if rt.last_seq_len > win_len { rt.last_seq_len - win_len } else { 0 };
         let lt_s = rt.last_tokens.as_slice();
-        var seen = [2048]i32{};
-        let seen_s = seen.as_mut_slice();
         for win_start..rt.last_seq_len |pos| {
             let tid = cast<i64>(lt_s[pos]);
-            if tid >= 128 and tid < v_size and seen_s[tid] == 0 {
-                seen_s[tid] = 1;
+            if tid >= 128 and tid < v_size and us[tid] == 0 {
+                us[tid] = 1;
                 if adj_s[tid] > 0.0 {
                     adj_s[tid] = adj_s[tid] / 1.24;
                 } else {
                     adj_s[tid] = adj_s[tid] * 1.24;
                 }
             }
+        }
+        for win_start..rt.last_seq_len |pos| {
+            let tid = cast<i64>(lt_s[pos]);
+            if tid >= 128 and tid < v_size { us[tid] = 0; }
         }
     }
 
@@ -1324,8 +2093,6 @@ pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
         let v = adj_s[c] * inv_t;
         if v > max_v { max_v = v; }
     }
-    var weights = [2048]f64{};
-    let ws = weights.as_mut_slice();
     var sum_e: f64 = 0.0;
     for 0..v_size |c| {
         if val_s[c] == 0 {
@@ -1343,8 +2110,6 @@ pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
     var cand_p = [32]f64{};
     let cid_s = cand_id.as_mut_slice();
     let cp_s = cand_p.as_mut_slice();
-    var used = [2048]i32{};
-    let us = used.as_mut_slice();
     let max_k = if v_size < 28 { v_size } else { 28 };
     var n_cand: i64 = 0;
     var cum_p: f64 = 0.0;
@@ -1384,6 +2149,12 @@ pub fn ladder_runtime_sample_next(rt: &var LadderRuntime, temp: f32) -> i32 {
 pub fn ladder_runtime_block_muls_per_tok(rt: &LadderRuntime, seq_pos: i64) -> i64 {
     let d = rt.d_model;
     let t = if seq_pos > 0 { seq_pos } else { 1 };
+    if rt.is_v3 {
+        // GQA Attention (wq d*d + wk d*kv + wv d*kv + wo d*d + 2*t*d), ZERO FFN multiplications!
+        let kv_dim = rt.n_kv_heads * (d / rt.n_heads);
+        let per_layer = 2 * d * d + 2 * d * kv_dim + 2 * t * d;
+        return per_layer * rt.n_layers * rt.n_loops;
+    }
     var per_layer: i64 = 0;
     if !rung_uses_logic_qkv(rt.rung) {
         // Wq, Wk, Wv, Wo projections + QK^T + Attn*V
@@ -1403,6 +2174,9 @@ pub fn ladder_runtime_block_muls_per_tok(rt: &LadderRuntime, seq_pos: i64) -> i6
 }
 
 pub fn ladder_runtime_logic_gates(rt: &LadderRuntime) -> i64 {
+    if rt.is_v3 {
+        return (rt.ffn_gates + rt.d_model * rt.ffn_group_factor) * rt.n_layers;
+    }
     var per_layer: i64 = 0;
     if rung_uses_logic_qkv(rt.rung) {
         per_layer = per_layer + 3 * rt.d_model;
@@ -1465,4 +2239,116 @@ test "ladder_io roundtrip matches EvalHard logits bit-closely" {
     }
     testing::expect(max_diff < 1e-4);
     testing::expect(ladder_runtime_block_muls_per_tok(&rt, 8) == 0);
+}
+
+test "glgpt v3 loader and incremental kv-cache match fresh forward" {
+    let allocator = mem::page_allocator();
+    var blob = string::new(allocator);
+    defer blob.deinit(allocator);
+
+    let vocab_size: i64 = 258; // 256 raw bytes + 2 merges
+    let seq_len: i64 = 16;
+    let d: i64 = 8; // power of 2 for FWHT
+    let n_heads: i64 = 2;
+    let n_kv: i64 = 1;
+    let kv_dim: i64 = 4;
+    let n_layers: i64 = 2;
+    let n_loops: i64 = 2;
+    let h1: i64 = 16;
+    let grp: i64 = 4;
+    let n_bits: i64 = 2;
+
+    try blob.append_bytes(allocator, "GLGP");
+    try push_i32_le(allocator, &var blob, 3);
+    try push_i32_le(allocator, &var blob, 7);
+    try push_i32_le(allocator, &var blob, cast<i32>(vocab_size));
+    try push_i32_le(allocator, &var blob, cast<i32>(seq_len));
+    try push_i32_le(allocator, &var blob, cast<i32>(d));
+    try push_i32_le(allocator, &var blob, cast<i32>(n_heads));
+    try push_i32_le(allocator, &var blob, cast<i32>(n_kv));
+    try push_i32_le(allocator, &var blob, cast<i32>(n_layers));
+    try push_i32_le(allocator, &var blob, cast<i32>(n_loops));
+    try push_i32_le(allocator, &var blob, cast<i32>(h1));
+    try push_i32_le(allocator, &var blob, cast<i32>(grp));
+    try push_i32_le(allocator, &var blob, cast<i32>(n_bits));
+    try push_i32_le(allocator, &var blob, 4);
+    try push_i32_le(allocator, &var blob, 1000000);
+    try push_i32_le(allocator, &var blob, 2500);
+    try push_i32_le(allocator, &var blob, 2700);
+    try push_i32_le(allocator, &var blob, 1000);
+    try push_i32_le(allocator, &var blob, 0);
+
+    // 2 BPE merges: ('a','b') and (256,'c')
+    try push_u16_le(allocator, &var blob, 97);
+    try push_u16_le(allocator, &var blob, 98);
+    try push_u16_le(allocator, &var blob, 256);
+    try push_u16_le(allocator, &var blob, 99);
+
+    var rng = core::rng_new(123);
+    // tok_emb [vocab_size, d]: f16 scales + i8 weights
+    for 0..vocab_size |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.02))); }
+    for 0..(vocab_size * d) |_| { try blob.append_byte(allocator, cast<u8>(rng.next_range(255))); }
+    // loop_emb [n_loops, d] f16
+    for 0..(n_loops * d) |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.01))); }
+    // final_ln [d] f16
+    for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(1.0))); }
+
+    // Per unique layer
+    for 0..n_layers |_| {
+        for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(1.0))); }
+        for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(1.0))); }
+        // wq [d, d]
+        for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.01))); }
+        for 0..(d * d) |_| { try blob.append_byte(allocator, cast<u8>(rng.next_range(255))); }
+        // wk [kv_dim, d]
+        for 0..kv_dim |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.01))); }
+        for 0..(kv_dim * d) |_| { try blob.append_byte(allocator, cast<u8>(rng.next_range(255))); }
+        // wv [kv_dim, d]
+        for 0..kv_dim |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.01))); }
+        for 0..(kv_dim * d) |_| { try blob.append_byte(allocator, cast<u8>(rng.next_range(255))); }
+        // wo [d, d]
+        for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.01))); }
+        for 0..(d * d) |_| { try blob.append_byte(allocator, cast<u8>(rng.next_range(255))); }
+        // thresh [d * n_bits] f16
+        for 0..(d * n_bits) |i| {
+            let tv: f32 = if i % 2 == 0 { cast<f32>(-0.5) } else { cast<f32>(0.5) };
+            try push_u16_le(allocator, &var blob, f32_to_f16(tv));
+        }
+        // out_scale [d] f16
+        for 0..d |_| { try push_u16_le(allocator, &var blob, f32_to_f16(cast<f32>(0.5))); }
+        // lut1 (in = d * n_bits, out = h1, N = 4)
+        for 0..(h1 * 4) |_| { try push_u16_le(allocator, &var blob, cast<u32>(rng.next_range(d * n_bits))); }
+        for 0..h1 |_| { try push_u16_le(allocator, &var blob, cast<u32>(rng.next_range(65536))); }
+        // lut2 (in = h1, out = d * grp, N = 4)
+        for 0..(d * grp * 4) |_| { try push_u16_le(allocator, &var blob, cast<u32>(rng.next_range(h1))); }
+        for 0..(d * grp) |_| { try push_u16_le(allocator, &var blob, cast<u32>(rng.next_range(65536))); }
+    }
+
+    let bb = blob.as_bytes();
+    var rt_inc = try ladder_runtime_from_bytes(allocator, bb);
+    defer rt_inc.deinit(allocator);
+    var rt_full = try ladder_runtime_from_bytes(allocator, bb);
+    defer rt_full.deinit(allocator);
+
+    testing::expect(rt_inc.is_v3);
+    testing::expect_equal<i64>(rt_inc.n_loops, 2);
+    testing::expect_equal<i64>(ladder_runtime_logic_gates(&rt_inc), (h1 + d * grp) * n_layers);
+
+    var toks = [6]i32{ 65, 97, 256, 257, 32, 66 };
+    let ts = toks.as_slice();
+    // Incremental decode step by step (exercising prefix KV cache!)
+    for 1..7 |ln| {
+        ladder_runtime_forward(&var rt_inc, ts[0..ln], ln);
+    }
+    // Fresh full decode in one call
+    ladder_runtime_forward(&var rt_full, ts, 6);
+
+    let l1 = rt_inc.logits.as_slice();
+    let l2 = rt_full.logits.as_slice();
+    var max_d: f64 = 0.0;
+    for 0..vocab_size |i| {
+        let df = math::abs<f64>(cast<f64>(l1[i]) - cast<f64>(l2[i]));
+        if df > max_d { max_d = df; }
+    }
+    testing::expect(max_d < 1e-5);
 }

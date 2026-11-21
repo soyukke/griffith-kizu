@@ -10,7 +10,7 @@
 
 ## 収録ブラウザデモ（[`web/`](web/) — 単体静的サイトとして即起動可能）
 
-すべて単一の統合 WASM（[`web/dist/app.wasm`](web/dist/app.wasm), 636 KB）と事前学習済み `.glgpt` モデルで動作します。サーバー推論・API 通信・WebGPU は不要です。
+すべて単一の統合 WASM（[`web/dist/app.wasm`](web/dist/app.wasm), 890 KB）と事前学習済み `.glgpt` モデルで動作します。サーバー推論・API 通信・WebGPU は不要です。
 
 | ラボ | パス | 内容 |
 |---|---|---|
@@ -19,7 +19,7 @@
 | **LAB-01b `compiler/`** | [`web/compiler/index.html`](web/compiler/index.html) | 4-bit パリティ（**`65 → 3` ゲート・理論最小**）・XOR・2-bit 加算器の回路探索＆64 並列 Bit-Slice VM vs 重みゼロ AOT 速度対決（`0.09〜0.18 ns/inf`） |
 | **LAB-02 `ladder/`** | [`web/ladder/index.html`](web/ladder/index.html) | Tiny Shakespeare 2,000 step 学習済み **5 段 `LogicLadderGPT`**（`L0` 311 KB → `L3-C` **59 KB・ブロック乗算 0 回**）切替＆1-hot ハードウェア MUX Attention マップ可視化 |
 | **LAB-03 `distill/`** | [`web/distill/index.html`](web/distill/index.html) | 辞書 0 B の UTF-8 N-gram 64-bit 指紋 → 実数 Teacher からラベルなし日本語ログ経由で KL 蒸留 → 論理合成（乗算 0 回・30× 高速） |
-| **LAB-04 `jpllm/`** | [`web/jpllm/index.html`](web/jpllm/index.html) | マルチターン対応チャット UI＋純 Kizu BPE 1280・4 層 N=4 WARP LUT・**M4 Max Metal GPU 段階 KL 蒸留**（`L0` PPL 11.56 → `L0b` 4,608 LUT **PPL 11.40** → `L3-C` 6,912 LUT・0 乗算・PPL 19.22） |
+| **LAB-04 `jpllm/`** | [`web/jpllm/index.html`](web/jpllm/index.html) | マルチターン対応チャット UI＋**v3 旗艦 `Griffith-JP-Base v1` 派生（BPE 8192・3,385 万 tok 事前学習・6×2=12 層・0 乗算 FWHT＋98,304 N=4 LUT・PPL 8.41・9.21 MB・WASM KV-Cache ~118 tok/s）**＋v2 Metal GPU 段階蒸留（`L0` → `L0b` → `L3-C` 0 乗算 MUX）4 段同時比較 |
 
 ---
 
@@ -58,6 +58,14 @@ scripts/kizu build --target native --backend llvm --opt -o target/griffith_llvm 
 ./target/griffith_llvm jpllm-train-one l0  1800 web/jpllm/models/l0.glgpt  - data/jpllm_corpus.txt
 ./target/griffith_llvm jpllm-train-one l0b 1800 web/jpllm/models/l0b.glgpt web/jpllm/models/l0.glgpt data/jpllm_corpus.txt
 ./target/griffith_llvm jpllm-train-one l3c 4200 web/jpllm/models/l3c.glgpt web/jpllm/models/l0b.glgpt data/jpllm_corpus.txt
+
+# Stage 4: Griffith-JP-Base v1（.glgpt v3）の純 Kizu ネイティブ推論＆任意の特化モデル生成
+./target/griffith_llvm glgpt-eval web/jpllm/models/v3_chat.glgpt "[会話]\nU: 量子コンピュータってすごい？\nA: " 48 400
+python3 scripts/specialize_griffith_base.py \
+  --base data/griffith_jp_base_v1/griffith_jp_base_v1.pt \
+  --bpe  data/griffith_jp_base_v1/bpe8192_merges.json \
+  --corpus data/jpllm_corpus.txt \
+  --out web/jpllm/models/v3_chat.glgpt
 ```
 
 ---

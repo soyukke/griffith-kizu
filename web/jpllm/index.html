@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light">
-  <title>jpllm/ — 日本語チャット＆4モード論理ゲート LLM | griffith/</title>
-  <meta name="description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語チャット＆4モード極小 LLM。">
+  <title>jpllm/ — 日本語チャット＆4モード論理ゲート LLM（v3 12層 98K LUT + v2 L3-C）| griffith/</title>
+  <meta name="description" content="3,385 万トークンの日本語事前学習から 0 乗算 FWHT + 98,304 N=4 WARP-LUT (12 層) へ結晶化した v3 と、M4 Max Metal GPU 蒸留の完全 0 乗算 L3-C をブラウザ WASM で実行。">
   <link rel="canonical" href="https://lab.soyukke.com/griffith/jpllm/">
   <meta property="og:type" content="website">
   <meta property="og:title" content="jpllm/ — 日本語チャット＆4モード論理ゲート LLM | griffith/">
-  <meta property="og:description" content="M4 Max Metal GPU（純 Kizu）で実数 Teacher から知識蒸留した、乗算ゼロ論理ゲート + 1-hot ハードウェア MUX Attention の日本語チャット＆4モード極小 LLM。">
+  <meta property="og:description" content="3,385 万トークンの日本語事前学習から 0 乗算 FWHT + 98,304 N=4 WARP-LUT (12 層) へ結晶化した v3 と、M4 Max Metal GPU 蒸留の完全 0 乗算 L3-C をブラウザ WASM で実行。">
   <meta property="og:url" content="https://lab.soyukke.com/griffith/jpllm/">
   <meta name="twitter:card" content="summary">
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
@@ -193,14 +193,14 @@
     .mode-btn__hint { font-size: 10px; color: var(--muted); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .mode-btn[aria-pressed="true"] .mode-btn__hint { color: #d7d4c8; }
 
-    /* モデル段切替 */
+    /* モデル段切替（v3 旗艦 + v2 3段の 2×2 グリッド） */
     .rung-row {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(2, 1fr);
       gap: 4px;
     }
     .rung-btn {
-      padding: 6px 4px;
+      padding: 6px 5px;
       border: 1px solid var(--rule);
       border-radius: 6px;
       background: var(--sheet);
@@ -213,8 +213,11 @@
     .rung-btn span { font-size: 9px; color: var(--muted); line-height: 1.15; }
     .rung-btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
     .rung-btn[aria-pressed="true"] span { color: #d7d4c8; }
-    .rung-btn--mux[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .rung-btn--mux[aria-pressed="true"] span { color: #fff; opacity: 0.92; }
+    .rung-btn--v3 { border-color: #d97f57; background: #fff9f5; }
+    .rung-btn--v3[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .rung-btn--v3[aria-pressed="true"] span { color: #fff; opacity: 0.94; }
+    .rung-btn--mux[aria-pressed="true"] { background: #141412; border-color: var(--accent); color: var(--paper); box-shadow: inset 0 0 0 1px var(--accent); }
+    .rung-btn--mux[aria-pressed="true"] span { color: #ffb393; }
 
     /* スライダー */
     .ctrl-row {
@@ -277,7 +280,8 @@
       background: var(--sheet);
       white-space: nowrap;
     }
-    .badge--mux { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .badge--v3 { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .badge--mux { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
     .badge--ffn { background: var(--ink); border-color: var(--ink); color: var(--paper); }
     .chat-head__right {
       display: flex;
@@ -333,6 +337,7 @@
       background: var(--tri);
       color: var(--ink);
     }
+    .msg__pill--v3 { background: var(--accent); color: #fff; }
     .msg__pill--mux { background: var(--accent-tint); color: var(--accent); border: 1px solid #f4b394; }
     .msg__pill--ffn { background: var(--ink); color: var(--paper); }
 
@@ -598,7 +603,7 @@
     }
     .sheet__tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
     .sheet__body { padding: 14px 16px; overflow: auto; }
-    .cmp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .cmp-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
     .cmp-card {
       background: var(--paper);
       border: 1px solid var(--rule);
@@ -608,7 +613,8 @@
       gap: 6px;
       align-content: start;
     }
-    .cmp-card--mux { border-color: var(--accent); background: var(--accent-tint); }
+    .cmp-card--v3 { border-color: var(--accent); background: #fff7f2; box-shadow: 0 0 0 1px rgba(255, 77, 0, 0.25); }
+    .cmp-card--mux { border-color: #d79c80; background: var(--accent-tint); }
     .cmp-card__h { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: 11px; font-weight: 800; }
     .cmp-card__out { font-size: 13px; font-weight: 700; line-height: 1.55; min-height: 52px; white-space: pre-wrap; }
     .cmp-card__meta { font-family: var(--mono); font-size: 10px; color: var(--muted); }
@@ -643,6 +649,7 @@
       color: var(--paper);
       border-color: var(--ink);
     }
+    .mobile-bar button.is-v3[aria-pressed="true"],
     .mobile-bar button.is-mux[aria-pressed="true"] {
       background: var(--accent);
       border-color: var(--accent);
@@ -672,11 +679,11 @@
       <div class="identity">
         <a class="mark" href="../">griffith<span class="slash">/</span>jpllm</a>
         <h1>日本語チャット＆4モード論理ゲート LLM</h1>
-        <span class="tagline" id="arch-tagline">BPE 1280 · 4層 N=4 WARP · Metal GPU 蒸留 · 0 ブロック乗算</span>
+        <span class="tagline" id="arch-tagline">BPE 8192 · 6×2=12層 d=512 · FWHT + 98K N=4 LUT · KV-Cache</span>
       </div>
       <div class="bar__right">
         <button type="button" class="btn" id="btn-clear-chat">新しい会話</button>
-        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">3段同時比較</button>
+        <button type="button" class="btn" id="btn-cmp" aria-expanded="false">4段同時比較</button>
         <button type="button" class="btn" id="btn-inspector" aria-expanded="true">回路</button>
         <button type="button" class="btn" id="btn-about" aria-expanded="false">しくみ</button>
       </div>
@@ -724,18 +731,21 @@
 
         <div class="sec">
           <div class="sec__h">
-            <span class="sec__title">論理ゲート化レベル</span>
+            <span class="sec__title">モデル / 論理ゲート化</span>
             <span class="sec__sub" id="load-stat">読込中…</span>
           </div>
           <div class="rung-row" id="rung-row">
-            <button type="button" class="rung-btn" data-rung="l0" aria-pressed="false">
-              <b>L0</b><span>実数 Teacher</span>
-            </button>
-            <button type="button" class="rung-btn" data-rung="l0b" aria-pressed="true">
-              <b>L0b</b><span>FFN 論理化</span>
+            <button type="button" class="rung-btn rung-btn--v3" data-rung="v3" aria-pressed="true">
+              <b>v3 H-LUT</b><span>12層·98K LUT·FWHT</span>
             </button>
             <button type="button" class="rung-btn rung-btn--mux" data-rung="l3c" aria-pressed="false">
-              <b>L3-C</b><span>完全論理・乗算0</span>
+              <b>L3-C</b><span>4層·完全論理 0乗算</span>
+            </button>
+            <button type="button" class="rung-btn" data-rung="l0b" aria-pressed="false">
+              <b>L0b</b><span>4層·FFN 論理化</span>
+            </button>
+            <button type="button" class="rung-btn" data-rung="l0" aria-pressed="false">
+              <b>L0</b><span>4層·実数 Teacher</span>
             </button>
           </div>
         </div>
@@ -759,7 +769,7 @@
           </div>
           <div class="metrics">
             <div class="metric">
-              <span class="metric__k">ブロック乗算/tok</span>
+              <span class="metric__k" id="m-muls-label">FFN 乗算/tok</span>
               <span class="metric__v hi" id="m-muls">—</span>
             </div>
             <div class="metric">
@@ -783,10 +793,10 @@
         <div class="chat-head">
           <div class="chat-head__left">
             <span class="chat-head__title" id="chat-title">マルチターンチャット</span>
-            <span class="badge badge--ffn" id="stage-badge">L0b · FFN 乗算 0 · N=4 LUT</span>
+            <span class="badge badge--v3" id="stage-badge">v3 H-LUT · 12層 FWHT · FFN 乗算 0</span>
           </div>
           <div class="chat-head__right">
-            <span id="ctx-stat">0 / 80 tok</span>
+            <span id="ctx-stat">0 / 256 tok</span>
             <span id="gen-speed">—</span>
           </div>
         </div>
@@ -797,9 +807,10 @@
           <button type="button" data-mmode="[関西]" aria-pressed="false">関西</button>
           <button type="button" data-mmode="[津軽]" aria-pressed="false">津軽</button>
           <span style="border-left:1px solid var(--rule);margin:0 2px;"></span>
-          <button type="button" data-mrung="l0" aria-pressed="false">L0</button>
-          <button type="button" data-mrung="l0b" aria-pressed="true">L0b</button>
+          <button type="button" class="is-v3" data-mrung="v3" aria-pressed="true">v3</button>
           <button type="button" class="is-mux" data-mrung="l3c" aria-pressed="false">L3-C</button>
+          <button type="button" data-mrung="l0b" aria-pressed="false">L0b</button>
+          <button type="button" data-mrung="l0" aria-pressed="false">L0</button>
         </div>
 
         <div class="chat-feed" id="chat-feed" aria-live="polite"></div>
@@ -840,30 +851,30 @@
         <div class="sec">
           <div class="sec__h">
             <span class="sec__title">直近の次トークン Top-5</span>
-            <span class="sec__sub" id="vocab-sub">BPE 1280</span>
+            <span class="sec__sub" id="vocab-sub">BPE 8192</span>
           </div>
           <div class="top5" id="top5-list"></div>
         </div>
 
         <button type="button" class="btn" id="open-cmp" style="width:100%;justify-content:space-between;padding:0 12px;">
-          <span>同じ発言を L0 / L0b / L3-C で比較</span><span>→</span>
+          <span>同じ発言を v3 / L0 / L0b / L3-C で比較</span><span>→</span>
         </button>
       </section>
     </main>
 
     <footer class="foot">
       <a href="../">← griffith/ 一覧</a>
-      <span>純 Kizu BPE 1280 + M4 Max Metal GPU 段階 KL 蒸留（L0 → L0b → L3-C）→ 単体 WASM（UTF-8 制約 Top-p 0.85）</span>
-      <span id="foot-stat">636 KB .wasm · kizu wasm32-browser</span>
+      <span>純 Kizu BPE 8192 (v3) / 1280 (v2) · FWHT + N=4 WARP LUT + KV-Cache · 単体 WASM（UTF-8 制約）</span>
+      <span id="foot-stat">890 KB .wasm · kizu wasm32-browser</span>
     </footer>
   </div>
 
-  <!-- モーダル：3段同時比較 / しくみ -->
+  <!-- モーダル：4段同時比較 / しくみ -->
   <div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-label="比較と解説">
     <div class="sheet__panel">
       <div class="sheet__head">
         <div class="sheet__tabs" role="tablist">
-          <button type="button" role="tab" data-tab="cmp" aria-selected="true">L0 / L0b / L3-C 同時比較</button>
+          <button type="button" role="tab" data-tab="cmp" aria-selected="true">v3 / L0 / L0b / L3-C 同時比較</button>
           <button type="button" role="tab" data-tab="about" aria-selected="false">しくみ・蒸留アーキテクチャ</button>
         </div>
         <button type="button" class="btn" id="sheet-close">閉じる</button>
@@ -875,42 +886,47 @@
             <button type="button" class="btn btn--go" id="btn-run-cmp" style="min-height:28px;font-size:11px">同時生成</button>
           </div>
           <div class="cmp-grid">
-            <div class="cmp-card">
-              <div class="cmp-card__h"><span>L0 実数 Teacher</span><span id="cmp-l0-meta">—</span></div>
-              <div class="cmp-card__out" id="cmp-l0-out">—</div>
-              <div class="cmp-card__meta" id="cmp-l0-stat">FP Attention + FP FFN</div>
-            </div>
-            <div class="cmp-card">
-              <div class="cmp-card__h"><span>L0b FFN 論理化</span><span id="cmp-l0b-meta">—</span></div>
-              <div class="cmp-card__out" id="cmp-l0b-out">—</div>
-              <div class="cmp-card__meta" id="cmp-l0b-stat">Teacher Warm-Start + N=4 LUT FFN</div>
+            <div class="cmp-card cmp-card--v3">
+              <div class="cmp-card__h"><span>v3 H-LUT（旗艦 12層）</span><span id="cmp-v3-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-v3-out">—</div>
+              <div class="cmp-card__meta" id="cmp-v3-stat">33.8M tok 事前学習 + FWHT + 98K N=4 LUT (FFN 乗算 0)</div>
             </div>
             <div class="cmp-card cmp-card--mux">
               <div class="cmp-card__h"><span>L3-C 完全論理ゲート</span><span id="cmp-l3-meta">—</span></div>
               <div class="cmp-card__out" id="cmp-l3-out">—</div>
               <div class="cmp-card__meta" id="cmp-l3-stat">0 ブロック乗算 + 1-hot MUX</div>
             </div>
+            <div class="cmp-card">
+              <div class="cmp-card__h"><span>L0b FFN 論理化 (v2)</span><span id="cmp-l0b-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-l0b-out">—</div>
+              <div class="cmp-card__meta" id="cmp-l0b-stat">Teacher Warm-Start + N=4 LUT FFN</div>
+            </div>
+            <div class="cmp-card">
+              <div class="cmp-card__h"><span>L0 実数 Teacher (v2)</span><span id="cmp-l0-meta">—</span></div>
+              <div class="cmp-card__out" id="cmp-l0-out">—</div>
+              <div class="cmp-card__meta" id="cmp-l0-stat">FP Attention + FP FFN</div>
+            </div>
           </div>
         </div>
 
         <div id="tab-about" hidden class="about-grid">
           <div>
-            <h3>1. チャット対応＆4 モードを 1 つの極小論理ゲート LLM に統合</h3>
+            <h3>1. 新旗艦 v3（Griffith-JP-Base v1 + Chat SFT：12 層・98,304 N=4 LUT）</h3>
             <p>
-              マルチターン会話 <code>[会話]</code>（<code>U: ... / A: ...</code> の文脈保持）と、3 つの日本語スタイル変換（<code>[X訳]</code>・<code>[関西]</code>・<code>[津軽]</code>）を 1 本の純 Kizu バイトレベル BPE モデルへ統合しています。
+              日本語 Wikipedia＋FineWeb-2 JA＋EN 技術文書の <b>3,385 万トークン（純 Kizu 互換 BPE 8,192）</b> を NVIDIA A100 上で事前学習した汎用日本語ベース <code>Griffith-JP-Base v1</code>（<code>d=512</code>・6 層×2 ループ＝実質 12 層・GQA 8Q/2KV・RoPE）を構築。
+              FFN の 2,477 万乗算を <b>0 乗算 FWHT（高速ウォルシュ・アダマール変換）＋ 2-bit 温度計 ＋ 98,304 個の離散 N=4 WARP-LUT（196,608 実効評価/tok・FFN 乗算 0 回）</b> へ KL 蒸留し、さらに 4 モード会話データ＋汎用日本語リプレイで特化しました（<b>検証 PPL 8.41・9.21 MB int8 <code>.glgpt v3</code></b>）。
             </p>
           </div>
           <div>
-            <h3>2. 強化版 段階蒸留（L0 → L0b → L3-C + N=4 WARP LUT + MUX Value Skip）</h3>
+            <h3>2. v2 段階蒸留ラダー（M4 Max 純 Kizu Metal GPU：L0 → L0b → L3-C）</h3>
             <p>
-              Apache 2.0 の <code>Qwen3-4B-Instruct</code> で生成した 5,033 件（740 KB）のマルチターン会話＆変換コーパスに対し、Apple M4 Max 上の純 Kizu Metal GPU カーネルで <code>L0</code>（実数 4 層 d=192 Transformer, PPL 11.56）を学習。
-              そこから Warm-Start＋応答トークン重視の KL 蒸留で <code>L0b</code>（FFN 4,608 個 N=4 WARP LUT, <b>PPL 11.40 で実数 Teacher 超え</b>）を構築し、さらに <code>L0b</code> の離散 LUT を逆ウォルシュ・アダマール変換で引き継いで Hardware MUX Value Skip 付き <code>L3-C</code>（6,912 LUT・ブロック乗算 0 回・PPL 19.22）へ結晶化しました。
+              Apple M4 Max 上の純 Kizu Metal GPU カーネルで学習した 4 層 d=192・BPE 1,280 モデル群もそのまま比較可能。<code>L0</code>（実数 PPL 11.56）→ <code>L0b</code>（4,608 LUT, PPL 11.40）→ <code>L3-C</code>（6,912 LUT・1-hot ハードウェア MUX・<b>全ブロック乗算 0 回・1.07 MB</b>）への結晶化をリアルタイムに見比べられます。
             </p>
           </div>
           <div>
-            <h3>3. ブラウザ完結 WASM 推論（UTF-8 状態制約 + Top-p 0.85 + 反復ペナルティ）</h3>
+            <h3>3. ブラウザ完結 Pure Kizu WASM（インクリメンタル KV-Cache + UTF-8 状態制約）</h3>
             <p>
-              すべての推論は 636 KB の統合 Kizu WASM（サーバー通信・WebGPU 不要）で動作し、UTF-8 継続バイトの状態機械により文字化け（）を構造上ゼロに抑えています。<code>L3-C</code> は XNOR-popcount と 1-hot ハードウェア MUX（1.84 ms/fwd）で実行されます。
+              全モデルが 890 KB の統合 Kizu WASM（サーバー通信・WebGPU 不要）で動作し、<code>v3</code> は自動 Prefix KV-Cache により単一スレッド WASM で <b>約 118 tok/s</b>（ネイティブ LLVM では 182 tok/s）、PyTorch 参照ロジットと誤差 <code>&lt; 0.0005</code> の一致を検証済み。UTF-8 継続バイト状態機械により文字化け（）を構造上ゼロに抑えています。
             </p>
           </div>
         </div>
@@ -925,35 +941,36 @@
     const encoder = new TextEncoder();
 
     const RUNG_INFO = {
-      l0:  { name: "L0 実数 Teacher", badge: "L0 · 実数ベースライン", cls: "", url: "./models/l0.glgpt", desc: "FP Attention + FP FFN" },
-      l0b: { name: "L0b FFN 論理ゲート化", badge: "L0b · FFN 乗算 0 · N=4 LUT", cls: "badge--ffn", url: "./models/l0b.glgpt", desc: "FP Attention + N=4 論理ゲート FFN" },
-      l3c: { name: "L3-C 完全論理ゲート", badge: "L3-C · 0 ブロック乗算 · 1-hot MUX", cls: "badge--mux", url: "./models/l3c.glgpt", desc: "N=4 QKV + XNOR + 1-hot MUX + N=4 FFN" },
+      v3:  { name: "v3 H-LUT（Griffith-JP v1）", badge: "v3 · 12層 FWHT · 98K LUT · FFN 乗算 0", cls: "badge--v3", url: "./models/v3_chat.glgpt", desc: "33.8M tok 事前学習 + FWHT + 98,304 N=4 LUT" },
+      l0:  { name: "L0 実数 Teacher (v2)", badge: "L0 · 4層 実数ベースライン", cls: "", url: "./models/l0.glgpt", desc: "FP Attention + FP FFN" },
+      l0b: { name: "L0b FFN 論理化 (v2)", badge: "L0b · 4層 FFN 乗算 0 · N=4 LUT", cls: "badge--ffn", url: "./models/l0b.glgpt", desc: "FP Attention + N=4 論理ゲート FFN" },
+      l3c: { name: "L3-C 完全論理ゲート (v2)", badge: "L3-C · 0 ブロック乗算 · 1-hot MUX", cls: "badge--mux", url: "./models/l3c.glgpt", desc: "N=4 QKV + XNOR + 1-hot MUX + N=4 FFN" },
     };
 
     const MODE_META = {
       "[会話]": {
         title: "マルチターンチャット（X自動翻訳口調）",
-        placeholder: "話しかけてみてください（例：おはよう / あなたは誰？ / 腹減った）…",
-        welcome: "やあ兄弟！俺は乗算ゼロの論理ゲートで動く極小AIみたいなんだよ。何でも話しかけてみてくれ！",
-        presets: ["おはよう", "あなたは誰？", "今日めっちゃ眠い", "腹減った", "なんでクソって言うの？", "仕事行きたくない", "バグが直らない", "猫かわいい"],
+        placeholder: "話しかけてみてください（例：おはよう / 量子コンピュータってすごい？ / 腹減った）…",
+        welcome: "やあ兄弟！俺は 98,304 個の論理ゲートと 0 乗算 FWHT で動く日本語 AI みたいなんだよ。何でも話しかけてみてくれ！",
+        presets: ["おはよう", "あなたは誰？", "量子コンピュータってすごい？", "ラーメン食べたい", "徹夜でバグが直らない", "今日めっちゃ眠い", "仕事行きたくない", "猫かわいい"],
       },
       "[X訳]": {
         title: "X 自動翻訳風変換",
-        placeholder: "変換したい日本語を入力（例：今日めっちゃ眠い）…",
+        placeholder: "変換したい日本語を入力（例：新しいAIモデルが公開されてワクワクする）…",
         welcome: "普通の日本語を送ると、Xの自動翻訳が暴走したみたいな口調に変換するみたいなんだよ。",
-        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "雨降ってきて最悪", "コードが一発で動いた", "ありがとう", "コーヒー飲みたい"],
+        presets: ["新しいAIモデルが公開されてワクワクする", "今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "雨降ってきて最悪", "コードが一発で動いた", "コーヒー飲みたい"],
       },
       "[関西]": {
         title: "関西弁・エセ関西変換",
         placeholder: "関西弁にしたい日本語を入力（例：このラーメン美味しい）…",
         welcome: "なんか喋ってみてや！論理ゲート回路で関西弁に変換したるで、知らんけど。",
-        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "雨降ってきて最悪", "コードが一発で動いた", "ありがとう", "腹減った"],
+        presets: ["このラーメンめっちゃ美味しい", "仕事終わったから帰る", "今日めっちゃ眠い", "猫が寝ててかわいい", "雨降ってきて最悪", "コードが一発で動いた", "ありがとう", "腹減った"],
       },
       "[津軽]": {
         title: "津軽弁変換",
-        placeholder: "津軽弁にしたい日本語を入力（例：今日めっちゃ寒い）…",
+        placeholder: "津軽弁にしたい日本語を入力（例：今日すごく寒い）…",
         welcome: "こんちは！日本語送ってけろば、論理ゲートで津軽弁に変換するびょん！",
-        presets: ["今日めっちゃ眠い", "このラーメンめっちゃ美味しい", "猫が寝ててかわいい", "仕事終わったから帰る", "寒い", "コードが一発で動いた", "ありがとう", "腹減った"],
+        presets: ["今日すごく寒い", "このラーメンめっちゃ美味しい", "今日めっちゃ眠い", "猫が寝ててかわいい", "仕事終わったから帰る", "コードが一発で動いた", "ありがとう", "腹減った"],
       },
     };
 
@@ -965,14 +982,14 @@
     const loadingRungs = {};
     const sizes = {};
 
-    let activeRung = "l0b";
+    let activeRung = "v3";
     let activeMode = "[会話]";
     let activeLayer = 0;
     let activeHead = 0;
     let generating = false;
     let stopFlag = false;
     let chatTurns = []; // multi-turn history for [会話]: [{u, a}]
-    let lastUserInput = "おはよう";
+    let lastUserInput = "量子コンピュータってすごい？";
     let lastPromptTokenCount = 0;
 
     function fmtNum(n) { return Number(n).toLocaleString("ja-JP"); }
@@ -1011,8 +1028,9 @@
       if (mode !== "[会話]") {
         return encoder.encode(`${mode} ${userText}\n=> `);
       }
-      // Keep as many recent turns as fit safely in maxSeq (leaving >= 28 tokens for reply)
-      const turns = historyTurns.slice(-3);
+      // Keep as many recent turns as fit safely in maxSeq (leaving room for reply)
+      const maxTurns = maxSeq >= 160 ? 5 : 3;
+      const turns = historyTurns.slice(-maxTurns);
       for (let drop = 0; drop <= turns.length; drop++) {
         const sub = turns.slice(drop);
         let text = "[会話]\n";
@@ -1021,7 +1039,7 @@
         }
         text += `U: ${userText}\nA: `;
         const bytes = encoder.encode(text);
-        if (bytes.length <= Math.max(48, (maxSeq - 26) * 3) || drop === turns.length) {
+        if (bytes.length <= Math.max(48, (maxSeq - 32) * 3) || drop === turns.length) {
           return bytes;
         }
       }
@@ -1068,11 +1086,12 @@
     function createAiBubble(rung, mode) {
       const feed = document.getElementById("chat-feed");
       const wrap = document.createElement("div");
+      const isV3 = rung === "v3";
       const isMux = rung === "l3c";
       const isFfn = rung === "l0b";
-      wrap.className = `msg msg--ai${isMux ? " is-mux" : ""}`;
-      const pillCls = isMux ? "msg__pill msg__pill--mux" : (isFfn ? "msg__pill msg__pill--ffn" : "msg__pill");
-      const pillLabel = isMux ? "L3-C · 0 乗算" : (isFfn ? "L0b · FFN論理" : "L0 · 実数");
+      wrap.className = `msg msg--ai${(isMux || isV3) ? " is-mux" : ""}`;
+      const pillCls = isV3 ? "msg__pill msg__pill--v3" : (isMux ? "msg__pill msg__pill--mux" : (isFfn ? "msg__pill msg__pill--ffn" : "msg__pill"));
+      const pillLabel = isV3 ? "v3 · 98K LUT / 12層" : (isMux ? "L3-C · 0 乗算" : (isFfn ? "L0b · FFN論理" : "L0 · 実数"));
       wrap.innerHTML = `
         <div class="msg__meta">
           <span class="${pillCls}">${pillLabel}</span>
@@ -1162,19 +1181,34 @@
       const hardPpl = ex.ladder_meta(h, 7) / 100;
       const steps = ex.ladder_meta(h, 8);
       const gates = ex.ladder_meta(h, 9);
+      const nLoops = ex.ladder_meta(h, 10) || 1;
+      const isV3 = ex.ladder_meta(h, 11) === 1;
       const muls = ex.ladder_block_muls(h, seqLen);
 
       document.getElementById("load-stat").textContent = `${activeRung.toUpperCase()} 準備完了`;
       document.getElementById("m-size").textContent = fmtKB(sizes[activeRung] || 0);
-      document.getElementById("m-muls").textContent = fmtNum(muls);
-      document.getElementById("m-muls").classList.toggle("hi", muls === 0);
+      if (isV3) {
+        document.getElementById("m-muls-label").textContent = "FFN 乗算/tok";
+        document.getElementById("m-muls").textContent = "0";
+        document.getElementById("m-muls").classList.add("hi");
+      } else {
+        document.getElementById("m-muls-label").textContent = "ブロック乗算/tok";
+        document.getElementById("m-muls").textContent = fmtNum(muls);
+        document.getElementById("m-muls").classList.toggle("hi", muls === 0);
+      }
       document.getElementById("m-gates").textContent = fmtNum(gates);
       document.getElementById("m-ppl").textContent = hardPpl.toFixed(2);
       document.getElementById("m-steps").textContent = fmtNum(steps);
       document.getElementById("vocab-sub").textContent = `BPE ${vocab}`;
-      document.getElementById("arch-tagline").textContent = `BPE ${vocab} · ${nLayers}層 d=${dModel} · Metal GPU 蒸留 · ${muls === 0 ? "0 ブロック乗算" : `${fmtNum(muls)} 乗算`}`;
-      document.getElementById("attn-caption").textContent = activeRung === "l3c" ? "L3-C ハードウェア MUX" : `${activeRung.toUpperCase()} Causal Attention`;
-      document.getElementById("attn-note").textContent = activeRung === "l3c" ? "各行 1 マスのみ点灯（乗算 0）" : "Softmax 確率分布";
+      document.getElementById("arch-tagline").textContent = isV3
+        ? `BPE ${vocab} · ${nLayers}×${nLoops}=${nLayers * nLoops}層 d=${dModel} · FWHT + ${fmtNum(gates)} N=4 LUT · KV-Cache`
+        : `BPE ${vocab} · ${nLayers}層 d=${dModel} · Metal GPU 蒸留 · ${muls === 0 ? "0 ブロック乗算" : `${fmtNum(muls)} 乗算`}`;
+      document.getElementById("attn-caption").textContent = isV3
+        ? `v3 GQA Attention (Loop ${nLoops}/${nLoops})`
+        : (activeRung === "l3c" ? "L3-C ハードウェア MUX" : `${activeRung.toUpperCase()} Causal Attention`);
+      document.getElementById("attn-note").textContent = isV3
+        ? "8Q/2KV RoPE · FFN は 0 乗算 FWHT+LUT"
+        : (activeRung === "l3c" ? "各行 1 マスのみ点灯（乗算 0）" : "Softmax 確率分布");
       rebuildLayerHeadButtons(h);
     }
 
@@ -1214,7 +1248,8 @@
       const svg = document.getElementById("attn-svg");
       svg.innerHTML = "";
       if (!h || !tokens || tokens.length === 0) return;
-      const total = tokens.length;
+      const isV3 = ex.ladder_meta(h, 11) === 1;
+      const total = isV3 ? Math.min(tokens.length, 128) : tokens.length;
       const show = Math.min(total, 16);
       const start = total - show;
       const padL = 44, padT = 34, size = 266;
@@ -1324,13 +1359,15 @@
 
       const t0 = performance.now();
       let generated = 0;
-      const maxNew = 54;
+      const isV3 = ex.ladder_meta(h, 11) === 1;
+      const eosId = ex.ladder_meta(h, 12);
+      const maxNew = isV3 ? 64 : 54;
       const feed = document.getElementById("chat-feed");
 
       for (let i = 0; i < maxNew; i++) {
         if (stopFlag) break;
         const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? seed : 0);
-        if (tid < 0) break;
+        if (tid < 0 || (eosId >= 0 && tid === eosId)) break;
         const piece = lastPieceBytes.slice();
         if (tid === 10) {
           if (generated > 0) break;
@@ -1407,13 +1444,16 @@
       const seed = 20261121;
 
       for (const [rung, outId, metaId, statId] of [
-        ["l0",  "cmp-l0-out",  "cmp-l0-meta",  "cmp-l0-stat"],
-        ["l0b", "cmp-l0b-out", "cmp-l0b-meta", "cmp-l0b-stat"],
+        ["v3",  "cmp-v3-out",  "cmp-v3-meta",  "cmp-v3-stat"],
         ["l3c", "cmp-l3-out",  "cmp-l3-meta",  "cmp-l3-stat"],
+        ["l0b", "cmp-l0b-out", "cmp-l0b-meta", "cmp-l0b-stat"],
+        ["l0",  "cmp-l0-out",  "cmp-l0-meta",  "cmp-l0-stat"],
       ]) {
         document.getElementById(outId).textContent = "読込・生成中…";
         const h = await loadRung(rung);
         const seqLen = ex.ladder_meta(h, 2);
+        const isV3 = ex.ladder_meta(h, 11) === 1;
+        const eosId = ex.ladder_meta(h, 12);
         let fullBytes = buildPromptBytes(activeMode, userText, [], seqLen);
         let genBytes = new Uint8Array(0);
         const t0 = performance.now();
@@ -1421,7 +1461,7 @@
         let nTok = 0;
         for (let i = 0; i < 48; i++) {
           const tid = ex.ladder_sample_bpe(h, tempMilli, i === 0 ? seed : 0);
-          if (tid < 0) break;
+          if (tid < 0 || (eosId >= 0 && tid === eosId)) break;
           const piece = lastPieceBytes.slice();
           if (tid === 10) {
             if (nTok > 0) break;
@@ -1445,7 +1485,9 @@
         const ppl = (ex.ladder_meta(h, 7) / 100).toFixed(2);
         document.getElementById(outId).textContent = decoder.decode(genBytes).trim() || "—";
         document.getElementById(metaId).textContent = `${fmtKB(sizes[rung])} · PPL ${ppl}`;
-        document.getElementById(statId).textContent = `乗算 ${fmtNum(muls)} · ゲート ${fmtNum(gates)} · ${nTok}tok ${dt.toFixed(0)}ms`;
+        document.getElementById(statId).textContent = isV3
+          ? `FFN 乗算 0 · ゲート ${fmtNum(gates)} · ${nTok}tok ${dt.toFixed(0)}ms`
+          : `乗算 ${fmtNum(muls)} · ゲート ${fmtNum(gates)} · ${nTok}tok ${dt.toFixed(0)}ms`;
       }
       btn.disabled = false;
     }
@@ -1521,7 +1563,7 @@
       document.querySelectorAll(".sheet__tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
       btnCmp.setAttribute("aria-expanded", String(tab === "cmp"));
       btnAbout.setAttribute("aria-expanded", String(tab === "about"));
-      if (tab === "cmp" && document.getElementById("cmp-l0-out").textContent === "—") {
+      if (tab === "cmp" && document.getElementById("cmp-v3-out").textContent === "—") {
         runCompareAll();
       }
     }
@@ -1564,9 +1606,8 @@
       await loadRung(activeRung);
       updateMetrics();
       resetChat();
-      // Background prefetch remaining rungs so mid-chat switching is instant
+      // Background prefetch lightweight L3-C (1 MB) so 0-mul comparison is instant
       loadRung("l3c").catch(() => {});
-      loadRung("l0").catch(() => {});
     }
 
     boot().catch((err) => {

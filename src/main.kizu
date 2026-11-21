@@ -33,6 +33,10 @@ pub fn main() -> !void {
             try cli::run_jpllm_train_one();
             return;
         }
+        if mem::equal_bytes(cmd, "glgpt-eval") {
+            try cli::run_glgpt_eval();
+            return;
+        }
         print("unknown command");
     }
     return;
